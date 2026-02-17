@@ -59,7 +59,7 @@ Issue tokens support:
 - Full GUID
 - GUID prefix
 
-Tip: in TUI, press `e` to edit description in an external editor (arrow keys and multiline supported). Set `MADDOXTASKS_EDITOR` to override the default editor.
+Tip: in TUI, press `e` to edit description inline (arrow keys, Home/End, Backspace/Delete supported). Press `Enter` to save or `Esc` to cancel.
 
 ## Agent JSON Commands
 

@@ -1,5 +1,3 @@
-using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Spectre.Console;
 using IssueStatus = MaddoxTasks.Domain.Status;
 using MaddoxTasks.Application;
@@ -425,93 +423,131 @@ public sealed class TuiApp
 
     private void EditDescription(IssueView issueView)
     {
-        var currentDescription = issueView.Issue.Description ?? string.Empty;
-        if (!TryEditTextWithExternalEditor(currentDescription, out var description, out var error))
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold]Edit description[/]");
+        AnsiConsole.MarkupLine("[grey]Left/Right/Home/End move cursor. Enter saves. Esc cancels.[/]");
+
+        Console.CursorVisible = true;
+        var saved = TryReadLineWithInlineEditor("Description: ", issueView.Issue.Description ?? string.Empty, out var description);
+        Console.CursorVisible = false;
+
+        if (!saved)
         {
-            Console.CursorVisible = true;
-            AnsiConsole.MarkupLine($"[yellow]{error.EscapeMarkup()}[/]");
-            description = AnsiConsole.Ask<string>("Description:", currentDescription);
-            Console.CursorVisible = false;
+            PauseWithMessage("Description edit canceled.", success: true);
+            return;
         }
 
         var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, description));
         PauseWithMessage(result.Message, result.Success);
     }
 
-    private static bool TryEditTextWithExternalEditor(string initialValue, out string editedValue, out string error)
+    private static bool TryReadLineWithInlineEditor(string label, string initialValue, out string result)
     {
-        editedValue = initialValue;
-        error = string.Empty;
+        result = initialValue;
+        var buffer = new List<char>((initialValue ?? string.Empty).ToCharArray());
+        var cursorIndex = buffer.Count;
+        var previousLength = buffer.Count;
 
-        var filePath = Path.Combine(Path.GetTempPath(), $"maddoxtasks-description-{Guid.NewGuid():N}.txt");
-        File.WriteAllText(filePath, initialValue ?? string.Empty);
+        Console.Write(label);
+        var inputLeft = Console.CursorLeft;
+        var inputTop = Console.CursorTop;
 
-        try
+        if (buffer.Count > 0)
         {
-            var editorExecutable = ResolveEditorExecutable();
-            var process = Process.Start(new ProcessStartInfo
-            {
-                FileName = editorExecutable,
-                Arguments = $"\"{filePath}\"",
-                UseShellExecute = false
-            });
-
-            if (process is null)
-            {
-                error = $"Could not start editor '{editorExecutable}'.";
-                return false;
-            }
-
-            process.WaitForExit();
-            if (process.ExitCode != 0)
-            {
-                error = $"Editor exited with code {process.ExitCode}.";
-                return false;
-            }
-
-            editedValue = File.ReadAllText(filePath);
-            return true;
+            Console.Write(new string(buffer.ToArray()));
         }
-        catch (Exception exception)
+
+        RepositionCursor(inputLeft, inputTop, cursorIndex);
+
+        while (true)
         {
-            error = $"External editor unavailable: {exception.Message}";
-            return false;
-        }
-        finally
-        {
-            try
+            var keyInfo = Console.ReadKey(intercept: true);
+            switch (keyInfo.Key)
             {
-                if (File.Exists(filePath))
-                {
-                    File.Delete(filePath);
-                }
+                case ConsoleKey.LeftArrow:
+                    if (cursorIndex > 0)
+                    {
+                        cursorIndex--;
+                    }
+                    break;
+                case ConsoleKey.RightArrow:
+                    if (cursorIndex < buffer.Count)
+                    {
+                        cursorIndex++;
+                    }
+                    break;
+                case ConsoleKey.Home:
+                    cursorIndex = 0;
+                    break;
+                case ConsoleKey.End:
+                    cursorIndex = buffer.Count;
+                    break;
+                case ConsoleKey.Backspace:
+                    if (cursorIndex > 0)
+                    {
+                        buffer.RemoveAt(cursorIndex - 1);
+                        cursorIndex--;
+                    }
+                    break;
+                case ConsoleKey.Delete:
+                    if (cursorIndex < buffer.Count)
+                    {
+                        buffer.RemoveAt(cursorIndex);
+                    }
+                    break;
+                case ConsoleKey.Enter:
+                    Console.WriteLine();
+                    result = new string(buffer.ToArray());
+                    return true;
+                case ConsoleKey.Escape:
+                    Console.WriteLine();
+                    return false;
+                default:
+                    if (!char.IsControl(keyInfo.KeyChar))
+                    {
+                        buffer.Insert(cursorIndex, keyInfo.KeyChar);
+                        cursorIndex++;
+                    }
+                    break;
             }
-            catch
-            {
-                // Ignore temp-file cleanup failures.
-            }
+
+            RenderInlineEditBuffer(inputLeft, inputTop, buffer, cursorIndex, ref previousLength);
         }
     }
 
-    private static string ResolveEditorExecutable()
+    private static void RenderInlineEditBuffer(
+        int inputLeft,
+        int inputTop,
+        List<char> buffer,
+        int cursorIndex,
+        ref int previousLength)
     {
-        var configuredEditor = Environment.GetEnvironmentVariable("MADDOXTASKS_EDITOR");
-        if (string.IsNullOrWhiteSpace(configuredEditor))
+        Console.SetCursorPosition(inputLeft, inputTop);
+        Console.Write(new string(buffer.ToArray()));
+        if (previousLength > buffer.Count)
         {
-            configuredEditor = Environment.GetEnvironmentVariable("VISUAL");
+            Console.Write(new string(' ', previousLength - buffer.Count));
         }
 
-        if (string.IsNullOrWhiteSpace(configuredEditor))
-        {
-            configuredEditor = Environment.GetEnvironmentVariable("EDITOR");
-        }
+        previousLength = buffer.Count;
+        RepositionCursor(inputLeft, inputTop, cursorIndex);
+    }
 
-        if (!string.IsNullOrWhiteSpace(configuredEditor))
-        {
-            return configuredEditor.Trim();
-        }
+    private static void RepositionCursor(int inputLeft, int inputTop, int cursorIndex)
+    {
+        var width = Console.BufferWidth <= 0 ? 80 : Console.BufferWidth;
+        var absoluteIndex = inputLeft + cursorIndex;
+        var targetTop = inputTop + (absoluteIndex / width);
+        var targetLeft = absoluteIndex % width;
 
-        return RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "notepad" : "vi";
+        try
+        {
+            Console.SetCursorPosition(targetLeft, targetTop);
+        }
+        catch
+        {
+            // Ignore cursor reposition failures in non-standard terminals.
+        }
     }
 
     private void ConfigureFilter()
@@ -677,4 +713,3 @@ public sealed class TuiApp
         return dueDate.Value.ToString("yyyy-MM-dd");
     }
 }
-
