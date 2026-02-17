@@ -39,7 +39,7 @@ public static partial class AgentRunner
                 view.Issue.ParentId?.ToString(),
                 view.Issue.Labels.ToArray(),
                 view.Issue.Comments
-                    .Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment))
+                    .Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment, comment.Actor))
                     .ToArray(),
                 view.Issue.CreatedAt,
                 view.Issue.UpdatedAt,
@@ -271,7 +271,9 @@ public static partial class AgentRunner
             return false;
         }
 
-        command = new UpdateDescription(issueId, description!);
+        TryGetString(root, "actor", required: false, out var actorText, out _);
+        var actor = string.IsNullOrWhiteSpace(actorText) ? "agent" : actorText!;
+        command = new UpdateDescription(issueId, description!, actor);
         return true;
     }
 
@@ -288,7 +290,9 @@ public static partial class AgentRunner
             return false;
         }
 
-        command = new AddComment(issueId, comment!);
+        TryGetString(root, "actor", required: false, out var actorText, out _);
+        var actor = string.IsNullOrWhiteSpace(actorText) ? "agent" : actorText!;
+        command = new AddComment(issueId, comment!, actor);
         return true;
     }
 
@@ -395,7 +399,7 @@ public static partial class AgentRunner
         DateTime UpdatedAt,
         DateTime? DueDate);
 
-    private sealed record AgentIssueCommentDto(DateTime Timestamp, string Comment);
+    private sealed record AgentIssueCommentDto(DateTime Timestamp, string Comment, string Actor);
 
     [JsonSourceGenerationOptions(
         PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,

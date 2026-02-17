@@ -100,26 +100,28 @@ public static class CommandPlanner
     {
         var issue = RequireIssue(command.IssueId, state);
         var normalized = command.Description?.Trim() ?? string.Empty;
+        var actor = NormalizeActor(command.Actor);
 
         if (string.Equals(issue.Description, normalized, StringComparison.Ordinal))
         {
             throw new CommandValidationException("Description is unchanged.");
         }
 
-        return new DescriptionUpdated(Guid.NewGuid(), command.IssueId, timestamp, normalized);
+        return new DescriptionUpdated(Guid.NewGuid(), command.IssueId, timestamp, normalized, actor);
     }
 
     private static IssueEvent PlanCommentAdd(AddComment command, IssueState state, DateTime timestamp)
     {
         _ = RequireIssue(command.IssueId, state);
         var normalized = command.Comment?.Trim() ?? string.Empty;
+        var actor = NormalizeActor(command.Actor);
 
         if (string.IsNullOrWhiteSpace(normalized))
         {
             throw new CommandValidationException("Comment cannot be empty.");
         }
 
-        return new CommentAdded(Guid.NewGuid(), command.IssueId, timestamp, normalized);
+        return new CommentAdded(Guid.NewGuid(), command.IssueId, timestamp, normalized, actor);
     }
 
     private static Issue RequireIssue(IssueId issueId, IssueState state)
@@ -138,6 +140,22 @@ public static class CommandPlanner
         if (string.IsNullOrWhiteSpace(normalized))
         {
             throw new CommandValidationException("Label cannot be empty.");
+        }
+
+        return normalized;
+    }
+
+    private static string NormalizeActor(string actor)
+    {
+        var normalized = actor?.Trim().ToLowerInvariant() ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return "user";
+        }
+
+        if (normalized is not ("user" or "agent"))
+        {
+            throw new CommandValidationException("Actor must be 'user' or 'agent'.");
         }
 
         return normalized;

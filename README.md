@@ -62,6 +62,7 @@ Issue tokens support:
 - GUID prefix
 
 Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, `h` description history, and `q`/`Esc` to go back.
+Comments and description history show `By` (`user` or `agent`).
 
 ## Agent JSON Commands
 
@@ -95,7 +96,8 @@ Comment example:
 {
   "type": "AddComment",
   "issueId": "1",
-  "comment": "Blocked by API contract review"
+  "comment": "Blocked by API contract review",
+  "actor": "agent"
 }
 ```
 

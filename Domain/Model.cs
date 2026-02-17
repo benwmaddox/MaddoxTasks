@@ -115,7 +115,7 @@ public sealed class Issue
                 UpdatedAt = descriptionUpdated.Timestamp;
                 break;
             case CommentAdded commentAdded:
-                _comments.Add(new IssueComment(commentAdded.Timestamp, commentAdded.Comment));
+                _comments.Add(new IssueComment(commentAdded.Timestamp, commentAdded.Comment, commentAdded.Actor));
                 UpdatedAt = commentAdded.Timestamp;
                 break;
             default:
@@ -124,7 +124,7 @@ public sealed class Issue
     }
 }
 
-public sealed record IssueComment(DateTime Timestamp, string Comment);
+public sealed record IssueComment(DateTime Timestamp, string Comment, string Actor);
 
 public sealed class IssueFilter
 {

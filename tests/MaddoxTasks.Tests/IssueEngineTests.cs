@@ -37,6 +37,7 @@ public sealed class IssueEngineTests
         Assert.Empty(issue.Labels);
         Assert.Single(issue.Comments);
         Assert.Equal("Ship this after review", issue.Comments[0].Comment);
+        Assert.Equal("user", issue.Comments[0].Actor);
     }
 
     [Fact]
@@ -64,7 +65,8 @@ public sealed class IssueEngineTests
         var commentResult = engine.Execute(new AddComment(issueId, "Need logs from staging"));
         Assert.True(commentResult.Success);
         Assert.Equal(3, store.LoadAll().Count);
-        Assert.IsType<CommentAdded>(store.LoadAll()[2]);
+        var commentEvent = Assert.IsType<CommentAdded>(store.LoadAll()[2]);
+        Assert.Equal("user", commentEvent.Actor);
     }
 
     [Fact]
@@ -120,6 +122,24 @@ public sealed class IssueEngineTests
         var commentResult = engine.Execute(new AddComment(issueId, "   "));
         Assert.False(commentResult.Success);
         Assert.Single(store.LoadAll());
+    }
+
+    [Fact]
+    public void AddComment_PreservesAgentActor()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+
+        var createResult = engine.Execute(new CreateIssue("First task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(createResult.IssueId);
+
+        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "agent"));
+        Assert.True(commentResult.Success);
+
+        var commentEvent = Assert.IsType<CommentAdded>(store.LoadAll()[1]);
+        Assert.Equal("agent", commentEvent.Actor);
+        Assert.Equal("agent", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
     }
 }
 

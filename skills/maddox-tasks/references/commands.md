@@ -65,6 +65,7 @@ Add a comment:
 {
   "type": "AddComment",
   "issueId": "1",
-  "comment": "Blocked on dependency upgrade"
+  "comment": "Blocked on dependency upgrade",
+  "actor": "agent"
 }
 ```

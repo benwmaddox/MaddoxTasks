@@ -34,11 +34,13 @@ public sealed record RemoveLabel(
 
 public sealed record UpdateDescription(
     IssueId IssueId,
-    string Description
+    string Description,
+    string Actor = "user"
 ) : Command;
 
 public sealed record AddComment(
     IssueId IssueId,
-    string Comment
+    string Comment,
+    string Actor = "user"
 ) : Command;
 

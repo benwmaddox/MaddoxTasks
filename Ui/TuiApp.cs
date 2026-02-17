@@ -490,7 +490,7 @@ public sealed class TuiApp
             return;
         }
 
-        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, nextDescription));
+        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, nextDescription, "user"));
         PauseWithMessage(result.Message, result.Success);
     }
 
@@ -502,7 +502,7 @@ public sealed class TuiApp
         var comment = AnsiConsole.Ask<string>("Comment:");
         Console.CursorVisible = false;
 
-        var result = _engine.Execute(new AddComment(issueView.Issue.Id, comment));
+        var result = _engine.Execute(new AddComment(issueView.Issue.Id, comment, "user"));
         PauseWithMessage(result.Message, result.Success);
     }
 
@@ -512,8 +512,8 @@ public sealed class TuiApp
             .Where(issueEvent => issueEvent.IssueId == issueView.Issue.Id)
             .Select(issueEvent => issueEvent switch
             {
-                IssueCreated created => new DescriptionHistoryEntry(created.Timestamp, "Created", created.Description ?? string.Empty),
-                DescriptionUpdated updated => new DescriptionHistoryEntry(updated.Timestamp, "Updated", updated.Description),
+                IssueCreated created => new DescriptionHistoryEntry(created.Timestamp, "Created", created.Description ?? string.Empty, "n/a"),
+                DescriptionUpdated updated => new DescriptionHistoryEntry(updated.Timestamp, "Updated", updated.Description, updated.Actor),
                 _ => null
             })
             .Where(entry => entry is not null)
@@ -533,6 +533,7 @@ public sealed class TuiApp
         table.AddColumn("#");
         table.AddColumn("When (UTC)");
         table.AddColumn("Event");
+        table.AddColumn("By");
         table.AddColumn("Description");
 
         for (var i = 0; i < history.Length; i++)
@@ -543,6 +544,7 @@ public sealed class TuiApp
                 (i + 1).ToString(),
                 entry.Timestamp.ToString("u"),
                 entry.Source,
+                entry.Actor.EscapeMarkup(),
                 description.EscapeMarkup());
         }
 
@@ -585,11 +587,12 @@ public sealed class TuiApp
         {
             var table = new Table().Border(TableBorder.Rounded);
             table.AddColumn("When (UTC)");
+            table.AddColumn("By");
             table.AddColumn("Comment");
 
             foreach (var comment in comments.TakeLast(8))
             {
-                table.AddRow(comment.Timestamp.ToString("u"), comment.Comment.EscapeMarkup());
+                table.AddRow(comment.Timestamp.ToString("u"), comment.Actor.EscapeMarkup(), comment.Comment.EscapeMarkup());
             }
 
             AnsiConsole.Write(new Panel(table).Header($"Comments ({comments.Count})"));
@@ -762,5 +765,5 @@ public sealed class TuiApp
         return dueDate.Value.ToString("yyyy-MM-dd");
     }
 
-    private sealed record DescriptionHistoryEntry(DateTime Timestamp, string Source, string Description);
+    private sealed record DescriptionHistoryEntry(DateTime Timestamp, string Source, string Description, string Actor);
 }

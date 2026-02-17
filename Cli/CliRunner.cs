@@ -272,7 +272,7 @@ public static class CliRunner
                 return;
             }
 
-            var result = engine.Execute(new UpdateDescription(issueId, description));
+            var result = engine.Execute(new UpdateDescription(issueId, description, "user"));
             PrintCommandResult(result);
         }, dbOption, issueArgument, descriptionArgument);
 
@@ -295,7 +295,7 @@ public static class CliRunner
                 return;
             }
 
-            var result = engine.Execute(new AddComment(issueId, comment));
+            var result = engine.Execute(new AddComment(issueId, comment, "user"));
             PrintCommandResult(result);
         }, dbOption, issueArgument, commentArgument);
 

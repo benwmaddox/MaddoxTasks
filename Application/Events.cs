@@ -52,13 +52,15 @@ public sealed record DescriptionUpdated(
     Guid EventId,
     IssueId IssueId,
     DateTime Timestamp,
-    string Description
+    string Description,
+    string Actor = "user"
 ) : IssueEvent(EventId, IssueId, Timestamp);
 
 public sealed record CommentAdded(
     Guid EventId,
     IssueId IssueId,
     DateTime Timestamp,
-    string Comment
+    string Comment,
+    string Actor = "user"
 ) : IssueEvent(EventId, IssueId, Timestamp);
 
