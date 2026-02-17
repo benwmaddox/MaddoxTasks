@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maddox Tasks"
+  short_description: "Run and automate Maddox Tasks via TUI, CLI, and agent JSON commands"
+  default_prompt: "Use Maddox Tasks to perform task operations and return exact commands and verification output."

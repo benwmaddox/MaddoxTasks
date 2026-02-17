@@ -63,6 +63,28 @@ dotnet run -- label 1 architecture
 dotnet run -- summary week
 ```
 
+## CLI Examples (Released Binary)
+
+Windows:
+
+```powershell
+.\MaddoxTasks.exe create "Fix reload bug" --priority 2 --description "Investigate cache invalidation"
+.\MaddoxTasks.exe list --status Active
+.\MaddoxTasks.exe status 1 Done
+.\MaddoxTasks.exe label 1 architecture
+.\MaddoxTasks.exe summary week
+```
+
+Linux/macOS:
+
+```bash
+./MaddoxTasks create "Fix reload bug" --priority 2 --description "Investigate cache invalidation"
+./MaddoxTasks list --status Active
+./MaddoxTasks status 1 Done
+./MaddoxTasks label 1 architecture
+./MaddoxTasks summary week
+```
+
 Issue tokens accept:
 
 - Sequence (`1`, `2`, ...)
@@ -81,6 +103,22 @@ Execute structured command JSON:
 
 ```bash
 dotnet run -- agent command --file cmd.json
+```
+
+Released binary equivalents:
+
+Windows:
+
+```powershell
+.\MaddoxTasks.exe agent issues
+.\MaddoxTasks.exe agent command --file cmd.json
+```
+
+Linux/macOS:
+
+```bash
+./MaddoxTasks agent issues
+./MaddoxTasks agent command --file cmd.json
 ```
 
 `cmd.json` example:
@@ -119,4 +157,12 @@ Default output is `F:\MaddoxTasks`.
 - `Release` workflow builds zipped binaries and publishes GitHub Releases.
 - Nightly releases run daily, and publish only if code changed since the last nightly tag.
 - Stable releases are built from tags matching `v*` (for example `v0.2.0`).
+
+## Agent Skill Directory
+
+This repo now includes a skill package for agent use:
+
+- `skills/maddox-tasks/SKILL.md`
+- `skills/maddox-tasks/agents/openai.yaml`
+- `skills/maddox-tasks/references/commands.md`
 
