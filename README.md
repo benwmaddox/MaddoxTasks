@@ -31,6 +31,28 @@ Override with `MaddoxTasks.json` in current directory, app directory, or OS conf
 
 A ready template is included at `MaddoxTasks.json.example`.
 
+## Run Compiled Binary
+
+From GitHub Releases:
+
+1. Download the zip for your platform from the latest release.
+2. Extract it.
+3. Run:
+
+Windows:
+
+```powershell
+.\MaddoxTasks.exe
+```
+
+Linux/macOS:
+
+```bash
+./MaddoxTasks
+```
+
+No parameters are required. The app will keep using the same default `MaddoxTasks.db` path between runs.
+
 ## CLI examples
 
 ```bash
@@ -90,4 +112,10 @@ dotnet test .\tests\MaddoxTasks.Tests\MaddoxTasks.Tests.csproj
 ```
 
 Default output is `F:\MaddoxTasks`.
+
+## CI and Releases
+
+- `CI` workflow runs build + tests on pushes to `main` and pull requests.
+- `Release` workflow builds zipped binaries and publishes GitHub Releases.
+- Nightly releases run daily, and publish only if code changed since the last nightly tag.
 

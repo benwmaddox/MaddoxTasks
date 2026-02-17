@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  schedule:
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional explicit release tag (for stable/manual release)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  determine:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      tag: ${{ steps.detect.outputs.tag }}
+      prerelease: ${{ steps.detect.outputs.prerelease }}
+      release_name: ${{ steps.detect.outputs.release_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          event="${{ github.event_name }}"
+          ref_name="${{ github.ref_name }}"
+          dispatch_tag="${{ github.event.inputs.tag || '' }}"
+
+          should_release="false"
+          prerelease="true"
+          tag=""
+          release_name=""
+
+          if [[ "$event" == "push" && "$ref_name" == v* ]]; then
+            should_release="true"
+            prerelease="false"
+            tag="$ref_name"
+            release_name="Release $tag"
+          elif [[ "$event" == "workflow_dispatch" && -n "$dispatch_tag" ]]; then
+            should_release="true"
+            prerelease="false"
+            tag="$dispatch_tag"
+            release_name="Release $tag"
+          else
+            last_nightly_tag="$(git tag --list 'nightly-*' --sort=-creatordate | head -n1 || true)"
+            changed="true"
+            if [[ -n "$last_nightly_tag" ]]; then
+              if git diff --quiet "$last_nightly_tag"..HEAD; then
+                changed="false"
+              fi
+            fi
+
+            if [[ "$changed" == "true" ]]; then
+              stamp="$(date -u +%Y%m%d-%H%M)"
+              day="$(date -u +%Y-%m-%d)"
+              tag="nightly-$stamp"
+              release_name="Nightly $day"
+              should_release="true"
+              prerelease="true"
+            fi
+          fi
+
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "release_name=$release_name" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: determine
+    if: needs.determine.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            runtime: win-x64
+          - os: ubuntu-latest
+            runtime: linux-x64
+          - os: macos-latest
+            runtime: osx-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet publish MaddoxTasks.csproj \
+            -c Release \
+            -r "${{ matrix.runtime }}" \
+            --self-contained true \
+            /p:PublishSingleFile=true \
+            /p:PublishTrimmed=false \
+            -o "out/${{ matrix.runtime }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="MaddoxTasks-${{ needs.determine.outputs.tag }}-${{ matrix.runtime }}.zip"
+          cd out
+          if command -v 7z >/dev/null 2>&1; then
+            7z a -tzip "../$asset" "${{ matrix.runtime }}" >/dev/null
+          else
+            zip -r "../$asset" "${{ matrix.runtime }}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.runtime }}
+          path: MaddoxTasks-${{ needs.determine.outputs.tag }}-${{ matrix.runtime }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: [determine, build]
+    if: needs.determine.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.determine.outputs.tag }}
+          name: ${{ needs.determine.outputs.release_name }}
+          prerelease: ${{ needs.determine.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: dist/*.zip
