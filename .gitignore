@@ -1,0 +1,17 @@
+# Build outputs
+bin/
+obj/
+artifacts/
+
+# Runtime/local data
+*.db
+*.db-*
+MaddoxTasks.json
+
+# IDE/editor files
+.vs/
+.vscode/
+*.user
+*.suo
+*.tmp
+*.log
