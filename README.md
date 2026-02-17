@@ -118,4 +118,5 @@ Default output is `F:\MaddoxTasks`.
 - `CI` workflow runs build + tests on pushes to `main` and pull requests.
 - `Release` workflow builds zipped binaries and publishes GitHub Releases.
 - Nightly releases run daily, and publish only if code changed since the last nightly tag.
+- Stable releases are built from tags matching `v*` (for example `v0.2.0`).
 
