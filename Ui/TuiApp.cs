@@ -294,11 +294,11 @@ public sealed class TuiApp
         AnsiConsole.Clear();
         AnsiConsole.Write(new Panel(grid).Header("Issue"));
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Description edit is inline here. Enter saves. Esc cancels.[/]");
+        AnsiConsole.MarkupLine("[grey]Description edit is inline here. Enter a new value to save, or leave blank to keep current.[/]");
 
         var currentDescription = issue.Description ?? string.Empty;
         Console.CursorVisible = true;
-        var saved = TryReadLineWithInlineEditor("Description: ", currentDescription, out var description);
+        var saved = TryReadDescriptionWithConsoleLineEditor(currentDescription, out var description);
         Console.CursorVisible = false;
 
         if (!saved || description == currentDescription)
@@ -427,113 +427,23 @@ public sealed class TuiApp
         PauseWithMessage(result.Message, result.Success);
     }
 
-    private static bool TryReadLineWithInlineEditor(string label, string initialValue, out string result)
+    private static bool TryReadDescriptionWithConsoleLineEditor(string currentDescription, out string result)
     {
-        result = initialValue;
-        var buffer = new List<char>((initialValue ?? string.Empty).ToCharArray());
-        var cursorIndex = buffer.Count;
-        var previousLength = buffer.Count;
-
-        Console.Write(label);
-        var inputLeft = Console.CursorLeft;
-        var inputTop = Console.CursorTop;
-
-        if (buffer.Count > 0)
+        result = currentDescription;
+        if (!string.IsNullOrWhiteSpace(currentDescription))
         {
-            Console.Write(new string(buffer.ToArray()));
+            AnsiConsole.MarkupLine($"[grey]Current: {currentDescription.EscapeMarkup()}[/]");
         }
 
-        RepositionCursor(inputLeft, inputTop, cursorIndex);
-
-        while (true)
+        Console.Write("Description: ");
+        var input = Console.ReadLine();
+        if (input is null || string.IsNullOrWhiteSpace(input))
         {
-            var keyInfo = Console.ReadKey(intercept: true);
-            switch (keyInfo.Key)
-            {
-                case ConsoleKey.LeftArrow:
-                    if (cursorIndex > 0)
-                    {
-                        cursorIndex--;
-                    }
-                    break;
-                case ConsoleKey.RightArrow:
-                    if (cursorIndex < buffer.Count)
-                    {
-                        cursorIndex++;
-                    }
-                    break;
-                case ConsoleKey.Home:
-                    cursorIndex = 0;
-                    break;
-                case ConsoleKey.End:
-                    cursorIndex = buffer.Count;
-                    break;
-                case ConsoleKey.Backspace:
-                    if (cursorIndex > 0)
-                    {
-                        buffer.RemoveAt(cursorIndex - 1);
-                        cursorIndex--;
-                    }
-                    break;
-                case ConsoleKey.Delete:
-                    if (cursorIndex < buffer.Count)
-                    {
-                        buffer.RemoveAt(cursorIndex);
-                    }
-                    break;
-                case ConsoleKey.Enter:
-                    Console.WriteLine();
-                    result = new string(buffer.ToArray());
-                    return true;
-                case ConsoleKey.Escape:
-                    Console.WriteLine();
-                    return false;
-                default:
-                    if (!char.IsControl(keyInfo.KeyChar))
-                    {
-                        buffer.Insert(cursorIndex, keyInfo.KeyChar);
-                        cursorIndex++;
-                    }
-                    break;
-            }
-
-            RenderInlineEditBuffer(inputLeft, inputTop, buffer, cursorIndex, ref previousLength);
-        }
-    }
-
-    private static void RenderInlineEditBuffer(
-        int inputLeft,
-        int inputTop,
-        List<char> buffer,
-        int cursorIndex,
-        ref int previousLength)
-    {
-        Console.SetCursorPosition(inputLeft, inputTop);
-        Console.Write(new string(buffer.ToArray()));
-        if (previousLength > buffer.Count)
-        {
-            Console.Write(new string(' ', previousLength - buffer.Count));
+            return false;
         }
 
-        previousLength = buffer.Count;
-        RepositionCursor(inputLeft, inputTop, cursorIndex);
-    }
-
-    private static void RepositionCursor(int inputLeft, int inputTop, int cursorIndex)
-    {
-        var width = Console.BufferWidth <= 0 ? 80 : Console.BufferWidth;
-        var absoluteIndex = inputLeft + cursorIndex;
-        var targetTop = inputTop + (absoluteIndex / width);
-        var targetLeft = absoluteIndex % width;
-
-        try
-        {
-            Console.SetCursorPosition(targetLeft, targetTop);
-        }
-        catch
-        {
-            // Ignore cursor reposition failures in non-standard terminals.
-        }
+        result = input;
+        return true;
     }
 
     private void ConfigureFilter()

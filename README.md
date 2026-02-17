@@ -59,7 +59,7 @@ Issue tokens support:
 - Full GUID
 - GUID prefix
 
-Tip: in TUI, press `Enter` on an issue to open details and edit description inline (arrow keys, Home/End, Backspace/Delete supported). Press `Enter` to save or `Esc` to cancel.
+Tip: in TUI, press `Enter` on an issue to open details and edit description inline. The description input uses your terminal's native line editor.
 
 ## Agent JSON Commands
 
