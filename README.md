@@ -25,11 +25,11 @@ The app reuses the same DB on every run automatically.
 
 Main board:
 
-![Maddox Tasks main board](docs/screenshots/tui-main.png)
+![Maddox Tasks main board](docs/screenshots/tui-main-clean.png)
 
 Help overlay (`?`):
 
-![Maddox Tasks help overlay](docs/screenshots/tui-help.png)
+![Maddox Tasks help overlay](docs/screenshots/tui-help-clean.png)
 
 ## Everyday CLI Commands (Released Binary)
 
