@@ -113,8 +113,8 @@ jobs:
             -c Release \
             -r "${{ matrix.runtime }}" \
             --self-contained true \
-            /p:PublishSingleFile=true \
-            /p:PublishTrimmed=false \
+            -p:PublishSingleFile=true \
+            -p:PublishTrimmed=false \
             -o "out/${{ matrix.runtime }}"
 
       - name: Package
