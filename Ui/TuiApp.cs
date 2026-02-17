@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Spectre.Console;
 using IssueStatus = MaddoxTasks.Domain.Status;
 using MaddoxTasks.Application;
@@ -423,12 +425,93 @@ public sealed class TuiApp
 
     private void EditDescription(IssueView issueView)
     {
-        Console.CursorVisible = true;
-        var description = AnsiConsole.Ask<string>("Description:", issueView.Issue.Description);
-        Console.CursorVisible = false;
+        var currentDescription = issueView.Issue.Description ?? string.Empty;
+        if (!TryEditTextWithExternalEditor(currentDescription, out var description, out var error))
+        {
+            Console.CursorVisible = true;
+            AnsiConsole.MarkupLine($"[yellow]{error.EscapeMarkup()}[/]");
+            description = AnsiConsole.Ask<string>("Description:", currentDescription);
+            Console.CursorVisible = false;
+        }
 
         var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, description));
         PauseWithMessage(result.Message, result.Success);
+    }
+
+    private static bool TryEditTextWithExternalEditor(string initialValue, out string editedValue, out string error)
+    {
+        editedValue = initialValue;
+        error = string.Empty;
+
+        var filePath = Path.Combine(Path.GetTempPath(), $"maddoxtasks-description-{Guid.NewGuid():N}.txt");
+        File.WriteAllText(filePath, initialValue ?? string.Empty);
+
+        try
+        {
+            var editorExecutable = ResolveEditorExecutable();
+            var process = Process.Start(new ProcessStartInfo
+            {
+                FileName = editorExecutable,
+                Arguments = $"\"{filePath}\"",
+                UseShellExecute = false
+            });
+
+            if (process is null)
+            {
+                error = $"Could not start editor '{editorExecutable}'.";
+                return false;
+            }
+
+            process.WaitForExit();
+            if (process.ExitCode != 0)
+            {
+                error = $"Editor exited with code {process.ExitCode}.";
+                return false;
+            }
+
+            editedValue = File.ReadAllText(filePath);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            error = $"External editor unavailable: {exception.Message}";
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+            }
+            catch
+            {
+                // Ignore temp-file cleanup failures.
+            }
+        }
+    }
+
+    private static string ResolveEditorExecutable()
+    {
+        var configuredEditor = Environment.GetEnvironmentVariable("MADDOXTASKS_EDITOR");
+        if (string.IsNullOrWhiteSpace(configuredEditor))
+        {
+            configuredEditor = Environment.GetEnvironmentVariable("VISUAL");
+        }
+
+        if (string.IsNullOrWhiteSpace(configuredEditor))
+        {
+            configuredEditor = Environment.GetEnvironmentVariable("EDITOR");
+        }
+
+        if (!string.IsNullOrWhiteSpace(configuredEditor))
+        {
+            return configuredEditor.Trim();
+        }
+
+        return RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "notepad" : "vi";
     }
 
     private void ConfigureFilter()
