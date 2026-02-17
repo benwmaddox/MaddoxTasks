@@ -361,7 +361,89 @@ public static partial class AgentRunner
             }
         }
 
+        var configActor = TryResolveActorFromCodexConfig();
+        if (!string.IsNullOrWhiteSpace(configActor))
+        {
+            return configActor;
+        }
+
         return "agent";
+    }
+
+    private static string? TryResolveActorFromCodexConfig()
+    {
+        try
+        {
+            var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+            if (string.IsNullOrWhiteSpace(codexHome))
+            {
+                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (string.IsNullOrWhiteSpace(userHome))
+                {
+                    return null;
+                }
+
+                codexHome = Path.Combine(userHome, ".codex");
+            }
+
+            var configPath = Path.Combine(codexHome, "config.toml");
+            if (!File.Exists(configPath))
+            {
+                return null;
+            }
+
+            string? model = null;
+            string? effort = null;
+
+            foreach (var rawLine in File.ReadLines(configPath))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0 || line.StartsWith('#'))
+                {
+                    continue;
+                }
+
+                var separator = line.IndexOf('=');
+                if (separator <= 0)
+                {
+                    continue;
+                }
+
+                var key = line[..separator].Trim();
+                var value = line[(separator + 1)..].Trim();
+                if (value.Length == 0)
+                {
+                    continue;
+                }
+
+                if (value.StartsWith('"') && value.EndsWith('"') && value.Length >= 2)
+                {
+                    value = value[1..^1];
+                }
+
+                if (key.Equals("model", StringComparison.OrdinalIgnoreCase))
+                {
+                    model = value;
+                    continue;
+                }
+
+                if (key.Equals("model_reasoning_effort", StringComparison.OrdinalIgnoreCase))
+                {
+                    effort = value;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(model))
+            {
+                return null;
+            }
+
+            return string.IsNullOrWhiteSpace(effort) ? model : $"{model} {effort}";
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static bool TryGetString(JsonElement root, string propertyName, bool required, out string? value, out string error)

@@ -63,6 +63,68 @@ public sealed class AgentRunnerTests
         Assert.Equal("gpt-5.2", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
     }
 
+    [Fact]
+    public void ExecuteCommandJson_UsesCodexConfigWhenActorNotProvided()
+    {
+        var previousCodexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
+        var previousCodexModel = Environment.GetEnvironmentVariable("CODEX_MODEL");
+        var previousOpenAiModel = Environment.GetEnvironmentVariable("OPENAI_MODEL");
+        var previousAnthropicModel = Environment.GetEnvironmentVariable("ANTHROPIC_MODEL");
+        var previousClaudeModel = Environment.GetEnvironmentVariable("CLAUDE_MODEL");
+        var previousGenericModel = Environment.GetEnvironmentVariable("MODEL");
+        var previousMaddoxActor = Environment.GetEnvironmentVariable("MADDOX_TASKS_AGENT_ACTOR");
+        var previousMaddoxActorAlt = Environment.GetEnvironmentVariable("MADDOX_TASKS_ACTOR");
+
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"maddox-agent-tests-{Guid.NewGuid():N}");
+        var codexHome = Path.Combine(tempRoot, ".codex");
+        Directory.CreateDirectory(codexHome);
+        File.WriteAllText(Path.Combine(codexHome, "config.toml"), """
+model = "gpt-5.3-codex"
+model_reasoning_effort = "high"
+""");
+
+        try
+        {
+            Environment.SetEnvironmentVariable("CODEX_HOME", codexHome);
+            Environment.SetEnvironmentVariable("CODEX_MODEL", null);
+            Environment.SetEnvironmentVariable("OPENAI_MODEL", null);
+            Environment.SetEnvironmentVariable("ANTHROPIC_MODEL", null);
+            Environment.SetEnvironmentVariable("CLAUDE_MODEL", null);
+            Environment.SetEnvironmentVariable("MODEL", null);
+            Environment.SetEnvironmentVariable("MADDOX_TASKS_AGENT_ACTOR", null);
+            Environment.SetEnvironmentVariable("MADDOX_TASKS_ACTOR", null);
+
+            var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+            var store = new InMemoryEventStoreForAgentTests();
+            var engine = new IssueEngine(store, clock);
+            var createResult = engine.Execute(new CreateIssue("Task", "Desc", Priority.From(3), null, null));
+            Assert.True(createResult.Success);
+
+            var response = AgentRunner.ExecuteCommandJson(
+                engine,
+                """{"type":"AddComment","issueId":"1","comment":"Automated note"}""");
+
+            Assert.True(ResponseSuccess(response));
+            Assert.Equal("gpt-5.3-codex high", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODEX_HOME", previousCodexHome);
+            Environment.SetEnvironmentVariable("CODEX_MODEL", previousCodexModel);
+            Environment.SetEnvironmentVariable("OPENAI_MODEL", previousOpenAiModel);
+            Environment.SetEnvironmentVariable("ANTHROPIC_MODEL", previousAnthropicModel);
+            Environment.SetEnvironmentVariable("CLAUDE_MODEL", previousClaudeModel);
+            Environment.SetEnvironmentVariable("MODEL", previousGenericModel);
+            Environment.SetEnvironmentVariable("MADDOX_TASKS_AGENT_ACTOR", previousMaddoxActor);
+            Environment.SetEnvironmentVariable("MADDOX_TASKS_ACTOR", previousMaddoxActorAlt);
+
+            if (Directory.Exists(tempRoot))
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+        }
+    }
+
     private static bool ResponseSuccess(string responseJson)
     {
         using var document = JsonDocument.Parse(responseJson);

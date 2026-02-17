@@ -173,7 +173,7 @@ public static class CommandPlanner
     }
 
     private static bool IsAllowedActorChar(char ch)
-        => char.IsLetterOrDigit(ch) || ch is '.' or '_' or '-' or ':' or '/' or '+';
+        => char.IsLetterOrDigit(ch) || ch is '.' or '_' or '-' or ':' or '/' or '+' or ' ';
 
     private static DateTime? NormalizeDueDate(DateTime? dueDate)
     {

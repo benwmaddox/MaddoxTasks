@@ -134,12 +134,12 @@ public sealed class IssueEngineTests
         var createResult = engine.Execute(new CreateIssue("First task", null, Priority.From(3), null, null));
         var issueId = Assert.IsAssignableFrom<IssueId>(createResult.IssueId);
 
-        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "gpt-5.2"));
+        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "gpt-5.3-codex high"));
         Assert.True(commentResult.Success);
 
         var commentEvent = Assert.IsType<CommentAdded>(store.LoadAll()[1]);
-        Assert.Equal("gpt-5.2", commentEvent.Actor);
-        Assert.Equal("gpt-5.2", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
+        Assert.Equal("gpt-5.3-codex high", commentEvent.Actor);
+        Assert.Equal("gpt-5.3-codex high", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
     }
 
     [Fact]
