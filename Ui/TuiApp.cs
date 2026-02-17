@@ -314,6 +314,9 @@ public sealed class TuiApp
                 case 'd':
                     EditDescription(refreshedIssue);
                     break;
+                case 'h':
+                    ShowDescriptionHistory(refreshedIssue);
+                    break;
             }
         }
     }
@@ -503,6 +506,51 @@ public sealed class TuiApp
         PauseWithMessage(result.Message, result.Success);
     }
 
+    private void ShowDescriptionHistory(IssueView issueView)
+    {
+        var history = _engine.GetEventLog()
+            .Where(issueEvent => issueEvent.IssueId == issueView.Issue.Id)
+            .Select(issueEvent => issueEvent switch
+            {
+                IssueCreated created => new DescriptionHistoryEntry(created.Timestamp, "Created", created.Description ?? string.Empty),
+                DescriptionUpdated updated => new DescriptionHistoryEntry(updated.Timestamp, "Updated", updated.Description),
+                _ => null
+            })
+            .Where(entry => entry is not null)
+            .Select(entry => entry!)
+            .ToArray();
+
+        AnsiConsole.Clear();
+        if (history.Length == 0)
+        {
+            AnsiConsole.MarkupLine("[grey]No description history found for this issue.[/]");
+            AnsiConsole.MarkupLine("[grey]Press any key to return[/]");
+            Console.ReadKey(intercept: true);
+            return;
+        }
+
+        var table = new Table().Border(TableBorder.Rounded);
+        table.AddColumn("#");
+        table.AddColumn("When (UTC)");
+        table.AddColumn("Event");
+        table.AddColumn("Description");
+
+        for (var i = 0; i < history.Length; i++)
+        {
+            var entry = history[i];
+            var description = string.IsNullOrWhiteSpace(entry.Description) ? "-" : entry.Description;
+            table.AddRow(
+                (i + 1).ToString(),
+                entry.Timestamp.ToString("u"),
+                entry.Source,
+                description.EscapeMarkup());
+        }
+
+        AnsiConsole.Write(new Panel(table).Header("Description history"));
+        AnsiConsole.MarkupLine("[grey]Press any key to return[/]");
+        Console.ReadKey(intercept: true);
+    }
+
     private IssueView? TryGetIssue(IssueId issueId)
         => _engine.QueryIssues(includeDone: true).FirstOrDefault(view => view.Issue.Id == issueId);
 
@@ -548,7 +596,7 @@ public sealed class TuiApp
         }
 
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   d description   q/Esc back[/]");
+        AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   d description   h desc-history   q/Esc back[/]");
     }
 
     private void ConfigureFilter()
@@ -713,4 +761,6 @@ public sealed class TuiApp
 
         return dueDate.Value.ToString("yyyy-MM-dd");
     }
+
+    private sealed record DescriptionHistoryEntry(DateTime Timestamp, string Source, string Description);
 }

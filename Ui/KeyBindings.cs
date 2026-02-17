@@ -31,6 +31,7 @@ public static class KeyBindingRegistry
         new("p", "Change priority (in detail view)", KeyContext.IssueDetail),
         new("t", "Add/remove label (in detail view)", KeyContext.IssueDetail),
         new("d", "Edit description (in detail view)", KeyContext.IssueDetail),
+        new("h", "Show description history (in detail view)", KeyContext.IssueDetail),
         new("q", "Close detail view", KeyContext.IssueDetail),
         new("Esc", "Close detail view", KeyContext.IssueDetail),
         new("/", "Open filter bar", KeyContext.Filtering),

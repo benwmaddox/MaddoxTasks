@@ -61,7 +61,7 @@ Issue tokens support:
 - Full GUID
 - GUID prefix
 
-Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, and `q`/`Esc` to go back.
+Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, `h` description history, and `q`/`Esc` to go back.
 
 ## Agent JSON Commands
 
