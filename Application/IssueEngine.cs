@@ -10,6 +10,7 @@ public sealed class IssueEngine
         Status.Active,
         Status.Next,
         Status.Blocked,
+        Status.ReadyForReview,
         Status.Backlog,
         Status.Done
     ];

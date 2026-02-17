@@ -316,7 +316,7 @@ public static partial class AgentRunner
     }
 
     private static bool TryParseStatus(string input, out Status status)
-        => Enum.TryParse(input, ignoreCase: true, out status);
+        => StatusText.TryParse(input, out status);
 
     private static string NormalizeIncomingJson(string json)
     {

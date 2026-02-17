@@ -38,6 +38,12 @@ For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model ident
 3. Execute with `agent command --file <json-file>` or stdin. Treat inline `--json` as last-resort on PowerShell.
 4. Re-read with `agent issues` and verify deterministic output.
 
+## Task Lifecycle Expectations
+
+1. When beginning work on a task, if the task status is `Next`, change it to `Active` before doing implementation work.
+2. While working, record decision points as comments using `AddComment`.
+3. When implementation is complete, change the task status to `Ready for Review`.
+
 ## Release and CI Workflow
 
 1. Use tag `v*` (for example `v0.2.0`) for stable releases.

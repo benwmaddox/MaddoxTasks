@@ -30,7 +30,62 @@ public enum Status
     Next,
     Active,
     Blocked,
+    ReadyForReview,
     Done
+}
+
+public static class StatusText
+{
+    public static string ToDisplayString(this Status status)
+        => status switch
+        {
+            Status.ReadyForReview => "Ready for Review",
+            _ => status.ToString()
+        };
+
+    public static bool TryParse(string? input, out Status status)
+    {
+        status = default;
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return false;
+        }
+
+        var trimmed = input.Trim();
+        if (Enum.TryParse<Status>(trimmed, ignoreCase: true, out status))
+        {
+            return true;
+        }
+
+        var normalizedInput = Normalize(trimmed);
+        foreach (var candidate in Enum.GetValues<Status>())
+        {
+            if (Normalize(candidate.ToString()) == normalizedInput)
+            {
+                status = candidate;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string Normalize(string value)
+    {
+        var buffer = new char[value.Length];
+        var index = 0;
+        foreach (var ch in value)
+        {
+            if (char.IsWhiteSpace(ch) || ch is '-' or '_')
+            {
+                continue;
+            }
+
+            buffer[index++] = char.ToLowerInvariant(ch);
+        }
+
+        return new string(buffer, 0, index);
+    }
 }
 
 public readonly record struct Priority(int Value)

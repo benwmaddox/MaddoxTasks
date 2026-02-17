@@ -89,7 +89,7 @@ public static class CliRunner
                 table.AddRow(
                     issue.ShortId,
                     issue.GuidPrefix,
-                    issue.Issue.Status.ToString(),
+                    issue.Issue.Status.ToDisplayString(),
                     issue.Issue.Priority.Value.ToString(),
                     issue.Issue.DueDate?.ToString("yyyy-MM-dd") ?? "-",
                     issue.Issue.Labels.Count == 0 ? "-" : string.Join(",", issue.Issue.Labels),
@@ -339,7 +339,7 @@ public static class CliRunner
 
             foreach (var status in Enum.GetValues<IssueStatus>())
             {
-                table.AddRow(status.ToString(), issues.Count(issue => issue.Issue.Status == status).ToString());
+                table.AddRow(status.ToDisplayString(), issues.Count(issue => issue.Issue.Status == status).ToString());
             }
 
             var overdue = issues.Count(issue => issue.Issue.DueDate.HasValue && issue.Issue.DueDate.Value.Date < now.Date);
@@ -515,7 +515,7 @@ public static class CliRunner
     }
 
     private static bool TryParseStatus(string value, out IssueStatus status)
-        => Enum.TryParse(value, ignoreCase: true, out status);
+        => StatusText.TryParse(value, out status);
 
     private static bool TryParseOptionalStatus(string? value, out IssueStatus? status)
     {
@@ -525,7 +525,7 @@ public static class CliRunner
             return true;
         }
 
-        if (!Enum.TryParse<IssueStatus>(value, ignoreCase: true, out var parsed))
+        if (!StatusText.TryParse(value, out var parsed))
         {
             return false;
         }

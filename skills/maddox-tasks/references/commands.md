@@ -18,8 +18,8 @@ Linux/macOS:
 
 Optional filters on `agent issues`:
 
-- `--status <Backlog|Active|Blocked|Next|Done>`
-- `--not-status <Backlog|Active|Blocked|Next|Done>`
+- `--status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done>`
+- `--not-status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done>`
 - `--max-priority <1..5>`
 - `--labels <comma,separated,labels>`
 - `--due-before <yyyy-MM-dd or date-time>`

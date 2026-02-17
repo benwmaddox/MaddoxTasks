@@ -12,6 +12,7 @@ public sealed class TuiApp
         IssueStatus.Active,
         IssueStatus.Next,
         IssueStatus.Blocked,
+        IssueStatus.ReadyForReview,
         IssueStatus.Backlog,
         IssueStatus.Done
     ];
@@ -78,7 +79,7 @@ public sealed class TuiApp
             }
 
             var group = views.Where(view => view.Issue.Status == status).ToList();
-            AnsiConsole.MarkupLine($"[bold]{status.ToString().ToUpperInvariant()} ({group.Count})[/]");
+            AnsiConsole.MarkupLine($"[bold]{status.ToDisplayString().ToUpperInvariant()} ({group.Count})[/]");
 
             if (group.Count == 0)
             {
@@ -120,12 +121,12 @@ public sealed class TuiApp
         var parts = new List<string>();
         if (_activeFilter.StatusEquals.HasValue)
         {
-            parts.Add($"status={_activeFilter.StatusEquals.Value}");
+            parts.Add($"status={_activeFilter.StatusEquals.Value.ToDisplayString()}");
         }
 
         if (_activeFilter.StatusNotEquals.HasValue)
         {
-            parts.Add($"status!={_activeFilter.StatusNotEquals.Value}");
+            parts.Add($"status!={_activeFilter.StatusNotEquals.Value.ToDisplayString()}");
         }
 
         if (_activeFilter.PriorityLessThanOrEqual.HasValue)
@@ -380,7 +381,8 @@ public sealed class TuiApp
         var target = AnsiConsole.Prompt(
             new SelectionPrompt<IssueStatus>()
                 .Title("New status")
-                .AddChoices(Enum.GetValues<IssueStatus>()));
+                .AddChoices(Enum.GetValues<IssueStatus>())
+                .UseConverter(status => status.ToDisplayString()));
         Console.CursorVisible = false;
 
         var result = _engine.Execute(new ChangeStatus(issueView.Issue.Id, target));
@@ -565,7 +567,7 @@ public sealed class TuiApp
         grid.AddColumn();
         grid.AddRow("Short ID", issueView.ShortId);
         grid.AddRow("GUID", issue.Id.ToString());
-        grid.AddRow("Status", issue.Status.ToString());
+        grid.AddRow("Status", issue.Status.ToDisplayString());
         grid.AddRow("Priority", issue.Priority.Value.ToString());
         grid.AddRow("Created", issue.CreatedAt.ToString("u"));
         grid.AddRow("Updated", issue.UpdatedAt.ToString("u"));
@@ -586,6 +588,7 @@ public sealed class TuiApp
         else
         {
             var table = new Table().Border(TableBorder.Rounded);
+            table.ShowRowSeparators = true;
             table.AddColumn("When (UTC)");
             table.AddColumn("By");
             table.AddColumn("Comment");
@@ -607,7 +610,8 @@ public sealed class TuiApp
         Console.CursorVisible = true;
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Filter[/]");
-        var statusEqualsText = AnsiConsole.Ask<string>("status equals (Backlog, Next, Active, Blocked, Done, blank for none):", string.Empty);
+        var statusOptions = string.Join(", ", Enum.GetValues<IssueStatus>().Select(status => status.ToDisplayString()));
+        var statusEqualsText = AnsiConsole.Ask<string>($"status equals ({statusOptions}, blank for none):", string.Empty);
         var statusNotText = AnsiConsole.Ask<string>("status not equals (blank for none):", string.Empty);
         var priorityText = AnsiConsole.Ask<string>("priority <= (1-5, blank for none):", string.Empty);
         var labelsText = AnsiConsole.Ask<string>("labels (comma-separated, blank for none):", string.Empty);
@@ -691,7 +695,7 @@ public sealed class TuiApp
             return true;
         }
 
-        if (!Enum.TryParse<IssueStatus>(input, ignoreCase: true, out var parsed))
+        if (!StatusText.TryParse(input, out var parsed))
         {
             return false;
         }

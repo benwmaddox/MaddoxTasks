@@ -208,6 +208,23 @@ model_reasoning_effort = "high"
         }
     }
 
+    [Fact]
+    public void ExecuteCommandJson_ParsesReadyForReviewStatusWithSpaces()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+        var createResult = engine.Execute(new CreateIssue("Task", "Desc", Priority.From(3), null, null));
+        Assert.True(createResult.Success);
+
+        var response = AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"ChangeStatus","issueId":"1","newStatus":"Ready for Review"}""");
+
+        Assert.True(ResponseSuccess(response));
+        Assert.Equal(Status.ReadyForReview, engine.QueryIssues(includeDone: true).Single().Issue.Status);
+    }
+
     private static bool ResponseSuccess(string responseJson)
     {
         using var document = JsonDocument.Parse(responseJson);
