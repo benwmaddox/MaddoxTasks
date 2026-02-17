@@ -20,7 +20,8 @@ public sealed class IssueEngineTests
             new PriorityChanged(Guid.NewGuid(), issueId, createdAt.AddMinutes(2), Priority.From(1)),
             new LabelAdded(Guid.NewGuid(), issueId, createdAt.AddMinutes(3), "architecture"),
             new DescriptionUpdated(Guid.NewGuid(), issueId, createdAt.AddMinutes(4), "Final description"),
-            new LabelRemoved(Guid.NewGuid(), issueId, createdAt.AddMinutes(5), "architecture")
+            new LabelRemoved(Guid.NewGuid(), issueId, createdAt.AddMinutes(5), "architecture"),
+            new CommentAdded(Guid.NewGuid(), issueId, createdAt.AddMinutes(6), "Ship this after review")
         };
 
         var state = IssueState.Replay(events);
@@ -31,9 +32,11 @@ public sealed class IssueEngineTests
         Assert.Equal(Status.Active, issue.Status);
         Assert.Equal(1, issue.Priority.Value);
         Assert.Equal(createdAt, issue.CreatedAt);
-        Assert.Equal(createdAt.AddMinutes(5), issue.UpdatedAt);
+        Assert.Equal(createdAt.AddMinutes(6), issue.UpdatedAt);
         Assert.Equal(dueDate, issue.DueDate);
         Assert.Empty(issue.Labels);
+        Assert.Single(issue.Comments);
+        Assert.Equal("Ship this after review", issue.Comments[0].Comment);
     }
 
     [Fact]
@@ -57,6 +60,11 @@ public sealed class IssueEngineTests
         var issue = engine.QueryIssues(includeDone: true).Single().Issue;
         Assert.Equal(Status.Blocked, issue.Status);
         Assert.Equal("First task", issue.Title);
+
+        var commentResult = engine.Execute(new AddComment(issueId, "Need logs from staging"));
+        Assert.True(commentResult.Success);
+        Assert.Equal(3, store.LoadAll().Count);
+        Assert.IsType<CommentAdded>(store.LoadAll()[2]);
     }
 
     [Fact]
@@ -97,6 +105,21 @@ public sealed class IssueEngineTests
         Assert.Equal(firstPass, secondPass);
         Assert.Single(firstPass);
         Assert.Equal(id1, firstPass[0]);
+    }
+
+    [Fact]
+    public void AddComment_RequiresNonEmptyComment()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+
+        var createResult = engine.Execute(new CreateIssue("First task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(createResult.IssueId);
+
+        var commentResult = engine.Execute(new AddComment(issueId, "   "));
+        Assert.False(commentResult.Success);
+        Assert.Single(store.LoadAll());
     }
 }
 

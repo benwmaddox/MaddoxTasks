@@ -16,6 +16,7 @@ public static class CommandPlanner
             AddLabel addLabel => PlanLabelAdd(addLabel, state, timestamp),
             RemoveLabel removeLabel => PlanLabelRemove(removeLabel, state, timestamp),
             UpdateDescription updateDescription => PlanDescriptionUpdate(updateDescription, state, timestamp),
+            AddComment addComment => PlanCommentAdd(addComment, state, timestamp),
             _ => throw new CommandValidationException($"Unsupported command '{command.GetType().Name}'.")
         };
     }
@@ -106,6 +107,19 @@ public static class CommandPlanner
         }
 
         return new DescriptionUpdated(Guid.NewGuid(), command.IssueId, timestamp, normalized);
+    }
+
+    private static IssueEvent PlanCommentAdd(AddComment command, IssueState state, DateTime timestamp)
+    {
+        _ = RequireIssue(command.IssueId, state);
+        var normalized = command.Comment?.Trim() ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            throw new CommandValidationException("Comment cannot be empty.");
+        }
+
+        return new CommentAdded(Guid.NewGuid(), command.IssueId, timestamp, normalized);
     }
 
     private static Issue RequireIssue(IssueId issueId, IssueState state)

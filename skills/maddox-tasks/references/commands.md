@@ -25,6 +25,7 @@ Windows:
 .\MaddoxTasks.exe priority 1 1
 .\MaddoxTasks.exe label 1 architecture
 .\MaddoxTasks.exe describe 1 "Updated description"
+.\MaddoxTasks.exe comment 1 "Waiting on CI"
 .\MaddoxTasks.exe summary week
 ```
 
@@ -37,6 +38,7 @@ Linux/macOS:
 ./MaddoxTasks priority 1 1
 ./MaddoxTasks label 1 architecture
 ./MaddoxTasks describe 1 "Updated description"
+./MaddoxTasks comment 1 "Waiting on CI"
 ./MaddoxTasks summary week
 ```
 
@@ -54,5 +56,15 @@ Linux/macOS:
   "type": "ChangeStatus",
   "issueId": "1",
   "newStatus": "Active"
+}
+```
+
+Add a comment:
+
+```json
+{
+  "type": "AddComment",
+  "issueId": "1",
+  "comment": "Blocked on dependency upgrade"
 }
 ```

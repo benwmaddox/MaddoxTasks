@@ -8,6 +8,7 @@ namespace MaddoxTasks.Infrastructure;
 public static class JsonDefaults
 {
     public static readonly JsonSerializerOptions Options = BuildOptions();
+    internal static readonly MaddoxTasksJsonContext Context = new(Options);
 
     private static JsonSerializerOptions BuildOptions()
     {
@@ -17,7 +18,7 @@ public static class JsonDefaults
             WriteIndented = false
         };
 
-        options.Converters.Add(new JsonStringEnumConverter());
+        options.Converters.Add(new JsonStringEnumConverter<Status>());
         options.Converters.Add(new IssueIdJsonConverter());
         options.Converters.Add(new PriorityJsonConverter());
 

@@ -1,11 +1,12 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using MaddoxTasks.Application;
 using MaddoxTasks.Domain;
 using MaddoxTasks.Infrastructure;
 
 namespace MaddoxTasks.Agent;
 
-public static class AgentRunner
+public static partial class AgentRunner
 {
     public static string ExecuteCommandJson(IssueEngine engine, string json)
     {
@@ -37,12 +38,15 @@ public static class AgentRunner
                 view.Issue.Priority.Value,
                 view.Issue.ParentId?.ToString(),
                 view.Issue.Labels.ToArray(),
+                view.Issue.Comments
+                    .Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment))
+                    .ToArray(),
                 view.Issue.CreatedAt,
                 view.Issue.UpdatedAt,
                 view.Issue.DueDate))
             .ToArray();
 
-        return JsonSerializer.Serialize(issues, PrettyOptions);
+        return JsonSerializer.Serialize(issues, PrettyJsonContext.AgentIssueDtoArray);
     }
 
     private static bool TryParseCommand(string json, IssueEngine engine, out Command? command, out string error)
@@ -97,6 +101,8 @@ public static class AgentRunner
                     return TryBuildLabelRemove(root, engine, out command, out error);
                 case "updatedescription":
                     return TryBuildDescriptionUpdate(root, engine, out command, out error);
+                case "addcomment":
+                    return TryBuildCommentAdd(root, engine, out command, out error);
                 default:
                     error = $"Unsupported command type '{type}'.";
                     return false;
@@ -269,6 +275,23 @@ public static class AgentRunner
         return true;
     }
 
+    private static bool TryBuildCommentAdd(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    {
+        command = null;
+        if (!TryResolveIssue(root, engine, out var issueId, out error))
+        {
+            return false;
+        }
+
+        if (!TryGetString(root, "comment", required: true, out var comment, out error))
+        {
+            return false;
+        }
+
+        command = new AddComment(issueId, comment!);
+        return true;
+    }
+
     private static bool TryResolveIssue(JsonElement root, IssueEngine engine, out IssueId issueId, out string error)
     {
         issueId = default;
@@ -347,12 +370,12 @@ public static class AgentRunner
     }
 
     private static string SerializeResponse(AgentCommandResponse response)
-        => JsonSerializer.Serialize(response, PrettyOptions);
+        => JsonSerializer.Serialize(response, PrettyJsonContext.AgentCommandResponse);
 
-    private static readonly JsonSerializerOptions PrettyOptions = new(JsonDefaults.Options)
+    private static readonly AgentJsonContext PrettyJsonContext = new(new JsonSerializerOptions(JsonDefaults.Options)
     {
         WriteIndented = true
-    };
+    });
 
     private sealed record AgentCommandResponse(bool Success, string Message, string? IssueId, string? EventId);
 
@@ -367,8 +390,18 @@ public static class AgentRunner
         int Priority,
         string? ParentId,
         string[] Labels,
+        AgentIssueCommentDto[] Comments,
         DateTime CreatedAt,
         DateTime UpdatedAt,
         DateTime? DueDate);
+
+    private sealed record AgentIssueCommentDto(DateTime Timestamp, string Comment);
+
+    [JsonSourceGenerationOptions(
+        PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
+        WriteIndented = true)]
+    [JsonSerializable(typeof(AgentIssueDto[]))]
+    [JsonSerializable(typeof(AgentCommandResponse))]
+    private sealed partial class AgentJsonContext : JsonSerializerContext;
 }
 

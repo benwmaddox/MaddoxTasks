@@ -55,3 +55,10 @@ public sealed record DescriptionUpdated(
     string Description
 ) : IssueEvent(EventId, IssueId, Timestamp);
 
+public sealed record CommentAdded(
+    Guid EventId,
+    IssueId IssueId,
+    DateTime Timestamp,
+    string Comment
+) : IssueEvent(EventId, IssueId, Timestamp);
+

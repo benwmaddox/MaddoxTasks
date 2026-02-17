@@ -26,7 +26,7 @@ Read `references/commands.md` for concrete command patterns.
 ## Agent Command Workflow
 
 1. Use `agent issues` to read current state as JSON.
-2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`).
+2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
 3. Execute with `agent command --file <json-file>` or `--json <payload>`.
 4. Re-read with `agent issues` and verify deterministic output.
 

@@ -276,38 +276,46 @@ public sealed class TuiApp
 
     private void OpenIssue(IssueView issueView)
     {
-        var issue = issueView.Issue;
-        var grid = new Grid();
-        grid.AddColumn();
-        grid.AddColumn();
-        grid.AddRow("Short ID", issueView.ShortId);
-        grid.AddRow("GUID", issue.Id.ToString());
-        grid.AddRow("Status", issue.Status.ToString());
-        grid.AddRow("Priority", issue.Priority.Value.ToString());
-        grid.AddRow("Created", issue.CreatedAt.ToString("u"));
-        grid.AddRow("Updated", issue.UpdatedAt.ToString("u"));
-        grid.AddRow("Due", issue.DueDate?.ToString("u") ?? "-");
-        grid.AddRow("Labels", issue.Labels.Count == 0 ? "-" : string.Join(",", issue.Labels));
-        grid.AddRow("Title", issue.Title);
-        grid.AddRow("Description", string.IsNullOrWhiteSpace(issue.Description) ? "-" : issue.Description);
+        var issueId = issueView.Issue.Id;
 
-        AnsiConsole.Clear();
-        AnsiConsole.Write(new Panel(grid).Header("Issue"));
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Description edit is inline here. Enter a new value to save, or leave blank to keep current.[/]");
-
-        var currentDescription = issue.Description ?? string.Empty;
-        Console.CursorVisible = true;
-        var saved = TryReadDescriptionWithConsoleLineEditor(currentDescription, out var description);
-        Console.CursorVisible = false;
-
-        if (!saved || description == currentDescription)
+        while (true)
         {
-            return;
-        }
+            var refreshedIssue = TryGetIssue(issueId);
+            if (refreshedIssue is null)
+            {
+                PauseWithMessage($"Issue '{issueId}' was not found.", success: false);
+                return;
+            }
 
-        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, description));
-        PauseWithMessage(result.Message, result.Success);
+            RenderIssueDetail(refreshedIssue);
+            var keyInfo = Console.ReadKey(intercept: true);
+            if (keyInfo.Key == ConsoleKey.Escape)
+            {
+                return;
+            }
+
+            var keyChar = char.ToLowerInvariant(keyInfo.KeyChar);
+            switch (keyChar)
+            {
+                case 'q':
+                    return;
+                case 'c':
+                    AddIssueComment(refreshedIssue);
+                    break;
+                case 's':
+                    ChangeStatus(refreshedIssue);
+                    break;
+                case 'p':
+                    ChangePriority(refreshedIssue);
+                    break;
+                case 't':
+                    ToggleLabel(refreshedIssue);
+                    break;
+                case 'd':
+                    EditDescription(refreshedIssue);
+                    break;
+            }
+        }
     }
 
     private void CreateIssue()
@@ -427,23 +435,120 @@ public sealed class TuiApp
         PauseWithMessage(result.Message, result.Success);
     }
 
-    private static bool TryReadDescriptionWithConsoleLineEditor(string currentDescription, out string result)
+    private void EditDescription(IssueView issueView)
     {
-        result = currentDescription;
+        Console.CursorVisible = true;
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold]Edit description[/]");
+
+        var currentDescription = issueView.Issue.Description ?? string.Empty;
         if (!string.IsNullOrWhiteSpace(currentDescription))
         {
             AnsiConsole.MarkupLine($"[grey]Current: {currentDescription.EscapeMarkup()}[/]");
         }
 
-        Console.Write("Description: ");
-        var input = Console.ReadLine();
-        if (input is null || string.IsNullOrWhiteSpace(input))
+        var mode = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("Description action")
+                .AddChoices("replace", "append", "clear", "cancel"));
+
+        string nextDescription;
+        switch (mode)
         {
-            return false;
+            case "replace":
+                nextDescription = AnsiConsole.Ask<string>("New description (blank clears):", string.Empty).Trim();
+                break;
+            case "append":
+                var toAppend = AnsiConsole.Ask<string>("Text to append:");
+                if (string.IsNullOrWhiteSpace(toAppend))
+                {
+                    Console.CursorVisible = false;
+                    PauseWithMessage("Description append text cannot be empty.", success: false);
+                    return;
+                }
+
+                var existing = currentDescription.Trim();
+                nextDescription = string.IsNullOrWhiteSpace(existing)
+                    ? toAppend.Trim()
+                    : $"{existing}{Environment.NewLine}{toAppend.Trim()}";
+                break;
+            case "clear":
+                nextDescription = string.Empty;
+                break;
+            default:
+                Console.CursorVisible = false;
+                return;
         }
 
-        result = input;
-        return true;
+        Console.CursorVisible = false;
+        if (string.Equals(nextDescription, currentDescription, StringComparison.Ordinal))
+        {
+            PauseWithMessage("Description is unchanged.", success: false);
+            return;
+        }
+
+        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, nextDescription));
+        PauseWithMessage(result.Message, result.Success);
+    }
+
+    private void AddIssueComment(IssueView issueView)
+    {
+        Console.CursorVisible = true;
+        AnsiConsole.Clear();
+        AnsiConsole.MarkupLine("[bold]Add comment[/]");
+        var comment = AnsiConsole.Ask<string>("Comment:");
+        Console.CursorVisible = false;
+
+        var result = _engine.Execute(new AddComment(issueView.Issue.Id, comment));
+        PauseWithMessage(result.Message, result.Success);
+    }
+
+    private IssueView? TryGetIssue(IssueId issueId)
+        => _engine.QueryIssues(includeDone: true).FirstOrDefault(view => view.Issue.Id == issueId);
+
+    private static void RenderIssueDetail(IssueView issueView)
+    {
+        var issue = issueView.Issue;
+
+        var grid = new Grid();
+        grid.AddColumn();
+        grid.AddColumn();
+        grid.AddRow("Short ID", issueView.ShortId);
+        grid.AddRow("GUID", issue.Id.ToString());
+        grid.AddRow("Status", issue.Status.ToString());
+        grid.AddRow("Priority", issue.Priority.Value.ToString());
+        grid.AddRow("Created", issue.CreatedAt.ToString("u"));
+        grid.AddRow("Updated", issue.UpdatedAt.ToString("u"));
+        grid.AddRow("Due", issue.DueDate?.ToString("u") ?? "-");
+        grid.AddRow("Labels", (issue.Labels.Count == 0 ? "-" : string.Join(",", issue.Labels)).EscapeMarkup());
+        grid.AddRow("Title", issue.Title.EscapeMarkup());
+        grid.AddRow("Description", (string.IsNullOrWhiteSpace(issue.Description) ? "-" : issue.Description).EscapeMarkup());
+
+        AnsiConsole.Clear();
+        AnsiConsole.Write(new Panel(grid).Header("Issue detail"));
+        AnsiConsole.WriteLine();
+
+        var comments = issue.Comments;
+        if (comments.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[grey]Comments: none[/]");
+        }
+        else
+        {
+            var table = new Table().Border(TableBorder.Rounded);
+            table.AddColumn("When (UTC)");
+            table.AddColumn("Comment");
+
+            foreach (var comment in comments.TakeLast(8))
+            {
+                table.AddRow(comment.Timestamp.ToString("u"), comment.Comment.EscapeMarkup());
+            }
+
+            AnsiConsole.Write(new Panel(table).Header($"Comments ({comments.Count})"));
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   d description   q/Esc back[/]");
     }
 
     private void ConfigureFilter()

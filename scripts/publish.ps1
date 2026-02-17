@@ -2,7 +2,8 @@ param(
     [string[]]$Runtime = @("win-x64"),
     [string]$Configuration = "Release",
     [string]$OutputRoot = "F:\\MaddoxTasks",
-    [switch]$NoSelfContained
+    [switch]$NoSelfContained,
+    [switch]$NoAot
 )
 
 Set-StrictMode -Version Latest
@@ -16,6 +17,8 @@ if (-not (Test-Path $projectFile)) {
 }
 
 $selfContained = if ($NoSelfContained) { "false" } else { "true" }
+$publishAot = if ($NoAot) { "false" } else { "true" }
+$publishTrimmed = if ($NoAot) { "false" } else { "true" }
 if (-not [System.IO.Path]::IsPathRooted($OutputRoot)) {
     $OutputRoot = Join-Path $projectRoot $OutputRoot
 }
@@ -25,14 +28,15 @@ New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 foreach ($rid in $Runtime) {
     $outDir = if ($Runtime.Count -eq 1) { $outputRoot } else { Join-Path $outputRoot $rid }
     New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-    Write-Host "Publishing runtime '$rid' to '$outDir'..."
+    Write-Host "Publishing runtime '$rid' to '$outDir' (AOT=$publishAot)..."
 
     dotnet publish $projectFile `
         -c $Configuration `
         -r $rid `
         --self-contained $selfContained `
         /p:PublishSingleFile=true `
-        /p:PublishTrimmed=false `
+        /p:PublishAot=$publishAot `
+        /p:PublishTrimmed=$publishTrimmed `
         -o $outDir
 
     if ($LASTEXITCODE -ne 0) {

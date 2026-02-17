@@ -28,6 +28,7 @@ public static class CliRunner
         root.AddCommand(BuildPriorityCommand(dbOption));
         root.AddCommand(BuildLabelCommand(dbOption));
         root.AddCommand(BuildDescribeCommand(dbOption));
+        root.AddCommand(BuildCommentCommand(dbOption));
         root.AddCommand(BuildSummaryCommand(dbOption));
         root.AddCommand(BuildAgentCommand(dbOption));
 
@@ -274,6 +275,29 @@ public static class CliRunner
             var result = engine.Execute(new UpdateDescription(issueId, description));
             PrintCommandResult(result);
         }, dbOption, issueArgument, descriptionArgument);
+
+        return command;
+    }
+
+    private static CliCommand BuildCommentCommand(Option<string> dbOption)
+    {
+        var issueArgument = new Argument<string>("issue", "Issue token (sequence, guid, or guid prefix).");
+        var commentArgument = new Argument<string>("comment", "Comment text.");
+        var command = new CliCommand("comment", "Add an issue comment.");
+        command.AddArgument(issueArgument);
+        command.AddArgument(commentArgument);
+
+        command.SetHandler((string dbPath, string issueToken, string comment) =>
+        {
+            var engine = CreateEngine(dbPath);
+            if (!TryResolveIssue(engine, issueToken, out var issueId))
+            {
+                return;
+            }
+
+            var result = engine.Execute(new AddComment(issueId, comment));
+            PrintCommandResult(result);
+        }, dbOption, issueArgument, commentArgument);
 
         return command;
     }

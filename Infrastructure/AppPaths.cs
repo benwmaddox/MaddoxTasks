@@ -35,9 +35,7 @@ public static class AppPaths
             }
 
             var rawJson = File.ReadAllText(settingsFile);
-            var settings = JsonSerializer.Deserialize<MaddoxTasksSettings>(
-                rawJson,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            var settings = JsonSerializer.Deserialize(rawJson, JsonDefaults.Context.MaddoxTasksSettings);
 
             if (string.IsNullOrWhiteSpace(settings?.DatabasePath))
             {

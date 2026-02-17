@@ -40,6 +40,7 @@ Windows:
 .\MaddoxTasks.exe list --status Active
 .\MaddoxTasks.exe status 1 Done
 .\MaddoxTasks.exe label 1 architecture
+.\MaddoxTasks.exe comment 1 "Waiting on security review"
 .\MaddoxTasks.exe summary week
 ```
 
@@ -50,6 +51,7 @@ Linux/macOS:
 ./MaddoxTasks list --status Active
 ./MaddoxTasks status 1 Done
 ./MaddoxTasks label 1 architecture
+./MaddoxTasks comment 1 "Waiting on security review"
 ./MaddoxTasks summary week
 ```
 
@@ -59,7 +61,7 @@ Issue tokens support:
 - Full GUID
 - GUID prefix
 
-Tip: in TUI, press `Enter` on an issue to open details and edit description inline. The description input uses your terminal's native line editor.
+Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, and `q`/`Esc` to go back.
 
 ## Agent JSON Commands
 
@@ -84,6 +86,16 @@ Linux/macOS:
   "type": "ChangeStatus",
   "issueId": "1",
   "newStatus": "Active"
+}
+```
+
+Comment example:
+
+```json
+{
+  "type": "AddComment",
+  "issueId": "1",
+  "comment": "Blocked by API contract review"
 }
 ```
 
@@ -132,10 +144,16 @@ Test:
 dotnet test .\tests\MaddoxTasks.Tests\MaddoxTasks.Tests.csproj
 ```
 
-Publish single-file (Windows default output `F:\MaddoxTasks`):
+Publish single-file Native AOT (Windows default output `F:\MaddoxTasks`):
 
 ```powershell
 .\scripts\publish.ps1 -Runtime win-x64
+```
+
+Publish without AOT:
+
+```powershell
+.\scripts\publish.ps1 -Runtime win-x64 -NoAot
 ```
 
 ## CI and Releases

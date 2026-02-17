@@ -37,3 +37,8 @@ public sealed record UpdateDescription(
     string Description
 ) : Command;
 
+public sealed record AddComment(
+    IssueId IssueId,
+    string Comment
+) : Command;
+

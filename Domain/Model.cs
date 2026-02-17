@@ -51,6 +51,7 @@ public readonly record struct Priority(int Value)
 public sealed class Issue
 {
     private readonly HashSet<string> _labels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<IssueComment> _comments = [];
 
     private Issue(IssueId id)
     {
@@ -70,6 +71,7 @@ public sealed class Issue
     public Priority Priority { get; private set; }
     public IssueId? ParentId { get; private set; }
     public IReadOnlyCollection<string> Labels => _labels.OrderBy(static x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    public IReadOnlyList<IssueComment> Comments => _comments.ToArray();
     public DateTime CreatedAt { get; private set; }
     public DateTime UpdatedAt { get; private set; }
     public DateTime? DueDate { get; private set; }
@@ -112,11 +114,17 @@ public sealed class Issue
                 Description = descriptionUpdated.Description;
                 UpdatedAt = descriptionUpdated.Timestamp;
                 break;
+            case CommentAdded commentAdded:
+                _comments.Add(new IssueComment(commentAdded.Timestamp, commentAdded.Comment));
+                UpdatedAt = commentAdded.Timestamp;
+                break;
             default:
                 throw new InvalidOperationException($"Unknown event type '{issueEvent.GetType().Name}'.");
         }
     }
 }
+
+public sealed record IssueComment(DateTime Timestamp, string Comment);
 
 public sealed class IssueFilter
 {
