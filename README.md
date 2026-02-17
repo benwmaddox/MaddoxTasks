@@ -96,6 +96,7 @@ Windows:
 ```powershell
 .\MaddoxTasks.exe agent issues
 .\MaddoxTasks.exe agent command --file cmd.json
+.\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
 ```
 
 Linux/macOS:
@@ -103,6 +104,7 @@ Linux/macOS:
 ```bash
 ./MaddoxTasks agent issues
 ./MaddoxTasks agent command --file cmd.json
+./MaddoxTasks agent command --actor gpt-5.2 --file cmd.json
 ```
 
 `cmd.json` example:
@@ -125,6 +127,8 @@ Comment example:
   "actor": "gpt-5.2"
 }
 ```
+
+PowerShell tip: prefer `--file` or stdin here-string over inline `--json` to avoid escaping problems.
 
 ## Where Data Is Stored
 

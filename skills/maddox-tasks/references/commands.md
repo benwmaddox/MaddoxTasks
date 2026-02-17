@@ -39,6 +39,24 @@ Run with file JSON:
 .\MaddoxTasks.exe agent command --file cmd.json
 ```
 
+Set default actor once (used when payload omits `actor` for `UpdateDescription` / `AddComment`):
+
+```powershell
+.\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
+```
+
+PowerShell stdin pattern (avoids quote escaping):
+
+```powershell
+@'
+{
+  "type": "ChangeStatus",
+  "issueId": "1",
+  "newStatus": "Active"
+}
+'@ | .\MaddoxTasks.exe agent command
+```
+
 Supported `type` values (all available agent commands):
 
 - `CreateIssue`
@@ -129,4 +147,4 @@ Supported `type` values (all available agent commands):
 Notes:
 
 - `issueId` accepts sequence (`"1"`), GUID prefix, or full GUID.
-- For `UpdateDescription` and `AddComment`, always set `actor` to the model identifier being used.
+- For `UpdateDescription` and `AddComment`, set `actor` to the model identifier being used. If omitted, `agent command --actor` applies. If neither is set, environment (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`) is checked, then fallback is `agent`.

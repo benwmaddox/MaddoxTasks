@@ -8,9 +8,12 @@ namespace MaddoxTasks.Agent;
 
 public static partial class AgentRunner
 {
-    public static string ExecuteCommandJson(IssueEngine engine, string json)
+    public static string ExecuteCommandJson(IssueEngine engine, string json, string? defaultActor = null)
     {
-        if (!TryParseCommand(json, engine, out var command, out var error))
+        var resolvedDefaultActor = ResolveDefaultActor(defaultActor);
+        var normalizedJson = NormalizeIncomingJson(json);
+
+        if (!TryParseCommand(normalizedJson, engine, resolvedDefaultActor, out var command, out var error))
         {
             return SerializeResponse(new AgentCommandResponse(false, error, null, null));
         }
@@ -49,7 +52,7 @@ public static partial class AgentRunner
         return JsonSerializer.Serialize(issues, PrettyJsonContext.AgentIssueDtoArray);
     }
 
-    private static bool TryParseCommand(string json, IssueEngine engine, out Command? command, out string error)
+    private static bool TryParseCommand(string json, IssueEngine engine, string defaultActor, out Command? command, out string error)
     {
         command = null;
         error = string.Empty;
@@ -100,9 +103,9 @@ public static partial class AgentRunner
                 case "removelabel":
                     return TryBuildLabelRemove(root, engine, out command, out error);
                 case "updatedescription":
-                    return TryBuildDescriptionUpdate(root, engine, out command, out error);
+                    return TryBuildDescriptionUpdate(root, engine, defaultActor, out command, out error);
                 case "addcomment":
-                    return TryBuildCommentAdd(root, engine, out command, out error);
+                    return TryBuildCommentAdd(root, engine, defaultActor, out command, out error);
                 default:
                     error = $"Unsupported command type '{type}'.";
                     return false;
@@ -258,7 +261,7 @@ public static partial class AgentRunner
         return true;
     }
 
-    private static bool TryBuildDescriptionUpdate(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    private static bool TryBuildDescriptionUpdate(JsonElement root, IssueEngine engine, string defaultActor, out Command? command, out string error)
     {
         command = null;
         if (!TryResolveIssue(root, engine, out var issueId, out error))
@@ -272,12 +275,12 @@ public static partial class AgentRunner
         }
 
         TryGetString(root, "actor", required: false, out var actorText, out _);
-        var actor = string.IsNullOrWhiteSpace(actorText) ? "agent" : actorText!;
+        var actor = string.IsNullOrWhiteSpace(actorText) ? defaultActor : actorText!;
         command = new UpdateDescription(issueId, description!, actor);
         return true;
     }
 
-    private static bool TryBuildCommentAdd(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    private static bool TryBuildCommentAdd(JsonElement root, IssueEngine engine, string defaultActor, out Command? command, out string error)
     {
         command = null;
         if (!TryResolveIssue(root, engine, out var issueId, out error))
@@ -291,7 +294,7 @@ public static partial class AgentRunner
         }
 
         TryGetString(root, "actor", required: false, out var actorText, out _);
-        var actor = string.IsNullOrWhiteSpace(actorText) ? "agent" : actorText!;
+        var actor = string.IsNullOrWhiteSpace(actorText) ? defaultActor : actorText!;
         command = new AddComment(issueId, comment!, actor);
         return true;
     }
@@ -314,6 +317,52 @@ public static partial class AgentRunner
 
     private static bool TryParseStatus(string input, out Status status)
         => Enum.TryParse(input, ignoreCase: true, out status);
+
+    private static string NormalizeIncomingJson(string json)
+    {
+        if (string.IsNullOrEmpty(json))
+        {
+            return json;
+        }
+
+        var span = json.AsSpan();
+        if (span.Length > 0 && span[0] == '\uFEFF')
+        {
+            span = span[1..];
+        }
+
+        return span.ToString();
+    }
+
+    private static string ResolveDefaultActor(string? explicitActor)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitActor))
+        {
+            return explicitActor.Trim();
+        }
+
+        var keys = new[]
+        {
+            "MADDOX_TASKS_AGENT_ACTOR",
+            "MADDOX_TASKS_ACTOR",
+            "CODEX_MODEL",
+            "OPENAI_MODEL",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_MODEL",
+            "MODEL"
+        };
+
+        foreach (var key in keys)
+        {
+            var value = Environment.GetEnvironmentVariable(key);
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim();
+            }
+        }
+
+        return "agent";
+    }
 
     private static bool TryGetString(JsonElement root, string propertyName, bool required, out string? value, out string error)
     {

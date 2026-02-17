@@ -394,11 +394,13 @@ public static class CliRunner
     {
         var jsonOption = new Option<string?>("--json", "Raw command JSON.");
         var fileOption = new Option<FileInfo?>("--file", "Path to JSON payload file.");
+        var actorOption = new Option<string?>("--actor", "Default actor for UpdateDescription/AddComment when payload omits actor.");
         var command = new CliCommand("command", "Execute JSON command.");
         command.AddOption(jsonOption);
         command.AddOption(fileOption);
+        command.AddOption(actorOption);
 
-        command.SetHandler((string dbPath, string? json, FileInfo? file) =>
+        command.SetHandler((string dbPath, string? json, FileInfo? file, string? actor) =>
         {
             var engine = CreateEngine(dbPath);
             var payload = json;
@@ -413,8 +415,8 @@ public static class CliRunner
                 payload = Console.In.ReadToEnd();
             }
 
-            Console.WriteLine(AgentRunner.ExecuteCommandJson(engine, payload));
-        }, dbOption, jsonOption, fileOption);
+            Console.WriteLine(AgentRunner.ExecuteCommandJson(engine, payload, actor));
+        }, dbOption, jsonOption, fileOption, actorOption);
 
         return command;
     }
