@@ -25,7 +25,6 @@ public static class KeyBindingRegistry
         new("p", "Change priority", KeyContext.IssueAction),
         new("t", "Add/remove label", KeyContext.IssueAction),
         new("d", "Mark done", KeyContext.IssueAction),
-        new("e", "Edit description", KeyContext.IssueAction),
         new("/", "Open filter bar", KeyContext.Filtering),
         new("Ctrl+r", "Reapply last filter", KeyContext.Filtering),
         new("?", "Show this help", KeyContext.Global),

@@ -256,13 +256,6 @@ public sealed class TuiApp
                 }
 
                 return;
-            case 'e':
-                if (selectedIssue is not null)
-                {
-                    EditDescription(selectedIssue);
-                }
-
-                return;
         }
     }
 
@@ -300,8 +293,21 @@ public sealed class TuiApp
 
         AnsiConsole.Clear();
         AnsiConsole.Write(new Panel(grid).Header("Issue"));
-        AnsiConsole.MarkupLine("[grey]Press any key to return[/]");
-        Console.ReadKey(intercept: true);
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[grey]Description edit is inline here. Enter saves. Esc cancels.[/]");
+
+        var currentDescription = issue.Description ?? string.Empty;
+        Console.CursorVisible = true;
+        var saved = TryReadLineWithInlineEditor("Description: ", currentDescription, out var description);
+        Console.CursorVisible = false;
+
+        if (!saved || description == currentDescription)
+        {
+            return;
+        }
+
+        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, description));
+        PauseWithMessage(result.Message, result.Success);
     }
 
     private void CreateIssue()
@@ -418,26 +424,6 @@ public sealed class TuiApp
     private void MarkDone(IssueView issueView)
     {
         var result = _engine.Execute(new ChangeStatus(issueView.Issue.Id, IssueStatus.Done));
-        PauseWithMessage(result.Message, result.Success);
-    }
-
-    private void EditDescription(IssueView issueView)
-    {
-        AnsiConsole.Clear();
-        AnsiConsole.MarkupLine("[bold]Edit description[/]");
-        AnsiConsole.MarkupLine("[grey]Left/Right/Home/End move cursor. Enter saves. Esc cancels.[/]");
-
-        Console.CursorVisible = true;
-        var saved = TryReadLineWithInlineEditor("Description: ", issueView.Issue.Description ?? string.Empty, out var description);
-        Console.CursorVisible = false;
-
-        if (!saved)
-        {
-            PauseWithMessage("Description edit canceled.", success: true);
-            return;
-        }
-
-        var result = _engine.Execute(new UpdateDescription(issueView.Issue.Id, description));
         PauseWithMessage(result.Message, result.Success);
     }
 
