@@ -21,6 +21,31 @@ Linux/macOS:
 
 The app reuses the same DB on every run automatically.
 
+## One-Time Windows Install (User-Level Skills + PATH)
+
+From this repo:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+If you already extracted a release to another folder, still run the repo script and point it at that binary directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File F:\Tasks\MaddoxTasks\scripts\install.ps1 -BinaryDir F:\MaddoxTasks -SkillSource F:\Tasks\MaddoxTasks\skills\maddox-tasks
+```
+
+What it does:
+
+- Links `maddox-tasks` skill into `~/.agents/skills`, `~/.codex/skills`, and `~/.claude/skills`.
+- Adds the directory containing `MaddoxTasks.exe` to your user `PATH`.
+
+After install, open a new terminal and run:
+
+```powershell
+MaddoxTasks.exe
+```
+
 ## What It Looks Like (TUI)
 
 Main board:
