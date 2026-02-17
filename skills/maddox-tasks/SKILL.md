@@ -1,17 +1,23 @@
 ---
 name: maddox-tasks
-description: Operate and automate Maddox Tasks from source or released binaries. Use when users ask to create/list/update tasks, run TUI/CLI commands, use JSON agent commands, diagnose database path behavior (MaddoxTasks.db defaults and MaddoxTasks.json overrides), or validate CI/release behavior for MaddoxTasks.
+description: Operate and automate Maddox Tasks via agent JSON commands. Use when users ask to list/create/update tasks in machine-readable workflows, execute agent command payloads, diagnose database path behavior (MaddoxTasks.db defaults and MaddoxTasks.json overrides), or validate CI/release behavior for MaddoxTasks.
 ---
 
 # Maddox Tasks Skill
 
 Run Maddox Tasks with the released binary first when available.
 
+## Execution Mode (Important)
+
+1. Use **only agent JSON commands** when operating as an agent.
+2. Treat `list tasks` as `agent issues` (machine-readable JSON).
+3. Do not run non-agent CLI commands (`list`, `create`, `status`, `priority`, `label`, `describe`, `comment`, `summary`) as part of this skill.
+4. If the user uses skill-style prompts such as `$maddox-tasks ...`, map them to `agent` subcommands.
+
 ## Use Released Binary
 
 1. Use `MaddoxTasks.exe` on Windows or `./MaddoxTasks` on Linux/macOS.
-2. Run without arguments to start TUI.
-3. Run CLI commands directly for deterministic automation.
+2. For this skill's workflow, execute only `agent` subcommands.
 
 Read `references/commands.md` for concrete command patterns.
 
@@ -26,6 +32,7 @@ Read `references/commands.md` for concrete command patterns.
 ## Agent Command Workflow
 
 1. Use `agent issues` to read current state as JSON.
+For "list tasks", use `agent issues` by default.
 2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
 For `UpdateDescription` and `AddComment`, use `"actor": "agent"` when acting as an automation.
 3. Execute with `agent command --file <json-file>` or `--json <payload>`.

@@ -1,4 +1,4 @@
 interface:
   display_name: "Maddox Tasks"
-  short_description: "Run and automate Maddox Tasks via TUI, CLI, and agent JSON commands"
-  default_prompt: "Use Maddox Tasks to perform task operations and return exact commands and verification output."
+  short_description: "Run Maddox Tasks in agent JSON mode for task retrieval and updates"
+  default_prompt: "Use Maddox Tasks agent commands only: read with 'agent issues' and mutate with 'agent command'; return exact commands and verification output."
