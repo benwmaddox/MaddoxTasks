@@ -35,7 +35,7 @@ Read `references/commands.md` for concrete command patterns.
 For "list tasks", use `agent issues` by default.
 2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
 For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.2"` or `"claude-sonnet"`), or pass `--actor <model-id>` on `agent command`.
-3. Execute with `agent command --file <json-file>` or `--json <payload>`. Prefer `--file` or stdin on PowerShell.
+3. Execute with `agent command --file <json-file>` or stdin. Treat inline `--json` as last-resort on PowerShell.
 4. Re-read with `agent issues` and verify deterministic output.
 
 ## Release and CI Workflow
