@@ -361,6 +361,12 @@ public static partial class AgentRunner
             }
         }
 
+        var claudeSettingsActor = TryResolveActorFromClaudeSettings();
+        if (!string.IsNullOrWhiteSpace(claudeSettingsActor))
+        {
+            return claudeSettingsActor;
+        }
+
         var configActor = TryResolveActorFromCodexConfig();
         if (!string.IsNullOrWhiteSpace(configActor))
         {
@@ -377,7 +383,7 @@ public static partial class AgentRunner
             var codexHome = Environment.GetEnvironmentVariable("CODEX_HOME");
             if (string.IsNullOrWhiteSpace(codexHome))
             {
-                var userHome = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var userHome = GetUserHomeDirectory();
                 if (string.IsNullOrWhiteSpace(userHome))
                 {
                     return null;
@@ -444,6 +450,74 @@ public static partial class AgentRunner
         {
             return null;
         }
+    }
+
+    private static string? TryResolveActorFromClaudeSettings()
+    {
+        try
+        {
+            var cwd = Environment.CurrentDirectory;
+            var userHome = GetUserHomeDirectory();
+
+            var candidates = new[]
+            {
+                string.IsNullOrWhiteSpace(cwd) ? null : Path.Combine(cwd, ".claude", "settings.local.json"),
+                string.IsNullOrWhiteSpace(cwd) ? null : Path.Combine(cwd, ".claude", "settings.json"),
+                string.IsNullOrWhiteSpace(userHome) ? null : Path.Combine(userHome, ".claude", "settings.json")
+            };
+
+            foreach (var candidate in candidates)
+            {
+                if (string.IsNullOrWhiteSpace(candidate) || !File.Exists(candidate))
+                {
+                    continue;
+                }
+
+                using var stream = File.OpenRead(candidate);
+                using var document = JsonDocument.Parse(stream);
+                var root = document.RootElement;
+
+                if (root.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                if (!TryGetProperty(root, "model", out var modelElement) || modelElement.ValueKind != JsonValueKind.String)
+                {
+                    continue;
+                }
+
+                var model = modelElement.GetString();
+                if (!string.IsNullOrWhiteSpace(model))
+                {
+                    return model.Trim();
+                }
+            }
+        }
+        catch
+        {
+            // Ignore unreadable config and continue fallback chain.
+        }
+
+        return null;
+    }
+
+    private static string? GetUserHomeDirectory()
+    {
+        var home = Environment.GetEnvironmentVariable("HOME");
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            return home;
+        }
+
+        home = Environment.GetEnvironmentVariable("USERPROFILE");
+        if (!string.IsNullOrWhiteSpace(home))
+        {
+            return home;
+        }
+
+        home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return string.IsNullOrWhiteSpace(home) ? null : home;
     }
 
     private static bool TryGetString(JsonElement root, string propertyName, bool required, out string? value, out string error)

@@ -147,4 +147,4 @@ Supported `type` values (all available agent commands):
 Notes:
 
 - `issueId` accepts sequence (`"1"`), GUID prefix, or full GUID.
-- For `UpdateDescription` and `AddComment`, set `actor` to the model identifier being used. If omitted, `agent command --actor` applies. If neither is set, environment (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`) is checked. If still unset and Codex config exists, `~/.codex/config.toml` (`model` + `model_reasoning_effort`) is used. Final fallback is `agent`.
+- For `UpdateDescription` and `AddComment`, set `actor` to the model identifier being used. If omitted, `agent command --actor` applies. If neither is set, environment (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`) is checked. If still unset and Claude settings exist, `.claude/settings.local.json`, `.claude/settings.json`, or `~/.claude/settings.json` (`model`) is used. If still unset and Codex config exists, `~/.codex/config.toml` (`model` + `model_reasoning_effort`) is used. Final fallback is `agent`.
