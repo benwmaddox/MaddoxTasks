@@ -125,7 +125,7 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void AddComment_PreservesAgentActor()
+    public void AddComment_PreservesModelActor()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStore();
@@ -134,12 +134,28 @@ public sealed class IssueEngineTests
         var createResult = engine.Execute(new CreateIssue("First task", null, Priority.From(3), null, null));
         var issueId = Assert.IsAssignableFrom<IssueId>(createResult.IssueId);
 
-        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "agent"));
+        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "gpt-5.2"));
         Assert.True(commentResult.Success);
 
         var commentEvent = Assert.IsType<CommentAdded>(store.LoadAll()[1]);
-        Assert.Equal("agent", commentEvent.Actor);
-        Assert.Equal("agent", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
+        Assert.Equal("gpt-5.2", commentEvent.Actor);
+        Assert.Equal("gpt-5.2", engine.QueryIssues(includeDone: true).Single().Issue.Comments[0].Actor);
+    }
+
+    [Fact]
+    public void AddComment_RejectsInvalidActorIdentifier()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+
+        var createResult = engine.Execute(new CreateIssue("First task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(createResult.IssueId);
+
+        var commentResult = engine.Execute(new AddComment(issueId, "Automated note", "bad actor!"));
+        Assert.False(commentResult.Success);
+
+        Assert.Single(store.LoadAll());
     }
 }
 

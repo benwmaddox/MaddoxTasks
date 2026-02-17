@@ -147,19 +147,33 @@ public static class CommandPlanner
 
     private static string NormalizeActor(string actor)
     {
-        var normalized = actor?.Trim().ToLowerInvariant() ?? string.Empty;
+        var normalized = actor?.Trim() ?? string.Empty;
         if (string.IsNullOrWhiteSpace(normalized))
         {
             return "user";
         }
 
-        if (normalized is not ("user" or "agent"))
+        if (string.Equals(normalized, "user", StringComparison.OrdinalIgnoreCase))
         {
-            throw new CommandValidationException("Actor must be 'user' or 'agent'.");
+            return "user";
+        }
+
+        if (string.Equals(normalized, "agent", StringComparison.OrdinalIgnoreCase))
+        {
+            return "agent";
+        }
+
+        if (normalized.Length > 64 || normalized.Any(static ch => !IsAllowedActorChar(ch)))
+        {
+            throw new CommandValidationException(
+                "Actor must be 'user', 'agent', or a model id (letters/digits and . _ - : / +).");
         }
 
         return normalized;
     }
+
+    private static bool IsAllowedActorChar(char ch)
+        => char.IsLetterOrDigit(ch) || ch is '.' or '_' or '-' or ':' or '/' or '+';
 
     private static DateTime? NormalizeDueDate(DateTime? dueDate)
     {

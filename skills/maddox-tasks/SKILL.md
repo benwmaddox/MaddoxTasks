@@ -34,7 +34,7 @@ Read `references/commands.md` for concrete command patterns.
 1. Use `agent issues` to read current state as JSON.
 For "list tasks", use `agent issues` by default.
 2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
-For `UpdateDescription` and `AddComment`, use `"actor": "agent"` when acting as an automation.
+For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.2"` or `"claude-sonnet"`).
 3. Execute with `agent command --file <json-file>` or `--json <payload>`.
 4. Re-read with `agent issues` and verify deterministic output.
 

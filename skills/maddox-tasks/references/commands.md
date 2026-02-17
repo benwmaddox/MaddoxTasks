@@ -111,7 +111,7 @@ Supported `type` values (all available agent commands):
   "type": "UpdateDescription",
   "issueId": "1",
   "description": "Updated description text",
-  "actor": "agent"
+  "actor": "gpt-5.2"
 }
 ```
 
@@ -122,11 +122,11 @@ Supported `type` values (all available agent commands):
   "type": "AddComment",
   "issueId": "1",
   "comment": "Blocked on dependency upgrade",
-  "actor": "agent"
+  "actor": "claude-sonnet"
 }
 ```
 
 Notes:
 
 - `issueId` accepts sequence (`"1"`), GUID prefix, or full GUID.
-- For `UpdateDescription` and `AddComment`, `actor` defaults to `agent` if omitted.
+- For `UpdateDescription` and `AddComment`, always set `actor` to the model identifier being used.
