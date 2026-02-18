@@ -2,11 +2,14 @@ using Spectre.Console;
 using IssueStatus = MaddoxTasks.Domain.Status;
 using MaddoxTasks.Application;
 using MaddoxTasks.Domain;
+using System.Text;
+using System.Threading;
 
 namespace MaddoxTasks.Ui;
 
 public sealed class TuiApp
 {
+    private const string UserCommentTint = "#9FB7D3";
     private static readonly IssueStatus[] StatusOrder =
     [
         IssueStatus.Active,
@@ -21,6 +24,8 @@ public sealed class TuiApp
     private int _selectedIndex;
     private IssueFilter? _activeFilter;
     private IssueFilter? _lastFilter;
+    private ToastMessage? _toast;
+    private StatusMessage? _lastStatusMessage;
 
     public TuiApp(IssueEngine engine)
     {
@@ -33,20 +38,14 @@ public sealed class TuiApp
 
         while (true)
         {
-            var showDone = ShouldShowDone();
-            var views = _engine.QueryIssues(_activeFilter, includeDone: showDone).ToList();
-
-            if (views.Count == 0)
-            {
-                _selectedIndex = 0;
-            }
-            else if (_selectedIndex >= views.Count)
-            {
-                _selectedIndex = views.Count - 1;
-            }
-
+            ExpireToastIfNeeded();
+            var views = GetCurrentViews(out var showDone);
             Render(views, showDone);
-            var keyInfo = Console.ReadKey(intercept: true);
+            var keyInfo = ReadKeyWithToastRefresh(() =>
+            {
+                var refreshedViews = GetCurrentViews(out var refreshedShowDone);
+                Render(refreshedViews, refreshedShowDone);
+            });
 
             if (HandleNavigationKey(keyInfo, views.Count))
             {
@@ -61,6 +60,23 @@ public sealed class TuiApp
             var selectedIssue = views.Count == 0 ? null : views[_selectedIndex];
             HandleActionKey(keyInfo, selectedIssue);
         }
+    }
+
+    private IReadOnlyList<IssueView> GetCurrentViews(out bool showDone)
+    {
+        showDone = ShouldShowDone();
+        var views = _engine.QueryIssues(_activeFilter, includeDone: showDone).ToList();
+
+        if (views.Count == 0)
+        {
+            _selectedIndex = 0;
+        }
+        else if (_selectedIndex >= views.Count)
+        {
+            _selectedIndex = views.Count - 1;
+        }
+
+        return views;
     }
 
     private void Render(IReadOnlyList<IssueView> views, bool showDone)
@@ -95,11 +111,12 @@ public sealed class TuiApp
                     ? "-"
                     : string.Join(",", view.Issue.Labels);
 
-                var line = $"{marker} {view.ShortId,-4} {view.GuidPrefix}  P{view.Issue.Priority.Value}  {due,-12}  {view.Issue.Title}";
+                var line = $"{marker} {view.ShortId,-4} P{view.Issue.Priority.Value}  {view.Issue.Title}";
                 if (labels != "-")
                 {
                     line += $" [labels:{labels}]";
                 }
+                line += $"  {due,-12}";
 
                 AnsiConsole.MarkupLine(line.EscapeMarkup());
                 cursor++;
@@ -108,6 +125,7 @@ public sealed class TuiApp
 
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[grey]up/down navigate   Enter open   n new   / filter   ? help   q quit[/]");
+        RenderStatusBar();
     }
 
     private void RenderFilterLine()
@@ -281,6 +299,7 @@ public sealed class TuiApp
 
         while (true)
         {
+            ExpireToastIfNeeded();
             var refreshedIssue = TryGetIssue(issueId);
             if (refreshedIssue is null)
             {
@@ -289,7 +308,14 @@ public sealed class TuiApp
             }
 
             RenderIssueDetail(refreshedIssue);
-            var keyInfo = Console.ReadKey(intercept: true);
+            var keyInfo = ReadKeyWithToastRefresh(() =>
+            {
+                var latest = TryGetIssue(issueId);
+                if (latest is not null)
+                {
+                    RenderIssueDetail(latest);
+                }
+            });
             if (keyInfo.Key == ConsoleKey.Escape)
             {
                 return;
@@ -328,10 +354,10 @@ public sealed class TuiApp
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Create issue[/]");
 
-        var title = AnsiConsole.Ask<string>("Title:");
-        var description = AnsiConsole.Ask<string>("Description (optional, blank for none):", string.Empty);
-        var priorityText = AnsiConsole.Ask<string>("Priority (1-5, default 3):", "3");
-        var dueText = AnsiConsole.Ask<string>("Due date (optional, yyyy-MM-dd):", string.Empty);
+        var title = PromptText("Title");
+        var description = PromptText("Description (optional, blank for none)");
+        var priorityText = PromptText("Priority (1-5, default 3)", "3");
+        var dueText = PromptText("Due date (optional, yyyy-MM-dd)");
 
         Console.CursorVisible = false;
 
@@ -392,7 +418,7 @@ public sealed class TuiApp
     private void ChangePriority(IssueView issueView)
     {
         Console.CursorVisible = true;
-        var priorityText = AnsiConsole.Ask<string>("Priority (1-5):", issueView.Issue.Priority.Value.ToString());
+        var priorityText = PromptText("Priority (1-5)", issueView.Issue.Priority.Value.ToString());
         Console.CursorVisible = false;
 
         if (!int.TryParse(priorityText, out var parsedPriority))
@@ -423,7 +449,7 @@ public sealed class TuiApp
             new SelectionPrompt<string>()
                 .Title("Label action")
                 .AddChoices("add", "remove"));
-        var label = AnsiConsole.Ask<string>("Label:");
+        var label = PromptText("Label");
         Console.CursorVisible = false;
 
         Command command = mode == "add"
@@ -461,10 +487,10 @@ public sealed class TuiApp
         switch (mode)
         {
             case "replace":
-                nextDescription = AnsiConsole.Ask<string>("New description (blank clears):", string.Empty).Trim();
+                nextDescription = PromptText("New description (blank clears)").Trim();
                 break;
             case "append":
-                var toAppend = AnsiConsole.Ask<string>("Text to append:");
+                var toAppend = PromptText("Text to append");
                 if (string.IsNullOrWhiteSpace(toAppend))
                 {
                     Console.CursorVisible = false;
@@ -501,7 +527,7 @@ public sealed class TuiApp
         Console.CursorVisible = true;
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Add comment[/]");
-        var comment = AnsiConsole.Ask<string>("Comment:");
+        var comment = PromptText("Comment");
         Console.CursorVisible = false;
 
         var result = _engine.Execute(new AddComment(issueView.Issue.Id, comment, "user"));
@@ -558,7 +584,7 @@ public sealed class TuiApp
     private IssueView? TryGetIssue(IssueId issueId)
         => _engine.QueryIssues(includeDone: true).FirstOrDefault(view => view.Issue.Id == issueId);
 
-    private static void RenderIssueDetail(IssueView issueView)
+    private void RenderIssueDetail(IssueView issueView)
     {
         var issue = issueView.Issue;
 
@@ -595,7 +621,13 @@ public sealed class TuiApp
 
             foreach (var comment in comments.TakeLast(8))
             {
-                table.AddRow(comment.Timestamp.ToString("u"), comment.Actor.EscapeMarkup(), comment.Comment.EscapeMarkup());
+                var commentText = comment.Comment.EscapeMarkup();
+                if (string.Equals(comment.Actor, "user", StringComparison.OrdinalIgnoreCase))
+                {
+                    commentText = $"[{UserCommentTint}]{commentText}[/]";
+                }
+
+                table.AddRow(comment.Timestamp.ToString("u"), comment.Actor.EscapeMarkup(), commentText);
             }
 
             AnsiConsole.Write(new Panel(table).Header($"Comments ({comments.Count})"));
@@ -603,6 +635,7 @@ public sealed class TuiApp
 
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   d description   h desc-history   q/Esc back[/]");
+        RenderStatusBar();
     }
 
     private void ConfigureFilter()
@@ -611,11 +644,11 @@ public sealed class TuiApp
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Filter[/]");
         var statusOptions = string.Join(", ", Enum.GetValues<IssueStatus>().Select(status => status.ToDisplayString()));
-        var statusEqualsText = AnsiConsole.Ask<string>($"status equals ({statusOptions}, blank for none):", string.Empty);
-        var statusNotText = AnsiConsole.Ask<string>("status not equals (blank for none):", string.Empty);
-        var priorityText = AnsiConsole.Ask<string>("priority <= (1-5, blank for none):", string.Empty);
-        var labelsText = AnsiConsole.Ask<string>("labels (comma-separated, blank for none):", string.Empty);
-        var dueText = AnsiConsole.Ask<string>("due on/before (yyyy-MM-dd, blank for none):", string.Empty);
+        var statusEqualsText = PromptText($"status equals ({statusOptions}, blank for none)");
+        var statusNotText = PromptText("status not equals (blank for none)");
+        var priorityText = PromptText("priority <= (1-5, blank for none)");
+        var labelsText = PromptText("labels (comma-separated, blank for none)");
+        var dueText = PromptText("due on/before (yyyy-MM-dd, blank for none)");
         Console.CursorVisible = false;
 
         if (!TryParseOptionalStatus(statusEqualsText, out var statusEquals))
@@ -744,13 +777,194 @@ public sealed class TuiApp
         }
     }
 
+    private static string PromptText(string label, string? defaultValue = null)
+    {
+        Console.Write($"{label}: ");
+        var initialText = defaultValue ?? string.Empty;
+        var startLeft = Console.CursorLeft;
+        var startTop = Console.CursorTop;
+
+        if (initialText.Length > 0)
+        {
+            Console.Write(initialText);
+        }
+
+        var value = ReadEditableLine(startLeft, startTop, initialText);
+        Console.WriteLine();
+
+        if (defaultValue is not null && string.IsNullOrEmpty(value))
+        {
+            return defaultValue;
+        }
+
+        return value;
+    }
+
+    private static string ReadEditableLine(int startLeft, int startTop, string initialText)
+    {
+        var buffer = new StringBuilder(initialText);
+        var cursor = buffer.Length;
+        var previousLength = buffer.Length;
+
+        while (true)
+        {
+            var keyInfo = Console.ReadKey(intercept: true);
+            var handled = true;
+
+            switch (keyInfo.Key)
+            {
+                case ConsoleKey.Enter:
+                    return buffer.ToString();
+                case ConsoleKey.LeftArrow:
+                    if (cursor > 0)
+                    {
+                        cursor--;
+                    }
+
+                    break;
+                case ConsoleKey.RightArrow:
+                    if (cursor < buffer.Length)
+                    {
+                        cursor++;
+                    }
+
+                    break;
+                case ConsoleKey.Home:
+                    cursor = 0;
+                    break;
+                case ConsoleKey.End:
+                    cursor = buffer.Length;
+                    break;
+                case ConsoleKey.Backspace:
+                    if (cursor > 0)
+                    {
+                        buffer.Remove(cursor - 1, 1);
+                        cursor--;
+                    }
+
+                    break;
+                case ConsoleKey.Delete:
+                    if (cursor < buffer.Length)
+                    {
+                        buffer.Remove(cursor, 1);
+                    }
+
+                    break;
+                default:
+                    if (keyInfo.Modifiers.HasFlag(ConsoleModifiers.Control))
+                    {
+                        if (keyInfo.Key == ConsoleKey.A)
+                        {
+                            cursor = 0;
+                            break;
+                        }
+
+                        if (keyInfo.Key == ConsoleKey.E)
+                        {
+                            cursor = buffer.Length;
+                            break;
+                        }
+
+                        handled = false;
+                        break;
+                    }
+
+                    if (!char.IsControl(keyInfo.KeyChar))
+                    {
+                        buffer.Insert(cursor, keyInfo.KeyChar);
+                        cursor++;
+                        break;
+                    }
+
+                    handled = false;
+                    break;
+            }
+
+            if (!handled)
+            {
+                continue;
+            }
+
+            RedrawEditableLine(startLeft, startTop, buffer, cursor, ref previousLength);
+        }
+    }
+
+    private static void RedrawEditableLine(int startLeft, int startTop, StringBuilder buffer, int cursor, ref int previousLength)
+    {
+        SetCursorFromOffset(startLeft, startTop, 0);
+
+        var text = buffer.ToString();
+        Console.Write(text);
+
+        if (previousLength > text.Length)
+        {
+            Console.Write(new string(' ', previousLength - text.Length));
+        }
+
+        previousLength = text.Length;
+        SetCursorFromOffset(startLeft, startTop, cursor);
+    }
+
+    private static void SetCursorFromOffset(int startLeft, int startTop, int offset)
+    {
+        var bufferWidth = Math.Max(Console.BufferWidth, 1);
+        var absolute = startLeft + Math.Max(offset, 0);
+        var left = absolute % bufferWidth;
+        var top = startTop + (absolute / bufferWidth);
+        Console.SetCursorPosition(left, top);
+    }
+
+    private ConsoleKeyInfo ReadKeyWithToastRefresh(Action rerender)
+    {
+        while (true)
+        {
+            if (Console.KeyAvailable)
+            {
+                return Console.ReadKey(intercept: true);
+            }
+
+            if (ExpireToastIfNeeded())
+            {
+                rerender();
+            }
+
+            Thread.Sleep(50);
+        }
+    }
+
+    private bool ExpireToastIfNeeded()
+    {
+        if (_toast is null || DateTime.UtcNow < _toast.ExpiresAtUtc)
+        {
+            return false;
+        }
+
+        _toast = null;
+        return true;
+    }
+
+    private void RenderStatusBar()
+    {
+        if (_toast is not null)
+        {
+            var toastColor = _toast.Success ? "green" : "red";
+            AnsiConsole.MarkupLine($"[{toastColor}]Status: {_toast.Message.EscapeMarkup()}[/]");
+            return;
+        }
+
+        if (_lastStatusMessage is null)
+        {
+            return;
+        }
+
+        var lastColor = _lastStatusMessage.Success ? "grey" : "maroon";
+        AnsiConsole.MarkupLine($"[{lastColor}]Last: {_lastStatusMessage.Message.EscapeMarkup()}[/]");
+    }
+
     private void PauseWithMessage(string message, bool success)
     {
-        AnsiConsole.Clear();
-        var color = success ? "green" : "red";
-        AnsiConsole.MarkupLine($"[{color}]{message.EscapeMarkup()}[/]");
-        AnsiConsole.MarkupLine("[grey]Press any key to continue[/]");
-        Console.ReadKey(intercept: true);
+        _lastStatusMessage = new StatusMessage(message, success);
+        _toast = new ToastMessage(message, success, DateTime.UtcNow.AddSeconds(2));
     }
 
     private static string RenderDue(DateTime? dueDate)
@@ -770,4 +984,6 @@ public sealed class TuiApp
     }
 
     private sealed record DescriptionHistoryEntry(DateTime Timestamp, string Source, string Description, string Actor);
+    private sealed record ToastMessage(string Message, bool Success, DateTime ExpiresAtUtc);
+    private sealed record StatusMessage(string Message, bool Success);
 }
