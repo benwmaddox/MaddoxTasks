@@ -525,7 +525,8 @@ public sealed class TuiApp
     private void AddIssueComment(IssueView issueView)
     {
         Console.CursorVisible = true;
-        AnsiConsole.Clear();
+        RenderIssueDetail(issueView);
+        AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[bold]Add comment[/]");
         var comment = PromptText("Comment");
         Console.CursorVisible = false;
