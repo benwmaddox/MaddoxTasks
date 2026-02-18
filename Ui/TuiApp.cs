@@ -354,10 +354,14 @@ public sealed class TuiApp
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Create issue[/]");
 
-        var title = PromptText("Title");
-        var description = PromptText("Description (optional, blank for none)");
-        var priorityText = PromptText("Priority (1-5, default 3)", "3");
-        var dueText = PromptText("Due date (optional, yyyy-MM-dd)");
+        if (!TryPromptText("Title", out var title)
+            || !TryPromptText("Description (optional, blank for none)", out var description)
+            || !TryPromptText("Priority (1-5, default 3)", out var priorityText, "3")
+            || !TryPromptText("Due date (optional, yyyy-MM-dd)", out var dueText))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
 
         Console.CursorVisible = false;
 
@@ -404,11 +408,13 @@ public sealed class TuiApp
     private void ChangeStatus(IssueView issueView)
     {
         Console.CursorVisible = true;
-        var target = AnsiConsole.Prompt(
-            new SelectionPrompt<IssueStatus>()
-                .Title("New status")
-                .AddChoices(Enum.GetValues<IssueStatus>())
-                .UseConverter(status => status.ToDisplayString()));
+        var statusChoices = Enum.GetValues<IssueStatus>();
+        if (!TryPromptChoice("New status", statusChoices, status => status.ToDisplayString(), out var target))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
         Console.CursorVisible = false;
 
         var result = _engine.Execute(new ChangeStatus(issueView.Issue.Id, target));
@@ -418,7 +424,12 @@ public sealed class TuiApp
     private void ChangePriority(IssueView issueView)
     {
         Console.CursorVisible = true;
-        var priorityText = PromptText("Priority (1-5)", issueView.Issue.Priority.Value.ToString());
+        if (!TryPromptText("Priority (1-5)", out var priorityText, issueView.Issue.Priority.Value.ToString()))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
         Console.CursorVisible = false;
 
         if (!int.TryParse(priorityText, out var parsedPriority))
@@ -445,11 +456,14 @@ public sealed class TuiApp
     private void ToggleLabel(IssueView issueView)
     {
         Console.CursorVisible = true;
-        var mode = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Label action")
-                .AddChoices("add", "remove"));
-        var label = PromptText("Label");
+        var modeChoices = new[] { "add", "remove" };
+        if (!TryPromptChoice("Label action", modeChoices, mode => mode, out var mode)
+            || !TryPromptText("Label", out var label))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
         Console.CursorVisible = false;
 
         Command command = mode == "add"
@@ -478,19 +492,32 @@ public sealed class TuiApp
             AnsiConsole.MarkupLine($"[grey]Current: {currentDescription.EscapeMarkup()}[/]");
         }
 
-        var mode = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("Description action")
-                .AddChoices("replace", "append", "clear", "cancel"));
+        var modeChoices = new[] { "replace", "append", "clear", "cancel" };
+        if (!TryPromptChoice("Description action", modeChoices, mode => mode, out var mode))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
 
         string nextDescription;
         switch (mode)
         {
             case "replace":
-                nextDescription = PromptText("New description (blank clears)").Trim();
+                if (!TryPromptText("New description (blank clears)", out var replaceDescription))
+                {
+                    Console.CursorVisible = false;
+                    return;
+                }
+
+                nextDescription = replaceDescription.Trim();
                 break;
             case "append":
-                var toAppend = PromptText("Text to append");
+                if (!TryPromptText("Text to append", out var toAppend))
+                {
+                    Console.CursorVisible = false;
+                    return;
+                }
+
                 if (string.IsNullOrWhiteSpace(toAppend))
                 {
                     Console.CursorVisible = false;
@@ -528,7 +555,12 @@ public sealed class TuiApp
         RenderIssueDetail(issueView);
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[bold]Add comment[/]");
-        var comment = PromptText("Comment");
+        if (!TryPromptText("Comment", out var comment))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
         Console.CursorVisible = false;
 
         var result = _engine.Execute(new AddComment(issueView.Issue.Id, comment, "user"));
@@ -645,11 +677,16 @@ public sealed class TuiApp
         AnsiConsole.Clear();
         AnsiConsole.MarkupLine("[bold]Filter[/]");
         var statusOptions = string.Join(", ", Enum.GetValues<IssueStatus>().Select(status => status.ToDisplayString()));
-        var statusEqualsText = PromptText($"status equals ({statusOptions}, blank for none)");
-        var statusNotText = PromptText("status not equals (blank for none)");
-        var priorityText = PromptText("priority <= (1-5, blank for none)");
-        var labelsText = PromptText("labels (comma-separated, blank for none)");
-        var dueText = PromptText("due on/before (yyyy-MM-dd, blank for none)");
+        if (!TryPromptText($"status equals ({statusOptions}, blank for none)", out var statusEqualsText)
+            || !TryPromptText("status not equals (blank for none)", out var statusNotText)
+            || !TryPromptText("priority <= (1-5, blank for none)", out var priorityText)
+            || !TryPromptText("labels (comma-separated, blank for none)", out var labelsText)
+            || !TryPromptText("due on/before (yyyy-MM-dd, blank for none)", out var dueText))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
         Console.CursorVisible = false;
 
         if (!TryParseOptionalStatus(statusEqualsText, out var statusEquals))
@@ -778,8 +815,9 @@ public sealed class TuiApp
         }
     }
 
-    private static string PromptText(string label, string? defaultValue = null)
+    private static bool TryPromptText(string label, out string value, string? defaultValue = null)
     {
+        value = string.Empty;
         Console.Write($"{label}: ");
         var initialText = defaultValue ?? string.Empty;
         var startLeft = Console.CursorLeft;
@@ -790,18 +828,24 @@ public sealed class TuiApp
             Console.Write(initialText);
         }
 
-        var value = ReadEditableLine(startLeft, startTop, initialText);
+        var promptResult = ReadEditableLine(startLeft, startTop, initialText);
         Console.WriteLine();
 
-        if (defaultValue is not null && string.IsNullOrEmpty(value))
+        if (!promptResult.Accepted)
         {
-            return defaultValue;
+            return false;
         }
 
-        return value;
+        value = promptResult.Text;
+        if (defaultValue is not null && string.IsNullOrEmpty(value))
+        {
+            value = defaultValue;
+        }
+
+        return true;
     }
 
-    private static string ReadEditableLine(int startLeft, int startTop, string initialText)
+    private static TextPromptResult ReadEditableLine(int startLeft, int startTop, string initialText)
     {
         var buffer = new StringBuilder(initialText);
         var cursor = buffer.Length;
@@ -815,7 +859,9 @@ public sealed class TuiApp
             switch (keyInfo.Key)
             {
                 case ConsoleKey.Enter:
-                    return buffer.ToString();
+                    return new TextPromptResult(Accepted: true, Text: buffer.ToString());
+                case ConsoleKey.Escape:
+                    return new TextPromptResult(Accepted: false, Text: buffer.ToString());
                 case ConsoleKey.LeftArrow:
                     if (cursor > 0)
                     {
@@ -887,6 +933,53 @@ public sealed class TuiApp
             }
 
             RedrawEditableLine(startLeft, startTop, buffer, cursor, ref previousLength);
+        }
+    }
+
+    private static bool TryPromptChoice<T>(string title, IReadOnlyList<T> choices, Func<T, string> converter, out T selection)
+    {
+        if (choices.Count == 0)
+        {
+            throw new ArgumentException("At least one choice is required.", nameof(choices));
+        }
+
+        var index = 0;
+        while (true)
+        {
+            AnsiConsole.Clear();
+            AnsiConsole.MarkupLine($"[bold]{title.EscapeMarkup()}[/]");
+            AnsiConsole.MarkupLine("[grey]up/down move   Enter select   Esc cancel[/]");
+            AnsiConsole.WriteLine();
+
+            for (var i = 0; i < choices.Count; i++)
+            {
+                var text = converter(choices[i]).EscapeMarkup();
+                if (i == index)
+                {
+                    AnsiConsole.MarkupLine($"[bold]> {text}[/]");
+                }
+                else
+                {
+                    AnsiConsole.MarkupLine($"  {text}");
+                }
+            }
+
+            var keyInfo = Console.ReadKey(intercept: true);
+            switch (keyInfo.Key)
+            {
+                case ConsoleKey.UpArrow:
+                    index = (index - 1 + choices.Count) % choices.Count;
+                    break;
+                case ConsoleKey.DownArrow:
+                    index = (index + 1) % choices.Count;
+                    break;
+                case ConsoleKey.Enter:
+                    selection = choices[index];
+                    return true;
+                case ConsoleKey.Escape:
+                    selection = choices[0];
+                    return false;
+            }
         }
     }
 
@@ -985,6 +1078,7 @@ public sealed class TuiApp
     }
 
     private sealed record DescriptionHistoryEntry(DateTime Timestamp, string Source, string Description, string Actor);
+    private sealed record TextPromptResult(bool Accepted, string Text);
     private sealed record ToastMessage(string Message, bool Success, DateTime ExpiresAtUtc);
     private sealed record StatusMessage(string Message, bool Success);
 }
