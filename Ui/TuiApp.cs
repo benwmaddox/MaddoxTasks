@@ -86,46 +86,81 @@ public sealed class TuiApp
         RenderFilterLine();
         AnsiConsole.WriteLine();
 
-        var cursor = 0;
-        foreach (var status in StatusOrder)
+        if (views.Count == 0)
         {
-            if (status == IssueStatus.Done && !showDone)
+            AnsiConsole.MarkupLine("[grey]No issues.[/]");
+        }
+        else
+        {
+            var table = new Table()
+                .Border(TableBorder.Square)
+                .ShowRowSeparators()
+                .AddColumn(new TableColumn("#"))
+                .AddColumn(new TableColumn("Title"))
+                .AddColumn(new TableColumn("Status"))
+                .AddColumn(new TableColumn("Priority").Centered());
+
+            var cursor = 0;
+            foreach (var status in StatusOrder)
             {
-                continue;
-            }
-
-            var group = views.Where(view => view.Issue.Status == status).ToList();
-            AnsiConsole.MarkupLine($"[bold]{status.ToDisplayString().ToUpperInvariant()} ({group.Count})[/]");
-
-            if (group.Count == 0)
-            {
-                AnsiConsole.MarkupLine("  [grey]-[/]");
-                continue;
-            }
-
-            foreach (var view in group)
-            {
-                var marker = cursor == _selectedIndex ? ">" : " ";
-                var due = RenderDue(view.Issue.DueDate);
-                var labels = view.Issue.Labels.Count == 0
-                    ? "-"
-                    : string.Join(",", view.Issue.Labels);
-
-                var line = $"{marker} {view.ShortId,-4} P{view.Issue.Priority.Value}  {view.Issue.Title}";
-                if (labels != "-")
+                if (status == IssueStatus.Done && !showDone)
                 {
-                    line += $" [labels:{labels}]";
+                    continue;
                 }
-                line += $"  {due,-12}";
 
-                AnsiConsole.MarkupLine(line.EscapeMarkup());
-                cursor++;
+                foreach (var view in views.Where(v => v.Issue.Status == status))
+                {
+                    var selected = cursor == _selectedIndex;
+                    var id = selected
+                        ? $"[bold]> {view.ShortId.EscapeMarkup()}[/]"
+                        : view.ShortId.EscapeMarkup();
+                    var title = selected
+                        ? $"[bold]{view.Issue.Title.EscapeMarkup()}[/]"
+                        : view.Issue.Title.EscapeMarkup();
+
+                    table.AddRow(id, title, StatusMarkup(status, selected), PriorityMarkup(view.Issue.Priority.Value, selected));
+                    cursor++;
+                }
             }
+
+            AnsiConsole.Write(table);
         }
 
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[grey]up/down navigate   Enter open   n new   / filter   ? help   q quit[/]");
         RenderStatusBar();
+    }
+
+    private static string StatusMarkup(IssueStatus status, bool bold)
+    {
+        var color = status switch
+        {
+            IssueStatus.Active => "green",
+            IssueStatus.Next => "cyan",
+            IssueStatus.Blocked => "red",
+            IssueStatus.ReadyForReview => "yellow",
+            IssueStatus.Done => "grey",
+            _ => "grey"
+        };
+        var text = status.ToDisplayString().EscapeMarkup();
+        return bold ? $"[bold {color}]{text}[/]" : $"[{color}]{text}[/]";
+    }
+
+    private static string PriorityMarkup(int priority, bool bold)
+    {
+        var color = priority switch
+        {
+            1 => "red",
+            2 => "darkorange3",
+            3 => "yellow",
+            _ => ""
+        };
+        var text = priority.ToString();
+        if (color.Length == 0)
+        {
+            return bold ? $"[bold]{text}[/]" : text;
+        }
+        return bold ? $"[bold {color}]{text}[/]" : $"[{color}]{text}[/]";
     }
 
     private void RenderFilterLine()
