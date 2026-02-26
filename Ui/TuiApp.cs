@@ -1004,7 +1004,7 @@ public sealed class TuiApp
         var bufferWidth = Math.Max(Console.BufferWidth, 1);
         var absolute = startLeft + Math.Max(offset, 0);
         var left = absolute % bufferWidth;
-        var top = startTop + (absolute / bufferWidth);
+        var top = Math.Min(startTop + (absolute / bufferWidth), Console.BufferHeight - 1);
         Console.SetCursorPosition(left, top);
     }
 
