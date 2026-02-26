@@ -94,6 +94,7 @@ public sealed class TuiApp
         {
             var table = new Table()
                 .Border(TableBorder.Square)
+                .ShowRowSeparators()
                 .AddColumn(new TableColumn("#"))
                 .AddColumn(new TableColumn("Title"))
                 .AddColumn(new TableColumn("Status"))
