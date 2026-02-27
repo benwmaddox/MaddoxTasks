@@ -22,6 +22,7 @@ public sealed class TuiApp
 
     private readonly IssueEngine _engine;
     private int _selectedIndex;
+    private int _scrollOffset;
     private IssueFilter? _activeFilter;
     private IssueFilter? _lastFilter;
     private ToastMessage? _toast;
@@ -92,42 +93,68 @@ public sealed class TuiApp
         }
         else
         {
+            // Flat list in display order
+            var ordered = StatusOrder
+                .Where(s => showDone || s != IssueStatus.Done)
+                .SelectMany(s => views.Where(v => v.Issue.Status == s))
+                .ToList();
+
+            // header(3) + table chrome(4) + footer(3) = 10 fixed lines; each row = 2 lines
+            var visibleRows = Math.Max(1, (Console.WindowHeight - 10) / 2);
+
+            // Keep selected row inside the viewport
+            if (_selectedIndex < _scrollOffset)
+                _scrollOffset = _selectedIndex;
+            else if (_selectedIndex >= _scrollOffset + visibleRows)
+                _scrollOffset = _selectedIndex - visibleRows + 1;
+            _scrollOffset = Math.Clamp(_scrollOffset, 0, Math.Max(0, ordered.Count - visibleRows));
+
+            // Fixed widths for all columns except Title so layout never shifts
             var table = new Table()
                 .Border(TableBorder.Square)
                 .ShowRowSeparators()
-                .AddColumn(new TableColumn("#"))
+                .Expand()
+                .AddColumn(new TableColumn("#").Width(8))
                 .AddColumn(new TableColumn("Title"))
-                .AddColumn(new TableColumn("Status"))
-                .AddColumn(new TableColumn("Priority").Centered());
+                .AddColumn(new TableColumn("Status").Width(16))
+                .AddColumn(new TableColumn("Priority").Centered().Width(8));
 
-            var cursor = 0;
-            foreach (var status in StatusOrder)
+            var windowEnd = Math.Min(_scrollOffset + visibleRows, ordered.Count);
+            for (var i = _scrollOffset; i < windowEnd; i++)
             {
-                if (status == IssueStatus.Done && !showDone)
-                {
-                    continue;
-                }
+                var view = ordered[i];
+                var selected = i == _selectedIndex;
+                var id = selected
+                    ? $"[bold]> {view.ShortId.EscapeMarkup()}[/]"
+                    : $"  {view.ShortId.EscapeMarkup()}";
+                var title = selected
+                    ? $"[bold]{view.Issue.Title.EscapeMarkup()}[/]"
+                    : view.Issue.Title.EscapeMarkup();
 
-                foreach (var view in views.Where(v => v.Issue.Status == status))
-                {
-                    var selected = cursor == _selectedIndex;
-                    var id = selected
-                        ? $"[bold]> {view.ShortId.EscapeMarkup()}[/]"
-                        : $"  {view.ShortId.EscapeMarkup()}";
-                    var title = selected
-                        ? $"[bold]{view.Issue.Title.EscapeMarkup()}[/]"
-                        : view.Issue.Title.EscapeMarkup();
-
-                    table.AddRow(id, title, StatusMarkup(status, selected), PriorityMarkup(view.Issue.Priority.Value, selected));
-                    cursor++;
-                }
+                table.AddRow(id, title, StatusMarkup(view.Issue.Status, selected), PriorityMarkup(view.Issue.Priority.Value, selected));
             }
 
             AnsiConsole.Write(table);
         }
 
+        // Footer — always visible
+        var footerLine = "[grey]up/down navigate   Enter open   n new   / filter   ? help   q quit[/]";
+        if (views.Count > 0)
+        {
+            var ordered = StatusOrder
+                .Where(s => showDone || s != IssueStatus.Done)
+                .SelectMany(s => views.Where(v => v.Issue.Status == s))
+                .ToList();
+            var visibleRows = Math.Max(1, (Console.WindowHeight - 10) / 2);
+            if (ordered.Count > visibleRows)
+            {
+                var windowEnd = Math.Min(_scrollOffset + visibleRows, ordered.Count);
+                footerLine += $"   [grey]{_scrollOffset + 1}-{windowEnd}/{ordered.Count}[/]";
+            }
+        }
+
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]up/down navigate   Enter open   n new   / filter   ? help   q quit[/]");
+        AnsiConsole.MarkupLine(footerLine);
         RenderStatusBar();
     }
 
