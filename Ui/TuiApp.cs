@@ -113,7 +113,7 @@ public sealed class TuiApp
                     var selected = cursor == _selectedIndex;
                     var id = selected
                         ? $"[bold]> {view.ShortId.EscapeMarkup()}[/]"
-                        : view.ShortId.EscapeMarkup();
+                        : $"  {view.ShortId.EscapeMarkup()}";
                     var title = selected
                         ? $"[bold]{view.Issue.Title.EscapeMarkup()}[/]"
                         : view.Issue.Title.EscapeMarkup();
