@@ -30,26 +30,23 @@ public static partial class AgentRunner
     public static string GetIssuesJson(IssueEngine engine, IssueFilter? filter, bool includeDone)
     {
         var issues = engine.QueryIssues(filter, includeDone)
-            .Select(view => new AgentIssueDto(
-                view.Sequence,
-                view.ShortId,
-                view.GuidPrefix,
-                view.Issue.Id.ToString(),
-                view.Issue.Title,
-                view.Issue.Description,
-                view.Issue.Status,
-                view.Issue.Priority.Value,
-                view.Issue.ParentId?.ToString(),
-                view.Issue.Labels.ToArray(),
-                view.Issue.Comments
-                    .Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment, comment.Actor))
-                    .ToArray(),
-                view.Issue.CreatedAt,
-                view.Issue.UpdatedAt,
-                view.Issue.DueDate))
+            .Select(ToAgentIssueDto)
             .ToArray();
 
         return JsonSerializer.Serialize(issues, PrettyJsonContext.AgentIssueDtoArray);
+    }
+
+    public static string GetNextTaskJson(IssueEngine engine)
+    {
+        IssueView? nextTask = engine.QueryIssues(includeDone: false)
+            .Where(view => view.Issue.Status is Status.Active or Status.Next)
+            .OrderBy(view => view.Issue.Priority.Value)
+            .ThenBy(view => view.Issue.Status == Status.Active ? 0 : 1)
+            .ThenBy(view => view.Sequence)
+            .FirstOrDefault();
+
+        var dto = nextTask is null ? null : ToAgentIssueDto(nextTask);
+        return JsonSerializer.Serialize(dto, PrettyJsonContext.AgentIssueDto);
     }
 
     private static bool TryParseCommand(string json, IssueEngine engine, string defaultActor, out Command? command, out string error)
@@ -581,6 +578,25 @@ public static partial class AgentRunner
     private static string SerializeResponse(AgentCommandResponse response)
         => JsonSerializer.Serialize(response, PrettyJsonContext.AgentCommandResponse);
 
+    private static AgentIssueDto ToAgentIssueDto(IssueView view)
+        => new(
+            view.Sequence,
+            view.ShortId,
+            view.GuidPrefix,
+            view.Issue.Id.ToString(),
+            view.Issue.Title,
+            view.Issue.Description,
+            view.Issue.Status,
+            view.Issue.Priority.Value,
+            view.Issue.ParentId?.ToString(),
+            view.Issue.Labels.ToArray(),
+            view.Issue.Comments
+                .Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment, comment.Actor))
+                .ToArray(),
+            view.Issue.CreatedAt,
+            view.Issue.UpdatedAt,
+            view.Issue.DueDate);
+
     private static readonly AgentJsonContext PrettyJsonContext = new(new JsonSerializerOptions(JsonDefaults.Options)
     {
         WriteIndented = true
@@ -609,6 +625,7 @@ public static partial class AgentRunner
     [JsonSourceGenerationOptions(
         PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
         WriteIndented = true)]
+    [JsonSerializable(typeof(AgentIssueDto))]
     [JsonSerializable(typeof(AgentIssueDto[]))]
     [JsonSerializable(typeof(AgentCommandResponse))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;

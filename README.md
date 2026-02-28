@@ -95,6 +95,7 @@ Windows:
 
 ```powershell
 .\MaddoxTasks.exe agent issues
+.\MaddoxTasks.exe agent next
 .\MaddoxTasks.exe agent command --file cmd.json
 .\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
 ```
@@ -103,9 +104,15 @@ Linux/macOS:
 
 ```bash
 ./MaddoxTasks agent issues
+./MaddoxTasks agent next
 ./MaddoxTasks agent command --file cmd.json
 ./MaddoxTasks agent command --actor gpt-5.2 --file cmd.json
 ```
+
+`agent next` selection policy:
+- Candidate statuses: `Active` and `Next` only.
+- Sort order: `priority` ascending (`1` highest), then `Active` before `Next`, then sequence ascending.
+- Output: one issue JSON object, or `null` when no candidates exist.
 
 `cmd.json` example:
 

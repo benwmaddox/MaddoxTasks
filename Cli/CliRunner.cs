@@ -354,6 +354,7 @@ public static class CliRunner
     {
         var command = new CliCommand("agent", "Agent-friendly JSON interface.");
         command.AddCommand(BuildAgentIssuesCommand(dbOption));
+        command.AddCommand(BuildAgentNextCommand(dbOption));
         command.AddCommand(BuildAgentCommandCommand(dbOption));
         return command;
     }
@@ -386,6 +387,18 @@ public static class CliRunner
 
             Console.WriteLine(AgentRunner.GetIssuesJson(engine, filter, includeDone));
         }, dbOption, statusOption, statusNotOption, maxPriorityOption, labelsOption, dueBeforeOption, includeDoneOption);
+
+        return command;
+    }
+
+    private static CliCommand BuildAgentNextCommand(Option<string> dbOption)
+    {
+        var command = new CliCommand("next", "Return next actionable issue (Active/Next) as JSON.");
+        command.SetHandler((string dbPath) =>
+        {
+            var engine = CreateEngine(dbPath);
+            Console.WriteLine(AgentRunner.GetNextTaskJson(engine));
+        }, dbOption);
 
         return command;
     }
