@@ -225,6 +225,75 @@ model_reasoning_effort = "high"
         Assert.Equal(Status.ReadyForReview, engine.QueryIssues(includeDone: true).Single().Issue.Status);
     }
 
+    [Fact]
+    public void GetNextTaskJson_SelectsLowestPriorityAcrossActiveAndNext()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+
+        var first = engine.Execute(new CreateIssue("First", null, Priority.From(3), null, null));
+        var second = engine.Execute(new CreateIssue("Second", null, Priority.From(1), null, null));
+        var third = engine.Execute(new CreateIssue("Third", null, Priority.From(2), null, null));
+        Assert.True(first.Success);
+        Assert.True(second.Success);
+        Assert.True(third.Success);
+
+        Assert.True(engine.TryResolveIssueToken("1", out var firstId, out _));
+        Assert.True(engine.TryResolveIssueToken("2", out var secondId, out _));
+        Assert.True(engine.TryResolveIssueToken("3", out var thirdId, out _));
+        Assert.True(engine.Execute(new ChangeStatus(firstId, Status.Active)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(secondId, Status.Next)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(thirdId, Status.Active)).Success);
+
+        var response = AgentRunner.GetNextTaskJson(engine);
+        using var document = JsonDocument.Parse(response);
+        var root = document.RootElement;
+        Assert.Equal(2, root.GetProperty("sequence").GetInt32());
+        Assert.Equal("Next", root.GetProperty("status").GetString());
+        Assert.Equal(1, root.GetProperty("priority").GetInt32());
+    }
+
+    [Fact]
+    public void GetNextTaskJson_PrefersActiveWhenPriorityTies()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+
+        var first = engine.Execute(new CreateIssue("First", null, Priority.From(2), null, null));
+        var second = engine.Execute(new CreateIssue("Second", null, Priority.From(2), null, null));
+        Assert.True(first.Success);
+        Assert.True(second.Success);
+
+        Assert.True(engine.TryResolveIssueToken("1", out var firstId, out _));
+        Assert.True(engine.TryResolveIssueToken("2", out var secondId, out _));
+        Assert.True(engine.Execute(new ChangeStatus(firstId, Status.Next)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(secondId, Status.Active)).Success);
+
+        var response = AgentRunner.GetNextTaskJson(engine);
+        using var document = JsonDocument.Parse(response);
+        var root = document.RootElement;
+        Assert.Equal(2, root.GetProperty("sequence").GetInt32());
+        Assert.Equal("Active", root.GetProperty("status").GetString());
+        Assert.Equal(2, root.GetProperty("priority").GetInt32());
+    }
+
+    [Fact]
+    public void GetNextTaskJson_ReturnsNullWhenNoActiveOrNextIssuesExist()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+
+        var create = engine.Execute(new CreateIssue("Backlog only", null, Priority.From(2), null, null));
+        Assert.True(create.Success);
+
+        var response = AgentRunner.GetNextTaskJson(engine);
+        using var document = JsonDocument.Parse(response);
+        Assert.Equal(JsonValueKind.Null, document.RootElement.ValueKind);
+    }
+
     private static bool ResponseSuccess(string responseJson)
     {
         using var document = JsonDocument.Parse(responseJson);

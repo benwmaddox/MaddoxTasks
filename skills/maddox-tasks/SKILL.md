@@ -11,8 +11,9 @@ Run Maddox Tasks with the published/released binary, never source internals, for
 
 1. Use **only agent JSON commands** when operating as an agent.
 2. Treat `list tasks` as `agent issues` (machine-readable JSON).
-3. Do not run non-agent CLI commands (`list`, `create`, `status`, `priority`, `label`, `describe`, `comment`, `summary`) as part of this skill.
-4. If the user uses skill-style prompts such as `$maddox-tasks ...`, map them to `agent` subcommands.
+3. Treat `next task` requests as `agent next` (machine-readable JSON for one selected task).
+4. Do not run non-agent CLI commands (`list`, `create`, `status`, `priority`, `label`, `describe`, `comment`, `summary`) as part of this skill.
+5. If the user uses skill-style prompts such as `$maddox-tasks ...`, map them to `agent` subcommands.
 
 ## Use Released Binary
 
@@ -35,6 +36,7 @@ Read `references/commands.md` for concrete command patterns.
 
 1. Use `agent issues` to read current state as JSON.
 For "list tasks", use `agent issues` by default.
+For "next task", use `agent next` (selection policy: priority ascending across `Active`/`Next`, then `Active` before `Next`, then sequence).
 2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
 For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.3-codex high"` or `"claude-sonnet"`), or pass `--actor <model-id>` on `agent command`. If actor is omitted, auto-detection uses env vars first, then Claude settings, then Codex config.
 3. Execute with `agent command --file <json-file>` or stdin. Treat inline `--json` as last-resort on PowerShell.

@@ -8,12 +8,14 @@ Windows:
 
 ```powershell
 .\MaddoxTasks.exe agent issues
+.\MaddoxTasks.exe agent next
 ```
 
 Linux/macOS:
 
 ```bash
 ./MaddoxTasks agent issues
+./MaddoxTasks agent next
 ```
 
 Optional filters on `agent issues`:
@@ -24,6 +26,12 @@ Optional filters on `agent issues`:
 - `--labels <comma,separated,labels>`
 - `--due-before <yyyy-MM-dd or date-time>`
 - `--include-done <true|false>` (default is `true`)
+
+`agent next` behavior:
+
+- Considers only statuses `Active` and `Next`.
+- Sorts by priority ascending (`1` highest), then `Active` before `Next`, then sequence ascending.
+- Returns one issue object as JSON, or `null` if no candidate exists.
 
 ## Execute Commands
 
