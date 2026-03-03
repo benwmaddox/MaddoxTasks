@@ -14,6 +14,12 @@ Run Maddox Tasks with the published/released binary, never source internals, for
 3. Do not run non-agent CLI commands (`list`, `create`, `status`, `priority`, `label`, `describe`, `comment`, `summary`) as part of this skill.
 4. If the user uses skill-style prompts such as `$maddox-tasks ...`, map them to `agent` subcommands.
 
+## Text Guidelines (ASCII Preference)
+
+1. Prefer ASCII characters in all agent-generated text (comments, titles, descriptions) where possible.
+2. Avoid curly quotes, em dashes, and other non-ASCII punctuation that can break terminals/tools.
+3. Use ASCII equivalents: `"` and `'`, `--`, and `...`.
+
 ## Use Released Binary
 
 1. Always use the published binary: `MaddoxTasks.exe` on Windows or `./MaddoxTasks` on Linux/macOS.
