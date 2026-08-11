@@ -12,7 +12,8 @@ public sealed class IssueEngine
         Status.Blocked,
         Status.ReadyForReview,
         Status.Backlog,
-        Status.Done
+        Status.Done,
+        Status.Rejected
     ];
 
     private readonly IEventStore _eventStore;
@@ -33,9 +34,9 @@ public sealed class IssueEngine
         var state = GetState();
         IEnumerable<Issue> issues = state.OrderedIssues;
 
-        if (!includeDone && filter?.StatusEquals != Status.Done)
+        if (!includeDone && !(filter?.StatusEquals is { } requestedStatus && requestedStatus.IsTerminal()))
         {
-            issues = issues.Where(issue => issue.Status != Status.Done);
+            issues = issues.Where(issue => !issue.Status.IsTerminal());
         }
 
         if (filter is not null)

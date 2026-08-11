@@ -18,12 +18,12 @@ Linux/macOS:
 
 Optional filters on `agent issues`:
 
-- `--status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done>`
-- `--not-status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done>`
+- `--status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done|Rejected>`
+- `--not-status <Backlog|Active|Blocked|Next|ReadyForReview|Ready for Review|Done|Rejected>`
 - `--max-priority <1..5>`
 - `--labels <comma,separated,labels>`
 - `--due-before <yyyy-MM-dd or date-time>`
-- `--include-done <true|false>` (default is `true`)
+- `--include-done <true|false>` (default is `true`; legacy option name that includes terminal `Done` and `Rejected` tasks)
 
 ## Execute Commands
 

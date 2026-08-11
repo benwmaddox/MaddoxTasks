@@ -35,6 +35,21 @@ public sealed class SqliteEventStoreTests : IDisposable
         Assert.Equal(Status.Active, issue.Status);
     }
 
+    [Fact]
+    public void StatusChanged_RejectedRoundTripsThroughSqlite()
+    {
+        var issueId = new IssueId(Guid.NewGuid());
+        var timestamp = new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc);
+        var store = new SqliteEventStore(_dbPath);
+
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Reject me", null, Status.Backlog, Priority.From(3), null, null));
+        store.Append(new StatusChanged(Guid.NewGuid(), issueId, timestamp.AddMinutes(1), Status.Rejected));
+
+        var loaded = store.LoadAll();
+        var replayed = IssueState.Replay(loaded);
+        var issue = Assert.Single(replayed.OrderedIssues);
+        Assert.Equal(Status.Rejected, issue.Status);
+    }
     public void Dispose()
     {
         try

@@ -31,11 +31,15 @@ public enum Status
     Active,
     Blocked,
     ReadyForReview,
-    Done
+    Done,
+    Rejected
 }
 
 public static class StatusText
 {
+    public static bool IsTerminal(this Status status)
+        => status is Status.Done or Status.Rejected;
+
     public static string ToDisplayString(this Status status)
         => status switch
         {

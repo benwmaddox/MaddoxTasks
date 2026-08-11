@@ -49,7 +49,7 @@ public static class CliRunner
         var maxPriorityOption = new Option<int?>("--max-priority", "Include only issues with priority <= value.");
         var labelsOption = new Option<string?>("--labels", "Comma-separated labels (all required).");
         var dueBeforeOption = new Option<string?>("--due-before", "Include issues due on/before date (yyyy-MM-dd).");
-        var includeDoneOption = new Option<bool>("--include-done", () => false, "Include done issues.");
+        var includeDoneOption = new Option<bool>("--include-done", () => false, "Include terminal issues (Done and Rejected).");
 
         var command = new CliCommand("list", "List issues.");
         command.AddOption(statusOption);

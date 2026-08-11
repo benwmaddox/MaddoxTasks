@@ -17,7 +17,8 @@ public sealed class TuiApp
         IssueStatus.Blocked,
         IssueStatus.ReadyForReview,
         IssueStatus.Backlog,
-        IssueStatus.Done
+        IssueStatus.Done,
+        IssueStatus.Rejected
     ];
 
     private readonly IssueEngine _engine;
@@ -103,7 +104,7 @@ public sealed class TuiApp
             var cursor = 0;
             foreach (var status in StatusOrder)
             {
-                if (status == IssueStatus.Done && !showDone)
+                if (status.IsTerminal() && !showDone)
                 {
                     continue;
                 }
@@ -140,6 +141,7 @@ public sealed class TuiApp
             IssueStatus.Blocked => "red",
             IssueStatus.ReadyForReview => "yellow",
             IssueStatus.Done => "grey",
+            IssueStatus.Rejected => "maroon",
             _ => "grey"
         };
         var text = status.ToDisplayString().EscapeMarkup();
@@ -315,12 +317,12 @@ public sealed class TuiApp
 
     private bool ShouldShowDone()
     {
-        if (_activeFilter?.StatusEquals == IssueStatus.Done)
+        if (_activeFilter?.StatusEquals is { } statusEquals && statusEquals.IsTerminal())
         {
             return true;
         }
 
-        if (_activeFilter?.StatusNotEquals == IssueStatus.Done)
+        if (_activeFilter?.StatusNotEquals is { } statusNotEquals && statusNotEquals.IsTerminal())
         {
             return false;
         }
