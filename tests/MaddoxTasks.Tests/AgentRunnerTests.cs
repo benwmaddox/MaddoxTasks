@@ -225,6 +225,25 @@ model_reasoning_effort = "high"
         Assert.Equal(Status.ReadyForReview, engine.QueryIssues(includeDone: true).Single().Issue.Status);
     }
 
+    [Fact]
+    public void ExecuteCommandJson_ParsesRejectedStatusAndSerializesIt()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+        var createResult = engine.Execute(new CreateIssue("Task", "Desc", Priority.From(3), null, null));
+        Assert.True(createResult.Success);
+
+        var response = AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"ChangeStatus","issueId":"1","newStatus":"Rejected"}""");
+
+        Assert.True(ResponseSuccess(response));
+        Assert.Equal(Status.Rejected, engine.QueryIssues(includeDone: true).Single().Issue.Status);
+        var issuesJson = AgentRunner.GetIssuesJson(engine, new IssueFilter { StatusEquals = Status.Rejected }, includeDone: false);
+        using var document = JsonDocument.Parse(issuesJson);
+        Assert.Equal("Rejected", document.RootElement[0].GetProperty("status").GetString());
+    }
     private static bool ResponseSuccess(string responseJson)
     {
         using var document = JsonDocument.Parse(responseJson);

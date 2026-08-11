@@ -89,6 +89,8 @@ Issue tokens support:
 Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, `h` description history, and `q`/`Esc` to go back.
 Comments and description history show `By` (`user`, `agent`, or a model id such as `gpt-5.2`).
 
+Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
+
 ## Agent JSON Commands
 
 Windows:

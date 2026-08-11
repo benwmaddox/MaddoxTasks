@@ -110,6 +110,33 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
+    public void QueryIssues_HidesTerminalStatusesByDefaultButAllowsExplicitTerminalFilter()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+
+        var done = engine.Execute(new CreateIssue("Done", null, Priority.From(3), null, null));
+        var rejected = engine.Execute(new CreateIssue("Rejected", null, Priority.From(3), null, null));
+        var active = engine.Execute(new CreateIssue("Active", null, Priority.From(3), null, null));
+        Assert.True(done.Success && rejected.Success && active.Success);
+        Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(done.IssueId), Status.Done)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(rejected.IssueId), Status.Rejected)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(active.IssueId), Status.Active)).Success);
+
+        var open = engine.QueryIssues(includeDone: false);
+        Assert.Single(open);
+        Assert.Equal(Status.Active, open[0].Issue.Status);
+
+        var explicitRejected = engine.QueryIssues(new IssueFilter { StatusEquals = Status.Rejected }, includeDone: false);
+        Assert.Single(explicitRejected);
+        Assert.Equal(Status.Rejected, explicitRejected[0].Issue.Status);
+
+        var explicitDone = engine.QueryIssues(new IssueFilter { StatusEquals = Status.Done }, includeDone: false);
+        Assert.Single(explicitDone);
+        Assert.Equal(Status.Done, explicitDone[0].Issue.Status);
+    }
+    [Fact]
     public void AddComment_RequiresNonEmptyComment()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
