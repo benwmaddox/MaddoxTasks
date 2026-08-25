@@ -121,5 +121,42 @@ public sealed class IssueEngine
                     new IssueView(state.GetSequence(candidate.Id), candidate));
             });
     }
+
+    public ConditionalStatusChangeResult TryCompleteReadyForReview(IssueId issueId, bool dryRun = false)
+    {
+        return _eventStore.ExecuteAtomic(events =>
+        {
+            var state = IssueState.Replay(events);
+            if (!state.TryGetIssue(issueId, out var issue))
+            {
+                return new EventStoreOperation<ConditionalStatusChangeResult>([], ConditionalStatusChangeResult.NotFound);
+            }
+
+            if (issue.Status != Status.ReadyForReview)
+            {
+                return new EventStoreOperation<ConditionalStatusChangeResult>([], ConditionalStatusChangeResult.AlreadyChanged);
+            }
+
+            var plannedEvent = new StatusChanged(
+                Guid.NewGuid(),
+                issueId,
+                DateTime.SpecifyKind(_clock.UtcNow, DateTimeKind.Utc),
+                Status.Done);
+            if (dryRun)
+            {
+                return new EventStoreOperation<ConditionalStatusChangeResult>([], ConditionalStatusChangeResult.WouldClose);
+            }
+
+            return new EventStoreOperation<ConditionalStatusChangeResult>([plannedEvent], ConditionalStatusChangeResult.Closed);
+        });
+    }
+}
+
+public enum ConditionalStatusChangeResult
+{
+    Closed,
+    WouldClose,
+    AlreadyChanged,
+    NotFound
 }
 

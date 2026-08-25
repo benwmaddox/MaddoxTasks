@@ -60,6 +60,12 @@ public static partial class AgentRunner
         return JsonSerializer.Serialize(ToAgentIssueDto(view), PrettyJsonContext.AgentIssueDto);
     }
 
+    public static string ReconcileReviewsJson(IssueEngine engine, IGitHubPullRequestClient pullRequests, bool dryRun = false)
+    {
+        var result = new ReviewReconciler(engine, pullRequests).Reconcile(dryRun);
+        return JsonSerializer.Serialize(result, PrettyJsonContext.ReviewReconciliationResult);
+    }
+
     private static AgentIssueDto ToAgentIssueDto(IssueView view)
     {
         var issue = view.Issue;
@@ -642,6 +648,8 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(AgentIssueDto[]))]
     [JsonSerializable(typeof(AgentIssueDto))]
     [JsonSerializable(typeof(AgentCommandResponse))]
+    [JsonSerializable(typeof(ReviewReconciliationResult))]
+    [JsonSerializable(typeof(ReviewReconciliationOutcome))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;
 }
 

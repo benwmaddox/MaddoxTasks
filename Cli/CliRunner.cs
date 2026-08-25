@@ -356,7 +356,32 @@ public static class CliRunner
         command.AddCommand(BuildAgentIssuesCommand(dbOption));
         command.AddCommand(BuildAgentNextCommand(dbOption));
         command.AddCommand(BuildAgentClaimCommand(dbOption));
+        command.AddCommand(BuildAgentReconcileReviewsCommand(dbOption));
         command.AddCommand(BuildAgentCommandCommand(dbOption));
+        return command;
+    }
+
+    private static CliCommand BuildAgentReconcileReviewsCommand(Option<string> dbOption)
+    {
+        var ghOption = new Option<string>("--gh-exe", () => "gh", "GitHub CLI executable.");
+        var ghTimeoutOption = new Option<int>("--gh-timeout-seconds", () => 45, "Maximum seconds to wait for each GitHub CLI lookup.");
+        var dryRunOption = new Option<bool>("--dry-run", "Report what would be checked without invoking gh or changing tasks.");
+        var command = new CliCommand("reconcile-reviews", "Reconcile ReadyForReview tasks with their associated GitHub pull requests.");
+        command.AddOption(ghOption);
+        command.AddOption(ghTimeoutOption);
+        command.AddOption(dryRunOption);
+        command.SetHandler((string dbPath, string ghExe, int ghTimeoutSeconds, bool dryRun) =>
+        {
+            if (ghTimeoutSeconds <= 0)
+            {
+                Console.Error.WriteLine("--gh-timeout-seconds must be positive.");
+                return;
+            }
+
+            var engine = CreateEngine(dbPath);
+            var client = new GitHubCliPullRequestClient(ghExe, TimeSpan.FromSeconds(ghTimeoutSeconds));
+            Console.WriteLine(AgentRunner.ReconcileReviewsJson(engine, client, dryRun));
+        }, dbOption, ghOption, ghTimeoutOption, dryRunOption);
         return command;
     }
 
