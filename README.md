@@ -228,7 +228,8 @@ Publish without AOT:
 ## CI and Releases
 
 - `CI` workflow runs build + tests on pushes to `main` and PRs.
-- `Release` workflow publishes zipped binaries.
+- `CI` also publishes Native AOT binaries for `win-x64`, `linux-x64`, and `osx-arm64`, then runs `scripts/validate-published-agent.ps1` against each binary. The smoke gate creates and reads a task through only the published `agent` JSON surface using an isolated temporary SQLite database, catching missing native SQLite dependencies and command-surface drift.
+- `Release` runs the same published-agent smoke gate for every runtime before packaging its zipped binary.
 - Stable releases: tags matching `v*` (example: `v0.2.0`).
 - Nightly prereleases: created only if code changed since the previous nightly tag.
 

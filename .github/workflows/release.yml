@@ -91,10 +91,13 @@ jobs:
         include:
           - os: windows-latest
             runtime: win-x64
+            binary: MaddoxTasks.exe
           - os: ubuntu-latest
             runtime: linux-x64
+            binary: MaddoxTasks
           - os: macos-latest
             runtime: osx-arm64
+            binary: MaddoxTasks
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
@@ -117,6 +120,10 @@ jobs:
             -p:PublishAot=true \
             -p:PublishTrimmed=true \
             -o "out/${{ matrix.runtime }}"
+
+      - name: Smoke test published agent
+        shell: pwsh
+        run: ./scripts/validate-published-agent.ps1 -Binary "out/${{ matrix.runtime }}/${{ matrix.binary }}"
 
       - name: Package
         shell: bash

@@ -26,3 +26,45 @@ jobs:
 
       - name: Test
         run: dotnet test tests/MaddoxTasks.Tests/MaddoxTasks.Tests.csproj -c Release --no-build
+
+  publish-and-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            runtime: win-x64
+            binary: MaddoxTasks.exe
+          - os: ubuntu-latest
+            runtime: linux-x64
+            binary: MaddoxTasks
+          - os: macos-latest
+            runtime: osx-arm64
+            binary: MaddoxTasks
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Publish Native AOT
+        shell: pwsh
+        run: >-
+          dotnet publish MaddoxTasks.csproj
+          -c Release
+          -r ${{ matrix.runtime }}
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:PublishAot=true
+          -p:PublishTrimmed=true
+          -o out/${{ matrix.runtime }}
+
+      - name: Smoke test published agent
+        shell: pwsh
+        run: >-
+          ./scripts/validate-published-agent.ps1
+          -Binary out/${{ matrix.runtime }}/${{ matrix.binary }}
