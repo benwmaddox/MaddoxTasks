@@ -152,6 +152,12 @@ For hourly Windows automation, preview or install the versioned scripts (install
 .\scripts\install-reserved-task.ps1 -MaddoxExe F:\MaddoxTasks\MaddoxTasks.exe -RepoRoot D:\code
 ```
 
+The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
+
+```powershell
+.\scripts\tests\run-reserved-task-multi-repo.tests.ps1
+```
+
 ## Where Data Is Stored
 
 Default DB file is `MaddoxTasks.db`.

@@ -156,8 +156,15 @@ try {
 
     $repositories = @($claim.repositories)
     if ($repositories.Count -eq 0) { throw "Claimed issue $($claim.issueId) has no repositories." }
-    $repositoryPath = Resolve-ReservedRepository -Repository $repositories[0]
+    # Resolve every reservation before starting Codex. This makes an invalid
+    # secondary repository fail before any work begins.
+    $repositoryPaths = @($repositories | ForEach-Object { Resolve-ReservedRepository -Repository $_ })
+    $repositoryPath = $repositoryPaths[0]
     $selection = ($repositories -join ", ")
+    $repositoryMappings = for ($repositoryIndex = 0; $repositoryIndex -lt $repositories.Count; $repositoryIndex++) {
+        "  $($repositories[$repositoryIndex]) -> $($repositoryPaths[$repositoryIndex])"
+    }
+    $repositoryMappingText = $repositoryMappings -join "`n"
     Write-Host "Claimed issue $($claim.sequence) '$($claim.title)' for repositories: $selection"
 
     if ($Preview) {
@@ -171,12 +178,16 @@ Work only on the already claimed Maddox Tasks issue below. Do not run MaddoxTask
 Selected issue (exact JSON):
 $($claim | ConvertTo-Json -Depth 10 -Compress)
 
-Reserved repositories (exact list): $selection
-Work in the first reserved repository at: $repositoryPath
+All reserved repositories are writable for this run. Exact repository-to-path mappings:
+$repositoryMappingText
+The first reserved repository is the working directory. Do not select another task.
 When complete, update the Maddox task as appropriate and leave a concise progress comment.
 "@
 
     $codexArguments = @("exec", "--sandbox", "workspace-write", "--cd", $repositoryPath)
+    for ($repositoryIndex = 1; $repositoryIndex -lt $repositoryPaths.Count; $repositoryIndex++) {
+        $codexArguments += @("--add-dir", $repositoryPaths[$repositoryIndex])
+    }
     if ($Model) { $codexArguments += @("--model", $Model) }
     if ($ReasoningEffort) { $codexArguments += @("-c", "model_reasoning_effort=$ReasoningEffort") }
 
