@@ -41,14 +41,27 @@ Read `references/commands.md` for concrete command patterns.
 
 1. Use `agent issues` to read current state as JSON.
 For "list tasks", use `agent issues` by default.
-2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`).
+2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`). Repository reservations are labels in the canonical form `repo:<name>`; repository identity is case-insensitive.
 For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.3-codex high"` or `"claude-sonnet"`), or pass `--actor <model-id>` on `agent command`. If actor is omitted, auto-detection uses env vars first, then Claude settings, then Codex config.
 3. Execute with `agent command --file <json-file>` or stdin. Treat inline `--json` as last-resort on PowerShell.
 4. Re-read with `agent issues` and verify deterministic output.
 
+## Repository Reservations and Claims
+
+`agent issues` returns a deterministic `repositories` array for every issue. To safely run concurrent scheduled workers, use `agent claim` instead of selecting a `Next` issue from a read-only listing:
+
+```powershell
+.\MaddoxTasks.exe agent claim
+.\MaddoxTasks.exe agent claim --dry-run
+```
+
+The command atomically selects one `Next` issue with at least one `repo:` label, ordered by priority then sequence, skips repositories reserved by `Active` or `ReadyForReview` issues, changes the selected issue to `Active`, and returns its issue JSON. It returns JSON `null` when no issue is available; stop the worker for that invocation. Dry-run is read-only. Active and `ReadyForReview` tasks must retain at least one repository and cannot overlap another reserving task. When changing reservations, add the new `repo:` label before removing the old label; moving to another status releases it.
+
+The hourly runner reconciles `ReadyForReview` tasks after work. It associates only canonical GitHub PR URLs in the task description/comments, and closes a task only when every associated PR has a non-null `mergedAt` from `gh pr view`. No-PR tasks and any open/closed-unmerged/error cases remain open. Preview mode is read-only and skips live `gh` calls.
+
 ## Task Lifecycle Expectations
 
-1. When beginning work on a task, if the task status is `Next`, change it to `Active` before doing implementation work.
+1. When beginning work on a task, use `agent claim`; do not select or activate a task separately.
 2. While working, record decision points as comments using `AddComment`.
 3. When implementation is complete, change the task status to `Ready for Review`.
 

@@ -91,12 +91,17 @@ Comments and description history show `By` (`user`, `agent`, or a model id such 
 
 Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
 
+Active and `ReadyForReview` work reserve repositories using labels with the canonical `repo:<name>` prefix, for example `repo:StasisLang` (repository names are compared case-insensitively). An issue must have at least one repository before it can enter either reserving status; reserving tasks cannot share a repository. Moving to another status releases the reservation. Add a new `repo:` label before removing an old one when changing the repositories of active or review work.
+
 ## Agent JSON Commands
 
 Windows:
 
 ```powershell
 .\MaddoxTasks.exe agent issues
+.\MaddoxTasks.exe agent next
+.\MaddoxTasks.exe agent claim
+.\MaddoxTasks.exe agent claim --dry-run
 .\MaddoxTasks.exe agent command --file cmd.json
 .\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
 ```
@@ -105,6 +110,9 @@ Linux/macOS:
 
 ```bash
 ./MaddoxTasks agent issues
+./MaddoxTasks agent next
+./MaddoxTasks agent claim
+./MaddoxTasks agent claim --dry-run
 ./MaddoxTasks agent command --file cmd.json
 ./MaddoxTasks agent command --actor gpt-5.2 --file cmd.json
 ```
@@ -132,6 +140,17 @@ Comment example:
 
 PowerShell tip: prefer `--file` or stdin here-string over inline `--json` to avoid escaping problems.
 If actor is omitted for `UpdateDescription`/`AddComment`, default resolution order is `--actor`, then env vars (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`), then Claude settings (`.claude/settings.local.json`, `.claude/settings.json`, `~/.claude/settings.json` model), then Codex config (`~/.codex/config.toml` model + reasoning effort), then `agent`.
+
+`agent issues` includes a deterministic `repositories` array derived from `repo:` labels. `agent claim` atomically selects the highest-priority available `Next` issue (sequence breaks ties), changes it to `Active`, and prints the selected issue JSON. It prints `null` when no repository-backed issue is available; scheduled runners should stop for that hour. `--dry-run` performs the same selection without changing the database.
+
+After its claim/work loop, the hourly runner checks `ReadyForReview` tasks using only PR URLs found in their descriptions and comments. A review task with no PR URL stays open. A task closes automatically only when every associated PR reports a non-null `mergedAt` from `gh pr view`; open, closed-unmerged, lookup-error, and ambiguous cases remain `ReadyForReview` with a warning. Preview mode reports intended checks without calling `gh` or mutating tasks.
+
+For hourly Windows automation, preview or install the versioned scripts (installation does not run the scheduled task immediately):
+
+```powershell
+.\scripts\run-reserved-task.ps1 -MaddoxExe F:\MaddoxTasks\MaddoxTasks.exe -RepoRoot D:\code -Preview
+.\scripts\install-reserved-task.ps1 -MaddoxExe F:\MaddoxTasks\MaddoxTasks.exe -RepoRoot D:\code
+```
 
 ## Where Data Is Stored
 

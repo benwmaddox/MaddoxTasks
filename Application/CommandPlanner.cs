@@ -55,6 +55,11 @@ public static class CommandPlanner
             throw new CommandValidationException($"Issue {command.IssueId} already has status '{command.NewStatus}'.");
         }
 
+        if (command.NewStatus.HoldsRepositoryReservation())
+        {
+            ValidateActiveReservation(issue, issue.Repositories, state);
+        }
+
         return new StatusChanged(Guid.NewGuid(), command.IssueId, timestamp, command.NewStatus);
     }
 
@@ -80,6 +85,12 @@ public static class CommandPlanner
             throw new CommandValidationException($"Issue {command.IssueId} already has label '{normalized}'.");
         }
 
+        if (issue.Status.HoldsRepositoryReservation() && RepositoryLabels.TryGetRepository(normalized, out var repository))
+        {
+            var repositories = issue.Repositories.Append(repository).ToArray();
+            ValidateActiveReservation(issue, repositories, state);
+        }
+
         return new LabelAdded(Guid.NewGuid(), command.IssueId, timestamp, normalized);
     }
 
@@ -91,6 +102,13 @@ public static class CommandPlanner
         if (!issue.HasLabel(normalized))
         {
             throw new CommandValidationException($"Issue {command.IssueId} does not have label '{normalized}'.");
+        }
+
+        if (issue.Status.HoldsRepositoryReservation() && RepositoryLabels.TryGetRepository(normalized, out _)
+            && issue.Repositories.Count <= 1)
+        {
+            throw new CommandValidationException(
+                $"Cannot remove repository label from reserving issue {command.IssueId}: at least one repo:<name> label is required.");
         }
 
         return new LabelRemoved(Guid.NewGuid(), command.IssueId, timestamp, normalized);
@@ -134,12 +152,48 @@ public static class CommandPlanner
         return issue;
     }
 
+    private static void ValidateActiveReservation(Issue issue, IEnumerable<string> repositories, IssueState state)
+    {
+        var normalizedRepositories = repositories
+            .Select(RepositoryLabels.Normalize)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (normalizedRepositories.Length == 0)
+        {
+            throw new CommandValidationException(
+                $"Cannot move issue {issue.Id} into a reservation-holding status: at least one repo:<name> label is required.");
+        }
+
+        foreach (var activeIssue in state.Issues.Values
+                     .Where(candidate => candidate.Id != issue.Id && candidate.Status.HoldsRepositoryReservation())
+                     .OrderBy(candidate => state.GetSequence(candidate.Id)))
+        {
+            var overlap = normalizedRepositories
+                .Intersect(activeIssue.Repositories, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
+                .FirstOrDefault();
+            if (overlap is not null)
+            {
+                throw new CommandValidationException(
+                    $"Cannot reserve repository '{overlap}': it is already reserved by reserving issue {activeIssue.Id}.");
+            }
+        }
+    }
+
     private static string NormalizeLabel(string label)
     {
         var normalized = IssueFiltering.NormalizeLabel(label);
         if (string.IsNullOrWhiteSpace(normalized))
         {
             throw new CommandValidationException("Label cannot be empty.");
+        }
+
+        if (normalized.StartsWith(RepositoryLabels.Prefix, StringComparison.Ordinal)
+            && !RepositoryLabels.TryGetRepository(normalized, out _))
+        {
+            throw new CommandValidationException("Repository label must use the form 'repo:<name>'.");
         }
 
         return normalized;

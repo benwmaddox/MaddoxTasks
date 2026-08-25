@@ -122,7 +122,9 @@ public sealed class IssueEngineTests
         Assert.True(done.Success && rejected.Success && active.Success);
         Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(done.IssueId), Status.Done)).Success);
         Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(rejected.IssueId), Status.Rejected)).Success);
-        Assert.True(engine.Execute(new ChangeStatus(Assert.IsAssignableFrom<IssueId>(active.IssueId), Status.Active)).Success);
+        var activeId = Assert.IsAssignableFrom<IssueId>(active.IssueId);
+        Assert.True(engine.Execute(new AddLabel(activeId, "repo:status-test")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(activeId, Status.Active)).Success);
 
         var open = engine.QueryIssues(includeDone: false);
         Assert.Single(open);
@@ -183,6 +185,96 @@ public sealed class IssueEngineTests
         Assert.False(commentResult.Success);
 
         Assert.Single(store.LoadAll());
+    }
+
+    [Fact]
+    public void ActiveTasksRequireDisjointRepositories()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("First", null, Priority.From(3), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Second", null, Priority.From(3), null, null)).IssueId);
+
+        Assert.False(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
+        Assert.True(engine.Execute(new AddLabel(first, "Repo:StasisLang")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
+        Assert.True(engine.Execute(new AddLabel(second, "repo:stasislang")).Success);
+
+        var conflict = engine.Execute(new ChangeStatus(second, Status.Active));
+        Assert.False(conflict.Success);
+        Assert.Contains("already reserved", conflict.Message, StringComparison.OrdinalIgnoreCase);
+
+        Assert.True(engine.Execute(new RemoveLabel(second, "repo:stasislang")).Success);
+        Assert.True(engine.Execute(new AddLabel(second, "repo:Other")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(second, Status.Active)).Success);
+        Assert.Equal(["other"], engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == second).Issue.Repositories);
+    }
+
+    [Fact]
+    public void ActiveRepositoryEditsCannotRemoveLastReservation()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+        var issueId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:one")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Active)).Success);
+
+        var result = engine.Execute(new RemoveLabel(issueId, "repo:one"));
+        Assert.False(result.Success);
+        Assert.Contains("at least one repo", result.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ClaimNextSelectsAvailableTaskByPriorityAndSequence()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+        var blocked = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(1), null, null)).IssueId);
+        var available = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Available", null, Priority.From(2), null, null)).IssueId);
+        var noRepo = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("No repo", null, Priority.From(1), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(blocked, "repo:busy")).Success);
+        Assert.True(engine.Execute(new AddLabel(available, "repo:free")).Success);
+        Assert.True(engine.Execute(new AddLabel(noRepo, "work")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(blocked, Status.Next)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(available, Status.Next)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(noRepo, Status.Next)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(blocked, Status.Active)).Success);
+
+        var claim = engine.ClaimNext();
+        Assert.NotNull(claim);
+        Assert.Equal(available, claim!.Issue.Id);
+        Assert.Equal(Status.Active, claim.Issue.Status);
+        Assert.Null(engine.ClaimNext());
+        Assert.Equal(Status.Active, engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == blocked).Issue.Status);
+    }
+
+    [Fact]
+    public void ReadyForReviewHoldsReservationsAndBlocksClaims()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, clock);
+        var reviewId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Review", null, Priority.From(1), null, null)).IssueId);
+        var blockedId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(2), null, null)).IssueId);
+        var freeId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Free", null, Priority.From(3), null, null)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(reviewId, "repo:shared")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(reviewId, Status.ReadyForReview)).Success);
+        Assert.True(engine.Execute(new AddLabel(blockedId, "repo:shared")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(blockedId, Status.Next)).Success);
+        Assert.True(engine.Execute(new AddLabel(freeId, "repo:free")).Success);
+
+        var blockedActivation = engine.Execute(new ChangeStatus(blockedId, Status.Active));
+        Assert.False(blockedActivation.Success);
+        Assert.Null(engine.ClaimNext());
+
+        Assert.True(engine.Execute(new ChangeStatus(freeId, Status.Next)).Success);
+        var claim = engine.ClaimNext();
+        Assert.NotNull(claim);
+        Assert.Equal(freeId, claim!.Issue.Id);
     }
 }
 

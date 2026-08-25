@@ -354,7 +354,33 @@ public static class CliRunner
     {
         var command = new CliCommand("agent", "Agent-friendly JSON interface.");
         command.AddCommand(BuildAgentIssuesCommand(dbOption));
+        command.AddCommand(BuildAgentNextCommand(dbOption));
+        command.AddCommand(BuildAgentClaimCommand(dbOption));
         command.AddCommand(BuildAgentCommandCommand(dbOption));
+        return command;
+    }
+
+    private static CliCommand BuildAgentNextCommand(Option<string> dbOption)
+    {
+        var command = new CliCommand("next", "Return next actionable issue (Active/Next) as JSON.");
+        command.SetHandler((string dbPath) =>
+        {
+            var engine = CreateEngine(dbPath);
+            Console.WriteLine(AgentRunner.GetNextTaskJson(engine));
+        }, dbOption);
+        return command;
+    }
+
+    private static CliCommand BuildAgentClaimCommand(Option<string> dbOption)
+    {
+        var dryRunOption = new Option<bool>("--dry-run", "Select without changing the task status.");
+        var command = new CliCommand("claim", "Atomically claim the next available repository-backed task as Active.");
+        command.AddOption(dryRunOption);
+        command.SetHandler((string dbPath, bool dryRun) =>
+        {
+            var engine = CreateEngine(dbPath);
+            Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun));
+        }, dbOption, dryRunOption);
         return command;
     }
 

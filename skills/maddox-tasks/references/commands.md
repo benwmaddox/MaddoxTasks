@@ -10,6 +10,8 @@ Windows:
 .\MaddoxTasks.exe agent issues
 ```
 
+`agent next` remains a read-only compatibility command for selecting the next existing Active/Next task. Use `agent claim` for concurrent workers that need an atomic repository reservation.
+
 Linux/macOS:
 
 ```bash
@@ -26,6 +28,26 @@ Optional filters on `agent issues`:
 - `--include-done <true|false>` (default is `true`; legacy option name that includes terminal `Done` and `Rejected` tasks)
 
 ## Execute Commands
+
+## Atomic Repository Claim
+
+Read-only preview:
+
+```powershell
+.\MaddoxTasks.exe agent claim --dry-run
+```
+
+Real claim:
+
+```powershell
+.\MaddoxTasks.exe agent claim
+```
+
+`agent claim` atomically selects the first eligible `Next` issue (priority ascending, then sequence ascending), requiring at least one `repo:<name>` label and no overlap with an `Active` or `ReadyForReview` issue. It changes exactly that issue to `Active` and returns its issue JSON, including the deterministic `repositories` array. It returns `null` when no claim is available. A scheduled runner should stop cleanly on `null`.
+
+Repository labels are canonicalized as lowercase `repo:<name>` identities and compared case-insensitively. Active and `ReadyForReview` tasks cannot lose their last repository or acquire a repository reserved by another reserving task. To change a reservation, add the replacement label first, then remove the old label.
+
+The scheduled runner checks `ReadyForReview` tasks after work. Only canonical `https://github.com/<owner>/<repo>/pull/<number>` URLs in descriptions/comments are associated. It closes a task only when all associated PRs have non-null `mergedAt`; no-PR, open, closed-unmerged, and lookup-error tasks remain unchanged.
 
 Run with inline JSON:
 
@@ -66,6 +88,8 @@ Supported `type` values (all available agent commands):
 - `RemoveLabel`
 - `UpdateDescription`
 - `AddComment`
+
+Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels.
 
 ## Payload Schemas
 

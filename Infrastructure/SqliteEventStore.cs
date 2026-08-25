@@ -16,16 +16,56 @@ public sealed class SqliteEventStore : IEventStore
 
         var fullPath = Path.GetFullPath(databasePath);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath) ?? ".");
-        _connectionString = new SqliteConnectionStringBuilder { DataSource = fullPath }.ToString();
+        _connectionString = new SqliteConnectionStringBuilder { DataSource = fullPath, DefaultTimeout = 30 }.ToString();
         Initialize();
     }
 
     public IReadOnlyList<IssueEvent> LoadAll()
     {
-        var events = new List<IssueEvent>();
-
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
+
+        return LoadAll(connection);
+    }
+
+    public T ExecuteAtomic<T>(Func<IReadOnlyList<IssueEvent>, EventStoreOperation<T>> operation)
+    {
+        using var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+
+        // BEGIN IMMEDIATE acquires the SQLite writer lock before reading state,
+        // so planning and appending cannot race another process.
+        using (var begin = connection.CreateCommand())
+        {
+            begin.CommandText = "BEGIN IMMEDIATE;";
+            begin.ExecuteNonQuery();
+        }
+
+        try
+        {
+            var result = operation(LoadAll(connection));
+            foreach (var issueEvent in result.Events)
+            {
+                Append(connection, issueEvent);
+            }
+
+            using var commit = connection.CreateCommand();
+            commit.CommandText = "COMMIT;";
+            commit.ExecuteNonQuery();
+            return result.Result;
+        }
+        catch
+        {
+            using var rollback = connection.CreateCommand();
+            rollback.CommandText = "ROLLBACK;";
+            rollback.ExecuteNonQuery();
+            throw;
+        }
+    }
+
+    private static IReadOnlyList<IssueEvent> LoadAll(SqliteConnection connection)
+    {
+        var events = new List<IssueEvent>();
 
         using var command = connection.CreateCommand();
         command.CommandText = """
@@ -49,6 +89,12 @@ public sealed class SqliteEventStore : IEventStore
     {
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
+
+        Append(connection, issueEvent);
+    }
+
+    private static void Append(SqliteConnection connection, IssueEvent issueEvent)
+    {
 
         using var command = connection.CreateCommand();
         command.CommandText = """
