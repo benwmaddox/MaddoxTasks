@@ -16,7 +16,6 @@ public sealed class AgentRunnerTests
         var engine = new IssueEngine(store, clock);
         var createResult = engine.Execute(new CreateIssue("Task", "Desc", Priority.From(3), null, null));
         Assert.True(createResult.Success);
-
         var response = AgentRunner.ExecuteCommandJson(
             engine,
             """{"type":"AddComment","issueId":"1","comment":"Automated note"}""",
@@ -216,6 +215,7 @@ model_reasoning_effort = "high"
         var engine = new IssueEngine(store, clock);
         var createResult = engine.Execute(new CreateIssue("Task", "Desc", Priority.From(3), null, null));
         Assert.True(createResult.Success);
+        Assert.True(engine.Execute(new AddLabel(Assert.IsAssignableFrom<IssueId>(createResult.IssueId), "repo:review")).Success);
 
         var response = AgentRunner.ExecuteCommandJson(
             engine,
@@ -243,6 +243,55 @@ model_reasoning_effort = "high"
         var issuesJson = AgentRunner.GetIssuesJson(engine, new IssueFilter { StatusEquals = Status.Rejected }, includeDone: false);
         using var document = JsonDocument.Parse(issuesJson);
         Assert.Equal("Rejected", document.RootElement[0].GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public void GetIssuesJson_IncludesDeterministicRepositories()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "Repo:Zeta")).Success);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
+
+        using var document = JsonDocument.Parse(AgentRunner.GetIssuesJson(engine, null, includeDone: true));
+        var repositories = document.RootElement[0].GetProperty("repositories").EnumerateArray().Select(item => item.GetString()!).ToArray();
+        Assert.Equal(["alpha", "zeta"], repositories);
+    }
+
+    [Fact]
+    public void ClaimJsonReturnsClaimAndNullWhenUnavailable()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Next)).Success);
+
+        using var claimed = JsonDocument.Parse(AgentRunner.GetClaimJson(engine));
+        Assert.Equal("Active", claimed.RootElement.GetProperty("status").GetString());
+        Assert.Equal("alpha", claimed.RootElement.GetProperty("repositories")[0].GetString());
+        Assert.Equal("null", AgentRunner.GetClaimJson(engine));
+    }
+
+    [Fact]
+    public void ClaimDryRunDoesNotMutateTask()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var store = new InMemoryEventStoreForAgentTests();
+        var engine = new IssueEngine(store, clock);
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Next)).Success);
+
+        using var preview = JsonDocument.Parse(AgentRunner.GetClaimJson(engine, dryRun: true));
+        Assert.Equal("Next", preview.RootElement.GetProperty("status").GetString());
+        Assert.Equal(Status.Next, engine.QueryIssues(includeDone: true).Single().Issue.Status);
     }
     private static bool ResponseSuccess(string responseJson)
     {

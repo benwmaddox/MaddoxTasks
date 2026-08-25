@@ -50,6 +50,51 @@ public sealed class SqliteEventStoreTests : IDisposable
         var issue = Assert.Single(replayed.OrderedIssues);
         Assert.Equal(Status.Rejected, issue.Status);
     }
+
+    [Fact]
+    public async Task ConcurrentClaims_ClaimSameTaskOnlyOnce()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue("Claim me", null, Priority.From(1), null, null)).IssueId);
+        Assert.True(setup.Execute(new AddLabel(issueId, "repo:shared")).Success);
+        Assert.True(setup.Execute(new ChangeStatus(issueId, Status.Next)).Success);
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()));
+
+        Assert.Single(claims, claim => claim is not null);
+        Assert.Single(claims, claim => claim is null);
+        var finalIssue = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll()).OrderedIssues.Single();
+        Assert.Equal(Status.Active, finalIssue.Status);
+    }
+
+    [Fact]
+    public async Task ConcurrentClaims_CannotShareRepositoryButCanUseDisjointRepositories()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        foreach (var repository in new[] { "shared", "shared", "other" })
+        {
+            var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue(repository, null, Priority.From(1), null, null)).IssueId);
+            Assert.True(setup.Execute(new AddLabel(issueId, $"repo:{repository}")).Success);
+            Assert.True(setup.Execute(new ChangeStatus(issueId, Status.Next)).Success);
+        }
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()));
+
+        Assert.Equal(2, claims.Count(claim => claim is not null));
+        var activeRepositories = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll()).OrderedIssues
+            .Where(issue => issue.Status == Status.Active)
+            .SelectMany(issue => issue.Repositories)
+            .ToArray();
+        Assert.Equal(2, activeRepositories.Length);
+        Assert.Equal(2, activeRepositories.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+    }
     public void Dispose()
     {
         try
@@ -64,5 +109,12 @@ public sealed class SqliteEventStoreTests : IDisposable
             // Ignore cleanup failures in temp directory.
         }
     }
+}
+
+file sealed class FrozenClockForSqliteReservations : IClock
+{
+    public FrozenClockForSqliteReservations(DateTime utcNow) => UtcNow = utcNow;
+
+    public DateTime UtcNow { get; }
 }
 

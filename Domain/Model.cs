@@ -37,6 +37,9 @@ public enum Status
 
 public static class StatusText
 {
+    public static bool HoldsRepositoryReservation(this Status status)
+        => status is Status.Active or Status.ReadyForReview;
+
     public static bool IsTerminal(this Status status)
         => status is Status.Done or Status.Rejected;
 
@@ -92,6 +95,51 @@ public static class StatusText
     }
 }
 
+public static class RepositoryLabels
+{
+    public const string Prefix = "repo:";
+
+    public static string Normalize(string repository)
+    {
+        var normalized = repository.Trim().ToLowerInvariant();
+        if (normalized.StartsWith(Prefix, StringComparison.Ordinal))
+        {
+            normalized = normalized[Prefix.Length..].Trim();
+        }
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            throw new ArgumentException("Repository name cannot be empty.", nameof(repository));
+        }
+
+        return normalized;
+    }
+
+    public static string ToLabel(string repository) => Prefix + Normalize(repository);
+
+    public static bool TryGetRepository(string label, out string repository)
+    {
+        repository = string.Empty;
+        var normalized = label.Trim().ToLowerInvariant();
+        if (!normalized.StartsWith(Prefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var value = normalized[Prefix.Length..].Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        repository = value;
+        return true;
+    }
+
+    public static bool Overlaps(IEnumerable<string> left, IEnumerable<string> right)
+        => left.Intersect(right, StringComparer.OrdinalIgnoreCase).Any();
+}
+
 public readonly record struct Priority(int Value)
 {
     public static Priority From(int value)
@@ -130,6 +178,12 @@ public sealed class Issue
     public Priority Priority { get; private set; }
     public IssueId? ParentId { get; private set; }
     public IReadOnlyCollection<string> Labels => _labels.OrderBy(static x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    public IReadOnlyList<string> Repositories => _labels
+        .Select(label => RepositoryLabels.TryGetRepository(label, out var repository) ? repository : null)
+        .Where(static repository => repository is not null)
+        .Select(static repository => repository!)
+        .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
+        .ToArray();
     public IReadOnlyList<IssueComment> Comments => _comments.ToArray();
     public DateTime CreatedAt { get; private set; }
     public DateTime UpdatedAt { get; private set; }

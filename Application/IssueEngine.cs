@@ -62,13 +62,17 @@ public sealed class IssueEngine
     {
         try
         {
-            var before = GetState();
-            var plannedEvent = CommandPlanner.Plan(command, before, _clock.UtcNow);
-            _eventStore.Append(plannedEvent);
-            return CommandExecutionResult.Succeeded(
-                $"{command.GetType().Name} applied.",
-                plannedEvent.IssueId,
-                plannedEvent.EventId);
+            return _eventStore.ExecuteAtomic(events =>
+            {
+                var before = IssueState.Replay(events);
+                var plannedEvent = CommandPlanner.Plan(command, before, _clock.UtcNow);
+                return new EventStoreOperation<CommandExecutionResult>(
+                    [plannedEvent],
+                    CommandExecutionResult.Succeeded(
+                        $"{command.GetType().Name} applied.",
+                        plannedEvent.IssueId,
+                        plannedEvent.EventId));
+            });
         }
         catch (CommandValidationException exception)
         {
@@ -78,6 +82,44 @@ public sealed class IssueEngine
         {
             return CommandExecutionResult.Failed($"Unexpected failure: {exception.Message}");
         }
+    }
+
+    public IssueView? ClaimNext(bool dryRun = false)
+    {
+        return _eventStore.ExecuteAtomic(events =>
+            {
+                var state = IssueState.Replay(events);
+                var activeRepositories = state.OrderedIssues
+                    .Where(issue => issue.Status.HoldsRepositoryReservation())
+                    .SelectMany(issue => issue.Repositories)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+                var candidate = state.OrderedIssues
+                    .Where(issue => issue.Status == Status.Next && issue.Repositories.Count > 0)
+                    .Where(issue => !issue.Repositories.Any(activeRepositories.Contains))
+                    .OrderBy(issue => issue.Priority.Value)
+                    .ThenBy(issue => state.GetSequence(issue.Id))
+                    .FirstOrDefault();
+
+                if (candidate is null)
+                {
+                    return new EventStoreOperation<IssueView?>([], null);
+                }
+
+                var plannedEvent = new StatusChanged(
+                    Guid.NewGuid(),
+                    candidate.Id,
+                    DateTime.SpecifyKind(_clock.UtcNow, DateTimeKind.Utc),
+                    Status.Active);
+                if (!dryRun)
+                {
+                    candidate.Apply(plannedEvent);
+                }
+
+                return new EventStoreOperation<IssueView?>(
+                    dryRun ? [] : [plannedEvent],
+                    new IssueView(state.GetSequence(candidate.Id), candidate));
+            });
     }
 }
 
