@@ -585,14 +585,22 @@ public static class CliRunner
             return true;
         }
 
-        if (!StatusText.TryParse(value, out status) || status is not (IssueStatus.Next or IssueStatus.Backlog))
+        var normalized = value.Trim();
+        if (string.Equals(normalized, nameof(IssueStatus.Next), StringComparison.OrdinalIgnoreCase))
         {
             status = IssueStatus.Next;
-            error = $"Initial status must be 'Next' or 'Backlog', not '{value}'.";
-            return false;
+            return true;
         }
 
-        return true;
+        if (string.Equals(normalized, nameof(IssueStatus.Backlog), StringComparison.OrdinalIgnoreCase))
+        {
+            status = IssueStatus.Backlog;
+            return true;
+        }
+
+        status = IssueStatus.Next;
+        error = $"Initial status must be 'Next' or 'Backlog', not '{value}'.";
+        return false;
     }
 
     private static bool TryParseOptionalStatus(string? value, out IssueStatus? status)

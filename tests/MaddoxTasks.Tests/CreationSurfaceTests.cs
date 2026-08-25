@@ -24,9 +24,12 @@ public sealed class CreationSurfaceTests
     [Fact]
     public void CliCreateStatus_RejectsOtherInitialStatuses()
     {
-        Assert.False(CliRunner.TryParseCreateStatus("Active", out _, out var error));
-        Assert.Contains("Next", error, StringComparison.Ordinal);
-        Assert.Contains("Backlog", error, StringComparison.Ordinal);
+        foreach (var value in new[] { "Active", "0", "Backlog, Next" })
+        {
+            Assert.False(CliRunner.TryParseCreateStatus(value, out _, out var error));
+            Assert.Contains("Next", error, StringComparison.Ordinal);
+            Assert.Contains("Backlog", error, StringComparison.Ordinal);
+        }
     }
 
     [Fact]

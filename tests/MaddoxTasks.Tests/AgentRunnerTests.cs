@@ -43,12 +43,17 @@ public sealed class AgentRunnerTests
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
         var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
 
-        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
-            engine,
-            """{"type":"CreateIssue","title":"Invalid","status":"Active"}"""));
-        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
-        Assert.Equal(JsonValueKind.Null, response.RootElement.GetProperty("status").ValueKind);
-        Assert.Equal(["success", "message", "issueId", "eventId", "status"], response.RootElement.EnumerateObject().Select(property => property.Name).ToArray());
+        foreach (var status in new[] { "Active", "0", "Backlog, Next" })
+        {
+            using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+                engine,
+                $$"""{"type":"CreateIssue","title":"Invalid","status":"{{status}}"}"""));
+            Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+            Assert.Equal(JsonValueKind.Null, response.RootElement.GetProperty("status").ValueKind);
+            Assert.Equal(["success", "message", "issueId", "eventId", "status"], response.RootElement.EnumerateObject().Select(property => property.Name).ToArray());
+        }
+
+        Assert.Empty(engine.GetEventLog());
     }
 
     [Fact]

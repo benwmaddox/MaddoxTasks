@@ -177,7 +177,16 @@ public static partial class AgentRunner
 
         if (!string.IsNullOrWhiteSpace(statusText))
         {
-            if (!StatusText.TryParse(statusText, out status) || status is not (Status.Next or Status.Backlog))
+            var normalizedStatus = statusText.Trim();
+            if (string.Equals(normalizedStatus, nameof(Status.Next), StringComparison.OrdinalIgnoreCase))
+            {
+                status = Status.Next;
+            }
+            else if (string.Equals(normalizedStatus, nameof(Status.Backlog), StringComparison.OrdinalIgnoreCase))
+            {
+                status = Status.Backlog;
+            }
+            else
             {
                 error = $"Initial status must be 'Next' or 'Backlog', not '{statusText}'.";
                 return false;
