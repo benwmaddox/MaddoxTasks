@@ -59,6 +59,16 @@ The command atomically selects one `Next` issue with at least one `repo:` label,
 
 The hourly runner reconciles `ReadyForReview` tasks after work. It associates only canonical GitHub PR URLs in the task description/comments, and closes a task only when every associated PR has a non-null `mergedAt` from `gh pr view`. No-PR tasks and any open/closed-unmerged/error cases remain open. Preview mode is read-only and skips live `gh` calls.
 
+Use the deterministic binary command for this reconciliation:
+
+```powershell
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --gh-timeout-seconds 45
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --dry-run
+```
+
+The command emits one JSON result containing per-task outcomes (`closed`, `noPullRequests`, `unmerged`, `lookupError`, `concurrentStateChange`, or `dryRun`) and continues after individual lookup failures. Only MaddoxTasks performs the conditional status transition; PowerShell should not duplicate URL parsing, GitHub lookup, or state mutation logic.
+
 ## Task Lifecycle Expectations
 
 1. When beginning work on a task, use `agent claim`; do not select or activate a task separately.

@@ -145,6 +145,16 @@ If actor is omitted for `UpdateDescription`/`AddComment`, default resolution ord
 
 After its claim/work loop, the hourly runner checks `ReadyForReview` tasks using only PR URLs found in their descriptions and comments. A review task with no PR URL stays open. A task closes automatically only when every associated PR reports a non-null `mergedAt` from `gh pr view`; open, closed-unmerged, lookup-error, and ambiguous cases remain `ReadyForReview` with a warning. Preview mode reports intended checks without calling `gh` or mutating tasks.
 
+The deterministic reconciliation can also be run directly as machine-readable JSON:
+
+```powershell
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --gh-timeout-seconds 45
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --dry-run
+```
+
+It extracts canonical GitHub pull-request URLs from each `ReadyForReview` description and comment, deduplicates them, checks `mergedAt`, and conditionally changes only still-`ReadyForReview` tasks to `Done`. No-PR, unmerged, lookup-error, and concurrent-state outcomes remain unchanged; processing continues across tasks.
+
 For hourly Windows automation, preview or install the versioned scripts (installation does not run the scheduled task immediately):
 
 ```powershell

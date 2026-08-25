@@ -29,99 +29,24 @@ function Invoke-MaddoxClaim {
     return $json | ConvertFrom-Json
 }
 
-function Invoke-MaddoxIssues {
-    param([string]$Status)
-
-    $arguments = @("agent", "issues", "--status", $Status, "--include-done", "false")
-    if ($DatabasePath) { $arguments += @("--db", $DatabasePath) }
-    $json = (& $MaddoxExe @arguments | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "MaddoxTasks agent issues failed with exit code $LASTEXITCODE." }
-    if ([string]::IsNullOrWhiteSpace($json)) { throw "MaddoxTasks agent issues returned no JSON." }
-    return @($json | ConvertFrom-Json)
-}
-
-function Get-CanonicalPullRequestUrls {
-    param([object]$Issue)
-
-    $content = @($Issue.description) + @($Issue.comments | ForEach-Object { $_.comment }) -join "`n"
-    $pattern = 'https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([0-9]+)'
-    $urls = foreach ($match in [regex]::Matches($content, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
-        "https://github.com/$($match.Groups[1].Value)/$($match.Groups[2].Value)/pull/$($match.Groups[3].Value)"
-    }
-    return @($urls | Sort-Object -Unique)
-}
-
-function Invoke-PullRequestView {
-    param([string]$Url)
-
-    $json = (& $GhExe pr view $Url --json state,mergedAt,url | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "gh pr view failed for '$Url' with exit code $LASTEXITCODE." }
-    if ([string]::IsNullOrWhiteSpace($json)) { throw "gh pr view returned no JSON for '$Url'." }
-    return $json | ConvertFrom-Json
-}
-
-function Set-IssueDone {
-    param([string]$IssueId)
-
-    $payload = @{ type = "ChangeStatus"; issueId = $IssueId; newStatus = "Done" } | ConvertTo-Json -Compress
-    $arguments = @("agent", "command")
-    if ($DatabasePath) { $arguments += @("--db", $DatabasePath) }
-    $json = ($payload | & $MaddoxExe @arguments | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) { throw "MaddoxTasks agent command failed with exit code $LASTEXITCODE." }
-    if ([string]::IsNullOrWhiteSpace($json)) { throw "MaddoxTasks agent command returned no JSON." }
-    $response = $json | ConvertFrom-Json
-    if (-not $response.success) { throw "MaddoxTasks refused closing issue '$IssueId': $($response.message)" }
-}
-
 function Invoke-ReviewReconciliation {
-    if ($Preview) {
-        $previewIssues = Invoke-MaddoxIssues -Status "ReadyForReview"
-        foreach ($issue in $previewIssues) {
-            $urls = Get-CanonicalPullRequestUrls -Issue $issue
-            if ($urls.Count -eq 0) {
-                Write-Host "Review preview: issue $($issue.issueId) has no associated PR URLs; leaving unchanged."
-            }
-            else {
-                Write-Host "Review preview: issue $($issue.issueId) would check $($urls -join ', ') and close only if all are merged. No gh calls or task mutations made."
-            }
-        }
-        return
-    }
-
-    if (-not (Get-Command $GhExe -ErrorAction SilentlyContinue)) {
-        throw "GitHub CLI '$GhExe' is required for ReadyForReview reconciliation. Install gh or pass -GhExe."
-    }
-
-    $issues = Invoke-MaddoxIssues -Status "ReadyForReview"
-    foreach ($issue in $issues) {
-        try {
-            $urls = Get-CanonicalPullRequestUrls -Issue $issue
-            if ($urls.Count -eq 0) {
-                Write-Host "Review issue $($issue.issueId) has no associated PR URLs; leaving unchanged."
-                continue
-            }
-
-            $views = foreach ($url in $urls) { Invoke-PullRequestView -Url $url }
-            if (@($views | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.mergedAt) }).Count -gt 0) {
-                Write-Host "Review issue $($issue.issueId) has an open or unmerged PR; leaving unchanged."
-                continue
-            }
-
-            Set-IssueDone -IssueId $issue.issueId
-            Write-Host "Closed review issue $($issue.issueId): all associated PRs are merged."
-        }
-        catch {
-            try {
-                $stillReady = Invoke-MaddoxIssues -Status "ReadyForReview" | Where-Object { $_.issueId -eq $issue.issueId }
-                if (@($stillReady).Count -eq 0) {
-                    Write-Host "Review issue $($issue.issueId) changed state concurrently; treating reconciliation as complete."
-                    continue
-                }
-            }
-            catch {
-                # Preserve the original actionable warning if the race check also fails.
-            }
-            Write-Warning "Could not reconcile review issue $($issue.issueId): $($_.Exception.Message). Leaving it unchanged and continuing."
+    $arguments = @("agent", "reconcile-reviews", "--gh-exe", $GhExe)
+    if ($DatabasePath) { $arguments += @("--db", $DatabasePath) }
+    if ($Preview) { $arguments += "--dry-run" }
+    $json = (& $MaddoxExe @arguments | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { throw "MaddoxTasks agent reconcile-reviews failed with exit code $LASTEXITCODE." }
+    if ([string]::IsNullOrWhiteSpace($json)) { throw "MaddoxTasks agent reconcile-reviews returned no JSON." }
+    $result = $json | ConvertFrom-Json
+    foreach ($outcome in @($result.outcomes)) {
+        switch ($outcome.outcome) {
+            "closed" { Write-Host "Closed review issue $($outcome.issueId): all associated PRs are merged." }
+            "noPullRequests" { Write-Host "Review issue $($outcome.issueId) has no associated PR URLs; leaving unchanged." }
+            "unmerged" { Write-Host "Review issue $($outcome.issueId) has an open or unmerged PR; leaving unchanged." }
+            "lookupError" { Write-Warning "Could not reconcile review issue $($outcome.issueId): $($outcome.error). Leaving it unchanged and continuing." }
+            "concurrentStateChange" { Write-Host "Review issue $($outcome.issueId) changed state concurrently; treating reconciliation as complete." }
+            "notFound" { Write-Warning "Review issue $($outcome.issueId) was not found during reconciliation; leaving it unchanged and continuing." }
+            "dryRun" { Write-Host "Review preview: issue $($outcome.issueId) would check $($outcome.pullRequestUrls -join ', ') and close only if all are merged. No gh calls or task mutations made." }
+            default { Write-Warning "Unexpected ReadyForReview reconciliation outcome '$($outcome.outcome)' for issue $($outcome.issueId); leaving it unchanged and continuing." }
         }
     }
 }

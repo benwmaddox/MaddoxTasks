@@ -44,7 +44,7 @@ if ($arguments -contains "claim") {
     } | ConvertTo-Json -Compress
     exit 0
 }
-if ($arguments -contains "issues") { "[]"; exit 0 }
+if ($arguments -contains "reconcile-reviews") { '{"dryRun":false,"outcomes":[]}' ; exit 0 }
 if ($arguments -contains "command") { '{"success":true,"message":"ok"}'; exit 0 }
 throw "Unexpected fake Maddox arguments: $($arguments -join ' ')"
 '@

@@ -49,6 +49,16 @@ Repository labels are canonicalized as lowercase `repo:<name>` identities and co
 
 The scheduled runner checks `ReadyForReview` tasks after work. Only canonical `https://github.com/<owner>/<repo>/pull/<number>` URLs in descriptions/comments are associated. It closes a task only when all associated PRs have non-null `mergedAt`; no-PR, open, closed-unmerged, and lookup-error tasks remain unchanged.
 
+To run this deterministic step directly:
+
+```powershell
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --gh-timeout-seconds 45
+.\MaddoxTasks.exe agent reconcile-reviews --gh-exe gh --dry-run
+```
+
+The JSON response includes `dryRun` and an `outcomes` array. Each outcome includes the task id, title, canonical deduplicated PR URLs, and one of `closed`, `noPullRequests`, `unmerged`, `lookupError`, `concurrentStateChange`, `notFound`, or `dryRun`. A dry run does not invoke GitHub CLI or mutate tasks.
+
 Run with inline JSON:
 
 ```powershell
