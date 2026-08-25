@@ -11,9 +11,13 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $projectFile = Join-Path $projectRoot "MaddoxTasks.csproj"
+$validatorScript = Join-Path $PSScriptRoot "validate-published-agent.ps1"
 
 if (-not (Test-Path $projectFile)) {
     throw "Could not locate project file at $projectFile"
+}
+if (-not (Test-Path $validatorScript)) {
+    throw "Could not locate published agent validator at $validatorScript"
 }
 
 $selfContained = if ($NoSelfContained) { "false" } else { "true" }
@@ -60,6 +64,20 @@ foreach ($rid in $Runtime) {
 
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet publish failed for runtime '$rid'."
+    }
+
+    $binaryName = if ($rid -like "win-*") { "MaddoxTasks.exe" } else { "MaddoxTasks" }
+    $binaryPath = Join-Path $outDir $binaryName
+    if (-not (Test-Path $binaryPath -PathType Leaf)) {
+        throw "dotnet publish did not produce the expected runtime binary '$binaryPath'."
+    }
+
+    Write-Host "Validating published agent '$binaryPath'..."
+    try {
+        & $validatorScript -Binary $binaryPath
+    }
+    catch {
+        throw "Published agent validation failed for runtime '$rid': $($_.Exception.Message)"
     }
 }
 
