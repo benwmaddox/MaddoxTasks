@@ -22,5 +22,9 @@
     <Compile Remove="tests\**\*.cs" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="MaddoxTasks.Tests" />
+  </ItemGroup>
+
 </Project>
 

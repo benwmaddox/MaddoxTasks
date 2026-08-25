@@ -394,7 +394,12 @@ public sealed class TuiApp
         if (!TryPromptText("Title", out var title)
             || !TryPromptText("Description (optional, blank for none)", out var description)
             || !TryPromptText("Priority (1-5, default 3)", out var priorityText, "3")
-            || !TryPromptText("Due date (optional, yyyy-MM-dd)", out var dueText))
+            || !TryPromptText("Due date (optional, yyyy-MM-dd)", out var dueText)
+            || !TryPromptChoice(
+                "Initial status",
+                [IssueStatus.Next, IssueStatus.Backlog],
+                status => status.ToDisplayString(),
+                out var initialStatus))
         {
             Console.CursorVisible = false;
             return;
@@ -431,16 +436,24 @@ public sealed class TuiApp
             dueDate = parsedDueDate;
         }
 
-        var command = new CreateIssue(
+        var command = BuildCreateIssueCommand(
             title,
             string.IsNullOrWhiteSpace(description) ? null : description,
             priority,
-            ParentId: null,
-            dueDate);
+            dueDate,
+            initialStatus);
 
         var result = _engine.Execute(command);
         PauseWithMessage(result.Message, result.Success);
     }
+
+    internal static CreateIssue BuildCreateIssueCommand(
+        string title,
+        string? description,
+        Priority priority,
+        DateTime? dueDate,
+        IssueStatus initialStatus = IssueStatus.Next)
+        => new(title, description, priority, ParentId: null, dueDate, initialStatus);
 
     private void ChangeStatus(IssueView issueView)
     {

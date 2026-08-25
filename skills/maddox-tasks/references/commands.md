@@ -111,10 +111,13 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
   "title": "Fix reload bug",
   "description": "Investigate cache invalidation",
   "priority": 2,
+  "status": "Next",
   "parentId": "551e912f-eee0-4042-ab87-3a89826fd88e",
   "dueDate": "2026-02-20"
 }
 ```
+
+`status` is optional and defaults to `Next`. The only supported initial statuses are `Next` and explicit `Backlog`; other statuses must be applied with `ChangeStatus` after creation. Successful command responses include the final stored `status`.
 
 `ChangeStatus`:
 

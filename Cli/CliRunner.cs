@@ -109,6 +109,7 @@ public static class CliRunner
         var priorityOption = new Option<int>("--priority", () => 3, "Priority between 1 and 5.");
         var parentOption = new Option<string?>("--parent", "Parent issue token (sequence, guid, or guid prefix).");
         var dueOption = new Option<string?>("--due", "Due date (yyyy-MM-dd).");
+        var statusOption = new Option<string?>("--status", () => "Next", "Initial status: Next (default) or Backlog.");
 
         var command = new CliCommand("create", "Create a new issue.");
         command.AddArgument(titleArgument);
@@ -116,10 +117,17 @@ public static class CliRunner
         command.AddOption(priorityOption);
         command.AddOption(parentOption);
         command.AddOption(dueOption);
+        command.AddOption(statusOption);
 
-        command.SetHandler((string dbPath, string title, string? description, int priorityRaw, string? parentToken, string? dueText) =>
+        command.SetHandler((string dbPath, string title, string? description, int priorityRaw, string? parentToken, string? dueText, string? statusText) =>
         {
             var engine = CreateEngine(dbPath);
+            if (!TryParseCreateStatus(statusText, out var initialStatus, out var statusError))
+            {
+                AnsiConsole.MarkupLine($"[red]{statusError.EscapeMarkup()}[/]");
+                return;
+            }
+
             Priority priority;
             try
             {
@@ -155,9 +163,9 @@ public static class CliRunner
                 dueDate = parsedDue;
             }
 
-            var result = engine.Execute(new CreateIssue(title, description, priority, parentId, dueDate));
+            var result = engine.Execute(new CreateIssue(title, description, priority, parentId, dueDate, initialStatus));
             PrintCommandResult(result);
-        }, dbOption, titleArgument, descriptionOption, priorityOption, parentOption, dueOption);
+        }, dbOption, titleArgument, descriptionOption, priorityOption, parentOption, dueOption, statusOption);
 
         return command;
     }
@@ -567,6 +575,25 @@ public static class CliRunner
 
     private static bool TryParseStatus(string value, out IssueStatus status)
         => StatusText.TryParse(value, out status);
+
+    internal static bool TryParseCreateStatus(string? value, out IssueStatus status, out string error)
+    {
+        status = IssueStatus.Next;
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return true;
+        }
+
+        if (!StatusText.TryParse(value, out status) || status is not (IssueStatus.Next or IssueStatus.Backlog))
+        {
+            status = IssueStatus.Next;
+            error = $"Initial status must be 'Next' or 'Backlog', not '{value}'.";
+            return false;
+        }
+
+        return true;
+    }
 
     private static bool TryParseOptionalStatus(string? value, out IssueStatus? status)
     {

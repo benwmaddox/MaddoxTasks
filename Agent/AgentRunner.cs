@@ -15,16 +15,23 @@ public static partial class AgentRunner
 
         if (!TryParseCommand(normalizedJson, engine, resolvedDefaultActor, out var command, out var error))
         {
-            return SerializeResponse(new AgentCommandResponse(false, error, null, null));
+            return SerializeResponse(new AgentCommandResponse(false, error, null, null, null));
         }
 
         var result = engine.Execute(command!);
+        Status? finalStatus = null;
+        if (result.Success && result.IssueId is { } issueId && engine.GetState().TryGetIssue(issueId, out var issue))
+        {
+            finalStatus = issue.Status;
+        }
+
         return SerializeResponse(
             new AgentCommandResponse(
                 result.Success,
                 result.Message,
                 result.IssueId?.ToString(),
-                result.EventId?.ToString()));
+                result.EventId?.ToString(),
+                finalStatus));
     }
 
     public static string GetIssuesJson(IssueEngine engine, IssueFilter? filter, bool includeDone)
@@ -162,6 +169,21 @@ public static partial class AgentRunner
         TryGetString(root, "parentId", required: false, out var parentText, out _);
         TryGetString(root, "dueDate", required: false, out var dueDateText, out _);
 
+        var status = Status.Next;
+        if (!TryGetString(root, "status", required: false, out var statusText, out error))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(statusText))
+        {
+            if (!StatusText.TryParse(statusText, out status) || status is not (Status.Next or Status.Backlog))
+            {
+                error = $"Initial status must be 'Next' or 'Backlog', not '{statusText}'.";
+                return false;
+            }
+        }
+
         var priority = 3;
         if (TryGetProperty(root, "priority", out var priorityElement))
         {
@@ -207,7 +229,7 @@ public static partial class AgentRunner
             dueDate = parsedDueDate;
         }
 
-        command = new CreateIssue(title!, description, priorityValue, parentId, dueDate);
+        command = new CreateIssue(title!, description, priorityValue, parentId, dueDate, status);
         return true;
     }
 
@@ -621,7 +643,12 @@ public static partial class AgentRunner
         WriteIndented = true
     });
 
-    private sealed record AgentCommandResponse(bool Success, string Message, string? IssueId, string? EventId);
+    private sealed record AgentCommandResponse(
+        bool Success,
+        string Message,
+        string? IssueId,
+        string? EventId,
+        Status? Status);
 
     private sealed record AgentIssueDto(
         int Sequence,

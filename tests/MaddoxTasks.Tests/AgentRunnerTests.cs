@@ -9,6 +9,49 @@ namespace MaddoxTasks.Tests;
 public sealed class AgentRunnerTests
 {
     [Fact]
+    public void ExecuteCommandJson_CreateDefaultsToNext_ReportsStatus_AndSupportsBacklog()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
+
+        using var defaultResponse = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"CreateIssue","title":"Next by default"}"""));
+        Assert.True(defaultResponse.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Next", defaultResponse.RootElement.GetProperty("status").GetString());
+
+        using var backlogResponse = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"CreateIssue","title":"Explicit backlog","status":"Backlog"}"""));
+        Assert.True(backlogResponse.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Backlog", backlogResponse.RootElement.GetProperty("status").GetString());
+        Assert.Equal(
+            [Status.Next, Status.Backlog],
+            engine.QueryIssues(includeDone: true).Select(view => view.Issue.Status).ToArray());
+
+        using var issues = JsonDocument.Parse(AgentRunner.GetIssuesJson(engine, null, includeDone: true));
+        Assert.Equal("Next", issues.RootElement[0].GetProperty("status").GetString());
+        Assert.Equal("Backlog", issues.RootElement[1].GetProperty("status").GetString());
+        using var next = JsonDocument.Parse(AgentRunner.GetNextTaskJson(engine));
+        Assert.Equal("Next", next.RootElement.GetProperty("status").GetString());
+        Assert.Equal("Next by default", next.RootElement.GetProperty("title").GetString());
+    }
+
+    [Fact]
+    public void ExecuteCommandJson_CreateRejectsUnsupportedInitialStatusDeterministically()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"CreateIssue","title":"Invalid","status":"Active"}"""));
+        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, response.RootElement.GetProperty("status").ValueKind);
+        Assert.Equal(["success", "message", "issueId", "eventId", "status"], response.RootElement.EnumerateObject().Select(property => property.Name).ToArray());
+    }
+
+    [Fact]
     public void ExecuteCommandJson_UsesDefaultActorWhenPayloadOmitsActor()
     {
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
@@ -251,7 +294,7 @@ model_reasoning_effort = "high"
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStoreForAgentTests();
         var engine = new IssueEngine(store, clock);
-        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null, Status.Backlog));
         var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
         Assert.True(engine.Execute(new AddLabel(issueId, "Repo:Zeta")).Success);
         Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
@@ -267,7 +310,7 @@ model_reasoning_effort = "high"
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStoreForAgentTests();
         var engine = new IssueEngine(store, clock);
-        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null, Status.Backlog));
         var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
         Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
         Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Next)).Success);
@@ -284,7 +327,7 @@ model_reasoning_effort = "high"
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStoreForAgentTests();
         var engine = new IssueEngine(store, clock);
-        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null));
+        var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null, Status.Backlog));
         var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
         Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
         Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Next)).Success);
