@@ -7,6 +7,34 @@ namespace MaddoxTasks.Tests;
 public sealed class IssueEngineTests
 {
     [Fact]
+    public void CreateIssue_DefaultsToNext_AndAllowsExplicitBacklog()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+
+        var defaultResult = engine.Execute(new CreateIssue("Default", null, Priority.From(3), null, null));
+        var backlogResult = engine.Execute(new CreateIssue("Backlog", null, Priority.From(3), null, null, Status.Backlog));
+
+        Assert.True(defaultResult.Success);
+        Assert.True(backlogResult.Success);
+        Assert.Equal(Status.Next, engine.QueryIssues(includeDone: true).Single(view => view.Issue.Title == "Default").Issue.Status);
+        Assert.Equal(Status.Backlog, engine.QueryIssues(includeDone: true).Single(view => view.Issue.Title == "Backlog").Issue.Status);
+    }
+
+    [Fact]
+    public void CreateIssue_RejectsReservationAndTerminalInitialStatuses()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+
+        var result = engine.Execute(new CreateIssue("Invalid", null, Priority.From(3), null, null, Status.Active));
+
+        Assert.False(result.Success);
+        Assert.Contains("Next", result.Message, StringComparison.Ordinal);
+        Assert.Empty(engine.GetEventLog());
+    }
+
+    [Fact]
     public void Replay_ReconstructsIssueFromEventLog()
     {
         var issueId = new IssueId(Guid.NewGuid());
@@ -232,9 +260,9 @@ public sealed class IssueEngineTests
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStore();
         var engine = new IssueEngine(store, clock);
-        var blocked = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(1), null, null)).IssueId);
-        var available = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Available", null, Priority.From(2), null, null)).IssueId);
-        var noRepo = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("No repo", null, Priority.From(1), null, null)).IssueId);
+        var blocked = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var available = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Available", null, Priority.From(2), null, null, Status.Backlog)).IssueId);
+        var noRepo = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("No repo", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
         Assert.True(engine.Execute(new AddLabel(blocked, "repo:busy")).Success);
         Assert.True(engine.Execute(new AddLabel(available, "repo:free")).Success);
         Assert.True(engine.Execute(new AddLabel(noRepo, "work")).Success);
@@ -257,9 +285,9 @@ public sealed class IssueEngineTests
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStore();
         var engine = new IssueEngine(store, clock);
-        var reviewId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Review", null, Priority.From(1), null, null)).IssueId);
-        var blockedId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(2), null, null)).IssueId);
-        var freeId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Free", null, Priority.From(3), null, null)).IssueId);
+        var reviewId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Review", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var blockedId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Blocked", null, Priority.From(2), null, null, Status.Backlog)).IssueId);
+        var freeId = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Free", null, Priority.From(3), null, null, Status.Backlog)).IssueId);
 
         Assert.True(engine.Execute(new AddLabel(reviewId, "repo:shared")).Success);
         Assert.True(engine.Execute(new ChangeStatus(reviewId, Status.ReadyForReview)).Success);

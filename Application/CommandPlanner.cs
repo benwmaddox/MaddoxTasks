@@ -34,13 +34,19 @@ public static class CommandPlanner
             throw new CommandValidationException($"Parent issue '{command.ParentId.Value}' does not exist.");
         }
 
+        if (command.Status is not (Status.Next or Status.Backlog))
+        {
+            throw new CommandValidationException(
+                $"New issues may only start in 'Next' or explicit 'Backlog' status, not '{command.Status}'.");
+        }
+
         return new IssueCreated(
             Guid.NewGuid(),
             IssueId.New(),
             timestamp,
             title,
             command.Description?.Trim() ?? string.Empty,
-            Status.Backlog,
+            command.Status,
             command.Priority,
             command.ParentId,
             NormalizeDueDate(command.DueDate));

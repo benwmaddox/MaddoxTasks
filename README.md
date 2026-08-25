@@ -61,7 +61,8 @@ Help overlay (`?`):
 Windows:
 
 ```powershell
-.\MaddoxTasks.exe create "Fix reload bug" --priority 2 --description "Investigate cache invalidation"
+.\MaddoxTasks.exe create "Fix reload bug" --priority 2 --description "Investigate cache invalidation" --status Next
+.\MaddoxTasks.exe create "Keep in backlog" --status Backlog
 .\MaddoxTasks.exe list --status Active
 .\MaddoxTasks.exe status 1 Done
 .\MaddoxTasks.exe label 1 architecture
@@ -72,7 +73,8 @@ Windows:
 Linux/macOS:
 
 ```bash
-./MaddoxTasks create "Fix reload bug" --priority 2 --description "Investigate cache invalidation"
+./MaddoxTasks create "Fix reload bug" --priority 2 --description "Investigate cache invalidation" --status Next
+./MaddoxTasks create "Keep in backlog" --status Backlog
 ./MaddoxTasks list --status Active
 ./MaddoxTasks status 1 Done
 ./MaddoxTasks label 1 architecture
@@ -90,6 +92,8 @@ Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, 
 Comments and description history show `By` (`user`, `agent`, or a model id such as `gpt-5.2`).
 
 Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
+
+New issues default to `Next` across the CLI, TUI, and agent command surfaces. Use the explicit `--status Backlog` CLI/TUI choice or `"status": "Backlog"` agent field when a new issue should remain in Backlog. Existing issues are not migrated or reordered.
 
 Active and `ReadyForReview` work reserve repositories using labels with the canonical `repo:<name>` prefix, for example `repo:StasisLang` (repository names are compared case-insensitively). An issue must have at least one repository before it can enter either reserving status; reserving tasks cannot share a repository. Moving to another status releases the reservation. Add a new `repo:` label before removing an old one when changing the repositories of active or review work.
 

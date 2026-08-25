@@ -56,7 +56,7 @@ public sealed class SqliteEventStoreTests : IDisposable
     {
         var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
-        var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue("Claim me", null, Priority.From(1), null, null)).IssueId);
+        var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue("Claim me", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
         Assert.True(setup.Execute(new AddLabel(issueId, "repo:shared")).Success);
         Assert.True(setup.Execute(new ChangeStatus(issueId, Status.Next)).Success);
 
@@ -77,7 +77,7 @@ public sealed class SqliteEventStoreTests : IDisposable
         var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
         foreach (var repository in new[] { "shared", "shared", "other" })
         {
-            var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue(repository, null, Priority.From(1), null, null)).IssueId);
+            var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(new CreateIssue(repository, null, Priority.From(1), null, null, Status.Backlog)).IssueId);
             Assert.True(setup.Execute(new AddLabel(issueId, $"repo:{repository}")).Success);
             Assert.True(setup.Execute(new ChangeStatus(issueId, Status.Next)).Success);
         }

@@ -159,7 +159,23 @@ try {
     if ([string]::IsNullOrWhiteSpace([string]$createResult.issueId)) {
         throw "CreateIssue returned no issueId."
     }
+    if ([string]$createResult.status -ne "Next") {
+        throw "CreateIssue returned status '$($createResult.status)' instead of 'Next'."
+    }
     $issueId = [string]$createResult.issueId
+
+    $backlogCommandPath = Join-Path $tempRoot "backlog-command.json"
+    Write-CommandFile -Path $backlogCommandPath -Command ([ordered]@{
+            type        = "CreateIssue"
+            title       = "Published agent backlog test"
+            status      = "Backlog"
+            priority    = 3
+        })
+    $backlogResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $backlogCommandPath) -WorkingDirectory $tempRoot
+    $backlogResult = Assert-CommandSucceeded -Response $backlogResponse -Step "CreateIssue Backlog"
+    if ([string]$backlogResult.status -ne "Backlog") {
+        throw "CreateIssue Backlog returned status '$($backlogResult.status)' instead of 'Backlog'."
+    }
 
     $labelCommandPath = Join-Path $tempRoot "label-command.json"
     Write-CommandFile -Path $labelCommandPath -Command ([ordered]@{
@@ -170,19 +186,10 @@ try {
     $labelResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $labelCommandPath) -WorkingDirectory $tempRoot
     [void](Assert-CommandSucceeded -Response $labelResponse -Step "AddLabel repo:published-smoke")
 
-    $statusCommandPath = Join-Path $tempRoot "status-command.json"
-    Write-CommandFile -Path $statusCommandPath -Command ([ordered]@{
-            type      = "ChangeStatus"
-            issueId   = $issueId
-            newStatus = "Next"
-        })
-    $statusResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $statusCommandPath) -WorkingDirectory $tempRoot
-    [void](Assert-CommandSucceeded -Response $statusResponse -Step "ChangeStatus Next")
-
     $issuesResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "issues") -WorkingDirectory $tempRoot
     $issues = @(Convert-AgentJson -Json $issuesResponse.StdOut -Step "agent issues after create")
-    if ($issues.Count -ne 1) {
-        throw "Expected one issue after CreateIssue, got $($issues.Count)."
+    if ($issues.Count -ne 2) {
+        throw "Expected two issues after CreateIssue, got $($issues.Count)."
     }
 
     $issue = $issues[0]

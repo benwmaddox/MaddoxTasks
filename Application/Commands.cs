@@ -9,7 +9,8 @@ public sealed record CreateIssue(
     string? Description,
     Priority Priority,
     IssueId? ParentId,
-    DateTime? DueDate
+    DateTime? DueDate,
+    Status Status = Status.Next
 ) : Command;
 
 public sealed record ChangeStatus(
