@@ -45,12 +45,13 @@ public static partial class AgentRunner
 
     public static string GetNextTaskJson(IssueEngine engine)
     {
-        var nextTask = engine.QueryIssues(includeDone: false)
-            .Where(view => view.Issue.Status is Status.Active or Status.Next)
-            .OrderBy(view => view.Issue.Priority.Value)
-            .ThenBy(view => view.Issue.Status == Status.Active ? 0 : 1)
-            .ThenBy(view => view.Sequence)
-            .FirstOrDefault();
+        var state = engine.GetState();
+        var nextIssue = state.SelectHierarchical(
+            issue => issue.Status is Status.Active or Status.Next,
+            preferActive: true);
+        var nextTask = nextIssue is null
+            ? null
+            : new IssueView(state.GetSequence(nextIssue.Id), nextIssue);
 
         var dto = nextTask is null ? null : ToAgentIssueDto(nextTask);
         return JsonSerializer.Serialize(dto, PrettyJsonContext.AgentIssueDto);
