@@ -479,6 +479,205 @@ public sealed class IssueEngineTests
         Assert.Equal(higherPriorityChild, secondClaim!.Issue.Id);
         Assert.Equal(secondRoot, thirdClaim!.Issue.Id);
     }
+
+    [Fact]
+    public void ClaimNext_ResetsStaleCurrentCodexReservationBeforeSelecting()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-12);
+        var store = new InMemoryEventStore();
+        var staleId = AppendActiveIssue(store, "Stale", "repo:stale", staleAt, staleAt,
+            "Reservation owner: codexThreadId=thread-stale", priority: 3);
+        var candidateId = AppendNextIssue(store, "Candidate", "repo:stale", priority: 1);
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        var claim = engine.ClaimNext();
+
+        Assert.NotNull(claim);
+        Assert.Equal(candidateId, claim!.Issue.Id);
+        Assert.Equal(Status.Next, engine.GetState().Issues[staleId].Status);
+        Assert.Contains(store.LoadAll(), issueEvent =>
+            issueEvent is CommentAdded comment &&
+            comment.IssueId == staleId &&
+            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ClaimNext_DoesNotResetYoungOrUnattributedActiveIssues()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStore();
+        var youngId = AppendActiveIssue(store, "Young", "repo:young", now.AddHours(-11), now.AddHours(-11),
+            "Reservation owner: codexThreadId=young");
+        var untrackedId = AppendActiveIssue(store, "Untracked", "repo:untracked", now.AddHours(-13), now.AddHours(-13), null);
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        Assert.Null(engine.ClaimNext());
+
+        Assert.Equal(Status.Active, engine.GetState().Issues[youngId].Status);
+        Assert.Equal(Status.Active, engine.GetState().Issues[untrackedId].Status);
+        Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
+            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ClaimNext_DoesNotResetWhenUnrelatedMutationMakesTaskYoung()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-13);
+        var store = new InMemoryEventStore();
+        var issueId = AppendActiveIssue(store, "Mutated", "repo:mutated", staleAt, staleAt,
+            "Reservation owner: codexThreadId=thread-mutated");
+        store.Append(new CommentAdded(Guid.NewGuid(), issueId, now.AddHours(-1), "Unrelated update", "user"));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        Assert.Null(engine.ClaimNext());
+
+        Assert.Equal(Status.Active, engine.GetState().Issues[issueId].Status);
+        Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
+            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ClaimNext_ResetsMultipleStaleReservationsInIssueSequenceOrder()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-12);
+        var store = new InMemoryEventStore();
+        var firstId = AppendActiveIssue(store, "First stale", "repo:first", staleAt, staleAt,
+            "Reservation owner: codexThreadId=first");
+        var secondId = AppendActiveIssue(store, "Second stale", "repo:second", staleAt, staleAt,
+            "Reservation owner: codexThreadId=second");
+        var firstReviewId = AppendActiveIssue(store, "First review", "repo:first", now.AddHours(-1), now.AddHours(-1),
+            "Reservation owner: codexThreadId=first-review", priority: 1);
+        store.Append(new StatusChanged(Guid.NewGuid(), firstReviewId, now.AddHours(-1), Status.ReadyForReview));
+        var secondReviewId = AppendActiveIssue(store, "Second review", "repo:second", now.AddHours(-1), now.AddHours(-1),
+            "Reservation owner: codexThreadId=second-review", priority: 1);
+        store.Append(new StatusChanged(Guid.NewGuid(), secondReviewId, now.AddHours(-1), Status.ReadyForReview));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        Assert.Null(engine.ClaimNext());
+
+        var cleanupEvents = store.LoadAll()
+            .Where(issueEvent => issueEvent.Timestamp == now)
+            .ToArray();
+        Assert.Equal(
+            new[] { firstId, firstId, secondId, secondId },
+            cleanupEvents.Select(issueEvent => issueEvent.IssueId).ToArray());
+        Assert.Equal(
+            new[] { typeof(StatusChanged), typeof(CommentAdded), typeof(StatusChanged), typeof(CommentAdded) },
+            cleanupEvents.Select(issueEvent => issueEvent.GetType()).ToArray());
+    }
+
+    [Fact]
+    public void ClaimNext_RejectsEmptyCodexThreadIdBeforeSemicolon()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-13);
+        var store = new InMemoryEventStore();
+        var issueId = AppendActiveIssue(store, "Malformed", "repo:malformed", staleAt, staleAt,
+            "Reservation owner: codexThreadId=; reservedAt=2026-02-14T00:00:00Z");
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        Assert.Null(engine.ClaimNext());
+
+        Assert.Equal(Status.Active, engine.GetState().Issues[issueId].Status);
+    }
+
+    [Fact]
+    public void ClaimNext_DoesNotResetReadyForReviewOrHistoricalReservationComment()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-13);
+        var store = new InMemoryEventStore();
+        var reviewId = AppendActiveIssue(store, "Review", "repo:review", staleAt, staleAt,
+            "Reservation owner: codexThreadId=review");
+        store.Append(new StatusChanged(Guid.NewGuid(), reviewId, staleAt.AddMinutes(1), Status.ReadyForReview));
+
+        var historicalId = AppendActiveIssue(store, "Historical", "repo:historical", staleAt, staleAt,
+            "Reservation owner: codexThreadId=historical");
+        store.Append(new StatusChanged(Guid.NewGuid(), historicalId, staleAt.AddMinutes(2), Status.Next));
+        store.Append(new StatusChanged(Guid.NewGuid(), historicalId, staleAt.AddMinutes(3), Status.Active));
+
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        Assert.Null(engine.ClaimNext());
+
+        Assert.Equal(Status.ReadyForReview, engine.GetState().Issues[reviewId].Status);
+        Assert.Equal(Status.Active, engine.GetState().Issues[historicalId].Status);
+        Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
+            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ClaimNext_DryRunSimulatesStaleResetWithoutPersistingCleanupOrClaim()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-12);
+        var store = new InMemoryEventStore();
+        var staleId = AppendActiveIssue(store, "Stale", "repo:shared", staleAt, staleAt,
+            "Reservation owner: codexThreadId=unavailable", priority: 3);
+        var candidateId = AppendNextIssue(store, "Candidate", "repo:shared", priority: 1);
+        var beforeCount = store.LoadAll().Count;
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        var preview = engine.ClaimNext(dryRun: true);
+
+        Assert.NotNull(preview);
+        Assert.Equal(candidateId, preview!.Issue.Id);
+        Assert.Equal(Status.Next, preview.Issue.Status);
+        Assert.Equal(beforeCount, store.LoadAll().Count);
+        Assert.Equal(Status.Active, engine.GetState().Issues[staleId].Status);
+    }
+
+    [Fact]
+    public void ClaimNext_PersistsStaleCleanupWhenNoCandidateExists()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-12);
+        var store = new InMemoryEventStore();
+        var staleId = AppendActiveIssue(store, "Stale", "repo:only", staleAt, staleAt,
+            "Reservation owner: codexThreadId=thread-stale", priority: 3);
+        var reviewId = AppendActiveIssue(store, "Review", "repo:only", now.AddHours(-1), now.AddHours(-1),
+            "Reservation owner: codexThreadId=review", priority: 1);
+        store.Append(new StatusChanged(Guid.NewGuid(), reviewId, now.AddHours(-1), Status.ReadyForReview));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+
+        Assert.Null(engine.ClaimNext());
+
+        Assert.Equal(Status.Next, engine.GetState().Issues[staleId].Status);
+        Assert.Equal(Status.ReadyForReview, engine.GetState().Issues[reviewId].Status);
+        Assert.Equal(6, store.LoadAll().Count(eventItem => eventItem.IssueId == staleId));
+    }
+
+    private static IssueId AppendNextIssue(IEventStore store, string title, string repository, int priority = 3)
+    {
+        var issueId = IssueId.New();
+        var timestamp = new DateTime(2026, 2, 1, 0, 0, 0, DateTimeKind.Utc);
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, title, null, Status.Next, Priority.From(priority), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), issueId, timestamp.AddMinutes(1), repository));
+        return issueId;
+    }
+
+    private static IssueId AppendActiveIssue(
+        IEventStore store,
+        string title,
+        string repository,
+        DateTime activeAt,
+        DateTime commentAt,
+        string? reservationComment,
+        int priority = 3)
+    {
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, activeAt.AddMinutes(-1), title, null, Status.Backlog, Priority.From(priority), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), issueId, activeAt, repository));
+        store.Append(new StatusChanged(Guid.NewGuid(), issueId, activeAt, Status.Active));
+        if (reservationComment is not null)
+        {
+            store.Append(new CommentAdded(Guid.NewGuid(), issueId, commentAt, reservationComment, "agent"));
+        }
+
+        return issueId;
+    }
 }
 
 file sealed class InMemoryEventStore : IEventStore

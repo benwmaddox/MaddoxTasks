@@ -5,6 +5,11 @@ namespace MaddoxTasks.Application;
 
 public sealed class IssueEngine
 {
+    private static readonly TimeSpan StaleCodexReservationAge = TimeSpan.FromHours(12);
+    private const string ReservationOwnerCommentPrefix = "Reservation owner: codexThreadId=";
+    private const string StaleCodexReservationResetComment =
+        "Automatic reset: Active Codex reservation had no task change for 12 hours; returned to Next.";
+
     private static readonly Status[] StatusSortOrder =
     [
         Status.Active,
@@ -88,7 +93,29 @@ public sealed class IssueEngine
     {
         return _eventStore.ExecuteAtomic(events =>
             {
+                var now = NormalizeUtc(_clock.UtcNow);
                 var state = IssueState.Replay(events);
+
+                var cleanupEvents = new List<IssueEvent>();
+                var staleCutoff = now - StaleCodexReservationAge;
+                foreach (var issue in state.OrderedIssues
+                             .Where(issue => issue.Status == Status.Active)
+                             .Where(issue => NormalizeUtc(issue.UpdatedAt) <= staleCutoff)
+                             .Where(issue => HasCurrentCodexReservation(issue, events)))
+                {
+                    var resetEvent = new StatusChanged(Guid.NewGuid(), issue.Id, now, Status.Next);
+                    var auditEvent = new CommentAdded(
+                        Guid.NewGuid(),
+                        issue.Id,
+                        now,
+                        StaleCodexReservationResetComment,
+                        "agent");
+                    cleanupEvents.Add(resetEvent);
+                    cleanupEvents.Add(auditEvent);
+                    issue.Apply(resetEvent);
+                    issue.Apply(auditEvent);
+                }
+
                 var activeRepositories = state.OrderedIssues
                     .Where(issue => issue.Status.HoldsRepositoryReservation())
                     .SelectMany(issue => issue.Repositories)
@@ -101,13 +128,13 @@ public sealed class IssueEngine
 
                 if (candidate is null)
                 {
-                    return new EventStoreOperation<IssueView?>([], null);
+                    return new EventStoreOperation<IssueView?>(dryRun ? [] : cleanupEvents, null);
                 }
 
                 var plannedEvent = new StatusChanged(
                     Guid.NewGuid(),
                     candidate.Id,
-                    DateTime.SpecifyKind(_clock.UtcNow, DateTimeKind.Utc),
+                    now,
                     Status.Active);
                 if (!dryRun)
                 {
@@ -115,10 +142,53 @@ public sealed class IssueEngine
                 }
 
                 return new EventStoreOperation<IssueView?>(
-                    dryRun ? [] : [plannedEvent],
+                    dryRun ? [] : [.. cleanupEvents, plannedEvent],
                     new IssueView(state.GetSequence(candidate.Id), candidate));
             });
     }
+
+    private static bool HasCurrentCodexReservation(Issue issue, IReadOnlyList<IssueEvent> events)
+    {
+        var latestActivation = events
+            .Where(issueEvent => issueEvent.IssueId == issue.Id)
+            .OfType<StatusChanged>()
+            .Where(statusChanged => statusChanged.NewStatus == Status.Active)
+            .Select(statusChanged => NormalizeUtc(statusChanged.Timestamp))
+            .LastOrDefault();
+
+        if (latestActivation == default)
+        {
+            return false;
+        }
+
+        return issue.Comments.Any(comment =>
+            NormalizeUtc(comment.Timestamp) >= latestActivation &&
+            IsCodexReservationComment(comment.Comment));
+    }
+
+    private static bool IsCodexReservationComment(string comment)
+    {
+        if (!comment.StartsWith(ReservationOwnerCommentPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var value = comment[ReservationOwnerCommentPrefix.Length..];
+        var separatorIndex = value.IndexOf(';');
+        if (separatorIndex >= 0)
+        {
+            value = value[..separatorIndex];
+        }
+
+        return !string.IsNullOrWhiteSpace(value);
+    }
+
+    private static DateTime NormalizeUtc(DateTime timestamp)
+        => timestamp.Kind == DateTimeKind.Utc
+            ? timestamp
+            : timestamp.Kind == DateTimeKind.Local
+                ? timestamp.ToUniversalTime()
+                : DateTime.SpecifyKind(timestamp, DateTimeKind.Utc);
 
     public ConditionalStatusChangeResult TryCompleteReadyForReview(IssueId issueId, bool dryRun = false)
     {

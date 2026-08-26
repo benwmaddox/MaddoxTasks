@@ -97,6 +97,35 @@ public sealed class SqliteEventStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ConcurrentClaims_ResetStaleCodexReservationOnlyOnce()
+    {
+        var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
+        var staleAt = now.AddHours(-12);
+        var store = new SqliteEventStore(_dbPath);
+        var staleId = new IssueId(Guid.NewGuid());
+        var candidateId = new IssueId(Guid.NewGuid());
+        store.Append(new IssueCreated(Guid.NewGuid(), staleId, staleAt.AddMinutes(-1), "Stale", null, Status.Backlog, Priority.From(3), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), staleId, staleAt, "repo:shared"));
+        store.Append(new StatusChanged(Guid.NewGuid(), staleId, staleAt, Status.Active));
+        store.Append(new CommentAdded(Guid.NewGuid(), staleId, staleAt, "Reservation owner: codexThreadId=stale", "agent"));
+        store.Append(new IssueCreated(Guid.NewGuid(), candidateId, staleAt.AddMinutes(-1), "Candidate", null, Status.Next, Priority.From(1), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), candidateId, staleAt, "repo:shared"));
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), new FrozenClockForSqliteReservations(now)).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), new FrozenClockForSqliteReservations(now)).ClaimNext()));
+
+        Assert.Single(claims, claim => claim is not null);
+        Assert.Single(claims, claim => claim is null);
+        var events = store.LoadAll();
+        Assert.Equal(1, events.Count(issueEvent => issueEvent is StatusChanged status &&
+            status.IssueId == staleId && status.NewStatus == Status.Next));
+        Assert.Equal(1, events.Count(issueEvent => issueEvent is CommentAdded comment &&
+            comment.IssueId == staleId && comment.Comment.Contains("12 hours", StringComparison.Ordinal)));
+        Assert.Equal(Status.Active, IssueState.Replay(events).Issues[candidateId].Status);
+    }
+
+    [Fact]
     public async Task ConcurrentHierarchicalClaims_SelectDisjointChildrenWithoutOverlap()
     {
         var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
