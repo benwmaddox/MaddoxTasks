@@ -21,6 +21,142 @@ public sealed class IssueState
 
     public IReadOnlyList<Issue> OrderedIssues => _creationOrder.Select(id => _issues[id]).ToArray();
 
+    /// <summary>
+    /// Returns issues in deterministic program order. A program is a root issue
+    /// and all of its descendants. Programs are ordered by root priority and
+    /// sequence, and each program is traversed child-first. Missing and cyclic
+    /// parent links are treated as deterministic roots so malformed data cannot
+    /// make selection recurse forever.
+    /// </summary>
+    public IReadOnlyList<Issue> HierarchicalIssues(bool preferActive = false)
+    {
+        var issues = OrderedIssues;
+        var issuesById = issues.ToDictionary(issue => issue.Id);
+        var sequenceById = _sequenceById;
+        var childrenByParent = issues
+            .Where(issue => issue.ParentId.HasValue && issuesById.ContainsKey(issue.ParentId.Value))
+            .GroupBy(issue => issue.ParentId!.Value)
+            .ToDictionary(
+                group => group.Key,
+                group => group
+                    .OrderBy(issue => issue.Priority.Value)
+                    .ThenBy(issue => preferActive && issue.Status == Status.Active ? 0 : 1)
+                    .ThenBy(issue => sequenceById[issue.Id])
+                    .ToArray());
+
+        var rootById = new Dictionary<IssueId, IssueId>();
+        foreach (var issue in issues)
+        {
+            AssignRoot(issue, issuesById, rootById, sequenceById);
+        }
+
+        var roots = rootById.Values
+            .Distinct()
+            .Select(rootId => issuesById[rootId])
+            .OrderBy(issue => issue.Priority.Value)
+            .ThenBy(issue => preferActive && issue.Status == Status.Active ? 0 : 1)
+            .ThenBy(issue => sequenceById[issue.Id])
+            .ToArray();
+
+        var result = new List<Issue>(issues.Count);
+        var visited = new HashSet<IssueId>();
+        foreach (var root in roots)
+        {
+            var stack = new Stack<(Issue Issue, bool Expanded)>();
+            stack.Push((root, false));
+
+            while (stack.Count > 0)
+            {
+                var (current, expanded) = stack.Pop();
+                if (expanded)
+                {
+                    result.Add(current);
+                    continue;
+                }
+
+                if (!visited.Add(current.Id))
+                {
+                    continue;
+                }
+
+                stack.Push((current, true));
+                if (childrenByParent.TryGetValue(current.Id, out var children))
+                {
+                    for (var index = children.Length - 1; index >= 0; index--)
+                    {
+                        stack.Push((children[index], false));
+                    }
+                }
+            }
+        }
+
+        // This is only a defensive fallback for malformed state. Every normal
+        // issue is reachable from one of the roots above.
+        foreach (var issue in issues
+                     .Where(issue => !visited.Contains(issue.Id))
+                     .OrderBy(issue => issue.Priority.Value)
+                     .ThenBy(issue => sequenceById[issue.Id]))
+        {
+            result.Add(issue);
+        }
+
+        return result;
+    }
+
+    public Issue? SelectHierarchical(Func<Issue, bool> predicate, bool preferActive = false)
+        => HierarchicalIssues(preferActive).FirstOrDefault(predicate);
+
+    private static void AssignRoot(
+        Issue issue,
+        IReadOnlyDictionary<IssueId, Issue> issuesById,
+        IDictionary<IssueId, IssueId> rootById,
+        IReadOnlyDictionary<IssueId, int> sequenceById)
+    {
+        if (rootById.ContainsKey(issue.Id))
+        {
+            return;
+        }
+
+        var path = new List<Issue>();
+        var pathIndex = new Dictionary<IssueId, int>();
+        var current = issue;
+        IssueId rootId;
+
+        while (true)
+        {
+            if (rootById.TryGetValue(current.Id, out rootId))
+            {
+                break;
+            }
+
+            if (pathIndex.TryGetValue(current.Id, out var cycleStart))
+            {
+                rootId = path
+                    .Skip(cycleStart)
+                    .Append(current)
+                    .OrderBy(candidate => candidate.Priority.Value)
+                    .ThenBy(candidate => sequenceById[candidate.Id])
+                    .First()
+                    .Id;
+                break;
+            }
+
+            pathIndex.Add(current.Id, path.Count);
+            path.Add(current);
+            if (!current.ParentId.HasValue ||
+                !issuesById.TryGetValue(current.ParentId.Value, out current!))
+            {
+                rootId = path[^1].Id;
+                break;
+            }
+        }
+
+        foreach (var pathIssue in path)
+        {
+            rootById[pathIssue.Id] = rootId;
+        }
+    }
+
     public static IssueState Replay(IEnumerable<IssueEvent> events)
     {
         var issues = new Dictionary<IssueId, Issue>();

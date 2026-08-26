@@ -304,6 +304,181 @@ public sealed class IssueEngineTests
         Assert.NotNull(claim);
         Assert.Equal(freeId, claim!.Issue.Id);
     }
+
+    [Fact]
+    public void ClaimNext_SelectsDisjointChildWhenParentRepositoryIsReserved()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var parent = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Parent", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var child = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Child", null, Priority.From(3), parent, null)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(parent, "repo:busy")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(parent, Status.Active)).Success);
+        Assert.True(engine.Execute(new AddLabel(child, "repo:free")).Success);
+
+        var claim = engine.ClaimNext();
+
+        Assert.NotNull(claim);
+        Assert.Equal(child, claim!.Issue.Id);
+    }
+
+    [Fact]
+    public void ClaimNext_SkipsReservedChildAndClaimsLaterSibling()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var parent = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Parent", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var reservedChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Reserved child", null, Priority.From(1), parent, null)).IssueId);
+        var freeChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Free child", null, Priority.From(2), parent, null)).IssueId);
+        var reservation = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Reservation", null, Priority.From(5), null, null, Status.Backlog)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(reservedChild, "repo:shared")).Success);
+        Assert.True(engine.Execute(new AddLabel(freeChild, "repo:free")).Success);
+        Assert.True(engine.Execute(new AddLabel(reservation, "repo:shared")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(reservation, Status.Active)).Success);
+
+        var claim = engine.ClaimNext();
+
+        Assert.NotNull(claim);
+        Assert.Equal(freeChild, claim!.Issue.Id);
+    }
+
+    [Fact]
+    public void ClaimNext_TraversesDescendantsBeforeAncestorsAndFallsBackByRootOrder()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var root = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Root", null, Priority.From(1), null, null)).IssueId);
+        var child = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Child", null, Priority.From(2), root, null)).IssueId);
+        var grandchild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Grandchild", null, Priority.From(5), child, null)).IssueId);
+        var otherRoot = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Other root", null, Priority.From(2), null, null)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(root, "repo:root")).Success);
+        Assert.True(engine.Execute(new AddLabel(child, "repo:child")).Success);
+        Assert.True(engine.Execute(new AddLabel(grandchild, "repo:grandchild")).Success);
+        Assert.True(engine.Execute(new AddLabel(otherRoot, "repo:other")).Success);
+
+        var firstClaim = engine.ClaimNext();
+        Assert.NotNull(firstClaim);
+        Assert.Equal(grandchild, firstClaim!.Issue.Id);
+
+        var secondClaim = engine.ClaimNext();
+        Assert.NotNull(secondClaim);
+        Assert.Equal(child, secondClaim!.Issue.Id);
+    }
+
+    [Fact]
+    public void ClaimNext_DryRunUsesHierarchyWithoutMutatingState()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var parent = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Parent", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var child = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Child", null, Priority.From(2), parent, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(parent, "repo:parent")).Success);
+        Assert.True(engine.Execute(new AddLabel(child, "repo:child")).Success);
+
+        var preview = engine.ClaimNext(dryRun: true);
+
+        Assert.NotNull(preview);
+        Assert.Equal(child, preview!.Issue.Id);
+        var state = engine.GetState();
+        Assert.True(state.TryGetIssue(child, out var childIssue));
+        Assert.Equal(Status.Next, childIssue.Status);
+    }
+
+    [Fact]
+    public void HierarchicalIssues_HandlesCyclicAndMissingParentsDeterministically()
+    {
+        var start = new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc);
+        var firstId = new IssueId(Guid.NewGuid());
+        var secondId = new IssueId(Guid.NewGuid());
+        var missingParent = new IssueId(Guid.NewGuid());
+        var orphanId = new IssueId(Guid.NewGuid());
+        var events = new IssueEvent[]
+        {
+            new IssueCreated(Guid.NewGuid(), firstId, start, "First", null, Status.Next, Priority.From(2), secondId, null),
+            new IssueCreated(Guid.NewGuid(), secondId, start.AddMinutes(1), "Second", null, Status.Next, Priority.From(1), firstId, null),
+            new IssueCreated(Guid.NewGuid(), orphanId, start.AddMinutes(2), "Orphan", null, Status.Next, Priority.From(3), missingParent, null)
+        };
+
+        var state = IssueState.Replay(events);
+        var firstPass = state.HierarchicalIssues().Select(issue => issue.Id).ToArray();
+        var secondPass = state.HierarchicalIssues().Select(issue => issue.Id).ToArray();
+
+        Assert.Equal(secondPass, firstPass);
+        Assert.Equal(3, firstPass.Length);
+        Assert.Contains(firstId, firstPass);
+        Assert.Contains(secondId, firstPass);
+        Assert.Contains(orphanId, firstPass);
+    }
+
+    [Fact]
+    public void ClaimNext_FallsThroughWhenFirstFamilyHasNoEligibleNodes()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var firstRoot = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First root", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var reservedChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Reserved child", null, Priority.From(2), firstRoot, null)).IssueId);
+        var noRepoChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("No repo child", null, Priority.From(3), firstRoot, null)).IssueId);
+        var reservation = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Reservation", null, Priority.From(5), null, null, Status.Backlog)).IssueId);
+        var secondRoot = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second root", null, Priority.From(2), null, null)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(reservedChild, "repo:busy")).Success);
+        Assert.True(engine.Execute(new AddLabel(reservation, "repo:busy")).Success);
+        Assert.True(engine.Execute(new AddLabel(secondRoot, "repo:free")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(reservation, Status.Active)).Success);
+
+        var claim = engine.ClaimNext();
+
+        Assert.NotNull(claim);
+        Assert.Equal(secondRoot, claim!.Issue.Id);
+        Assert.Equal(Status.Next, engine.GetState().Issues[noRepoChild].Status);
+    }
+
+    [Fact]
+    public void ClaimNext_UsesRootAndSiblingPriorityThenSequenceDeterministically()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var firstRoot = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First root", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var higherPriorityChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Higher priority child", null, Priority.From(5), firstRoot, null)).IssueId);
+        var lowerPriorityChild = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Lower priority child", null, Priority.From(2), firstRoot, null)).IssueId);
+        var secondRoot = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second root", null, Priority.From(1), null, null)).IssueId);
+
+        Assert.True(engine.Execute(new AddLabel(higherPriorityChild, "repo:higher")).Success);
+        Assert.True(engine.Execute(new AddLabel(lowerPriorityChild, "repo:lower")).Success);
+        Assert.True(engine.Execute(new AddLabel(secondRoot, "repo:second")).Success);
+
+        var firstClaim = engine.ClaimNext();
+        var secondClaim = engine.ClaimNext();
+        var thirdClaim = engine.ClaimNext();
+
+        Assert.Equal(lowerPriorityChild, firstClaim!.Issue.Id);
+        Assert.Equal(higherPriorityChild, secondClaim!.Issue.Id);
+        Assert.Equal(secondRoot, thirdClaim!.Issue.Id);
+    }
 }
 
 file sealed class InMemoryEventStore : IEventStore

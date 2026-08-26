@@ -57,6 +57,44 @@ public sealed class AgentRunnerTests
     }
 
     [Fact]
+    public void GetNextTaskJson_SelectsChildBeforeActiveParent()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
+        var parent = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Parent", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var child = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Child", null, Priority.From(5), parent, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(parent, "repo:parent")).Success);
+        Assert.True(engine.Execute(new AddLabel(child, "repo:child")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(parent, Status.Active)).Success);
+
+        using var document = JsonDocument.Parse(AgentRunner.GetNextTaskJson(engine));
+
+        Assert.Equal(child.ToString(), document.RootElement.GetProperty("issueId").GetString());
+        Assert.Equal("Next", document.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public void GetNextTaskJson_PreservesActivePreferenceForEqualRootPriority()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
+        var next = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Next", null, Priority.From(2), null, null)).IssueId);
+        var active = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Active", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(next, "repo:next")).Success);
+        Assert.True(engine.Execute(new AddLabel(active, "repo:active")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(active, Status.Active)).Success);
+
+        using var document = JsonDocument.Parse(AgentRunner.GetNextTaskJson(engine));
+
+        Assert.Equal(active.ToString(), document.RootElement.GetProperty("issueId").GetString());
+        Assert.Equal("Active", document.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
     public void ExecuteCommandJson_UsesDefaultActorWhenPayloadOmitsActor()
     {
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));

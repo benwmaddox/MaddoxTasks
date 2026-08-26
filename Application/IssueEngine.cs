@@ -94,12 +94,10 @@ public sealed class IssueEngine
                     .SelectMany(issue => issue.Repositories)
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-                var candidate = state.OrderedIssues
-                    .Where(issue => issue.Status == Status.Next && issue.Repositories.Count > 0)
-                    .Where(issue => !issue.Repositories.Any(activeRepositories.Contains))
-                    .OrderBy(issue => issue.Priority.Value)
-                    .ThenBy(issue => state.GetSequence(issue.Id))
-                    .FirstOrDefault();
+                var candidate = state.SelectHierarchical(
+                    issue => issue.Status == Status.Next &&
+                             issue.Repositories.Count > 0 &&
+                             !issue.Repositories.Any(activeRepositories.Contains));
 
                 if (candidate is null)
                 {
