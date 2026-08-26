@@ -95,6 +95,36 @@ public sealed class SqliteEventStoreTests : IDisposable
         Assert.Equal(2, activeRepositories.Length);
         Assert.Equal(2, activeRepositories.Distinct(StringComparer.OrdinalIgnoreCase).Count());
     }
+
+    [Fact]
+    public async Task ConcurrentHierarchicalClaims_SelectDisjointChildrenWithoutOverlap()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var parent = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+            new CreateIssue("Parent", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var firstChild = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+            new CreateIssue("First child", null, Priority.From(1), parent, null)).IssueId);
+        var secondChild = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+            new CreateIssue("Second child", null, Priority.From(2), parent, null)).IssueId);
+        Assert.True(setup.Execute(new AddLabel(firstChild, "repo:left")).Success);
+        Assert.True(setup.Execute(new AddLabel(secondChild, "repo:right")).Success);
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()));
+
+        Assert.Equal(2, claims.Count(claim => claim is not null));
+        Assert.Equal(
+            new[] { firstChild, secondChild }.OrderBy(id => id.Value).ToArray(),
+            claims.Where(claim => claim is not null).Select(claim => claim!.Issue.Id).OrderBy(id => id.Value).ToArray());
+        var activeRepositories = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll()).OrderedIssues
+            .Where(issue => issue.Status == Status.Active)
+            .SelectMany(issue => issue.Repositories)
+            .ToArray();
+        Assert.Equal(["left", "right"], activeRepositories.OrderBy(repository => repository, StringComparer.OrdinalIgnoreCase).ToArray());
+    }
+
     public void Dispose()
     {
         try
