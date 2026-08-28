@@ -5,10 +5,10 @@ namespace MaddoxTasks.Application;
 
 public sealed class IssueEngine
 {
-    private static readonly TimeSpan StaleCodexReservationAge = TimeSpan.FromHours(12);
+    private static readonly TimeSpan StaleCodexReservationAge = TimeSpan.FromHours(24);
     private const string ReservationOwnerCommentPrefix = "Reservation owner: codexThreadId=";
     private const string StaleCodexReservationResetComment =
-        "Automatic reset: Active Codex reservation had no task change for 12 hours; returned to Next.";
+        "Automatic reset: Active Codex reservation had no task change for 24 hours; returned to Next.";
 
     private static readonly Status[] StatusSortOrder =
     [
