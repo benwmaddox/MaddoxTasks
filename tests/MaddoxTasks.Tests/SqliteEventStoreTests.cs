@@ -100,7 +100,7 @@ public sealed class SqliteEventStoreTests : IDisposable
     public async Task ConcurrentClaims_ResetStaleCodexReservationOnlyOnce()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-12);
+        var staleAt = now.AddHours(-24);
         var store = new SqliteEventStore(_dbPath);
         var staleId = new IssueId(Guid.NewGuid());
         var candidateId = new IssueId(Guid.NewGuid());
@@ -121,7 +121,7 @@ public sealed class SqliteEventStoreTests : IDisposable
         Assert.Equal(1, events.Count(issueEvent => issueEvent is StatusChanged status &&
             status.IssueId == staleId && status.NewStatus == Status.Next));
         Assert.Equal(1, events.Count(issueEvent => issueEvent is CommentAdded comment &&
-            comment.IssueId == staleId && comment.Comment.Contains("12 hours", StringComparison.Ordinal)));
+            comment.IssueId == staleId && comment.Comment.Contains("24 hours", StringComparison.Ordinal)));
         Assert.Equal(Status.Active, IssueState.Replay(events).Issues[candidateId].Status);
     }
 

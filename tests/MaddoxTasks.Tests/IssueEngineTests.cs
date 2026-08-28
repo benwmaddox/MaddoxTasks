@@ -484,7 +484,7 @@ public sealed class IssueEngineTests
     public void ClaimNext_ResetsStaleCurrentCodexReservationBeforeSelecting()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-12);
+        var staleAt = now.AddHours(-24);
         var store = new InMemoryEventStore();
         var staleId = AppendActiveIssue(store, "Stale", "repo:stale", staleAt, staleAt,
             "Reservation owner: codexThreadId=thread-stale", priority: 3);
@@ -499,7 +499,7 @@ public sealed class IssueEngineTests
         Assert.Contains(store.LoadAll(), issueEvent =>
             issueEvent is CommentAdded comment &&
             comment.IssueId == staleId &&
-            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+            comment.Comment.Contains("24 hours", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -507,9 +507,9 @@ public sealed class IssueEngineTests
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
         var store = new InMemoryEventStore();
-        var youngId = AppendActiveIssue(store, "Young", "repo:young", now.AddHours(-11), now.AddHours(-11),
+        var youngId = AppendActiveIssue(store, "Young", "repo:young", now.AddHours(-23), now.AddHours(-23),
             "Reservation owner: codexThreadId=young");
-        var untrackedId = AppendActiveIssue(store, "Untracked", "repo:untracked", now.AddHours(-13), now.AddHours(-13), null);
+        var untrackedId = AppendActiveIssue(store, "Untracked", "repo:untracked", now.AddHours(-25), now.AddHours(-25), null);
         var engine = new IssueEngine(store, new FrozenClock(now));
 
         Assert.Null(engine.ClaimNext());
@@ -517,14 +517,14 @@ public sealed class IssueEngineTests
         Assert.Equal(Status.Active, engine.GetState().Issues[youngId].Status);
         Assert.Equal(Status.Active, engine.GetState().Issues[untrackedId].Status);
         Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
-            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+            comment.Comment.Contains("24 hours", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void ClaimNext_DoesNotResetWhenUnrelatedMutationMakesTaskYoung()
+    public void ClaimNext_DoesNotResetWhenActivityWithin24HoursMakesTaskYoung()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-13);
+        var staleAt = now.AddHours(-25);
         var store = new InMemoryEventStore();
         var issueId = AppendActiveIssue(store, "Mutated", "repo:mutated", staleAt, staleAt,
             "Reservation owner: codexThreadId=thread-mutated");
@@ -535,14 +535,14 @@ public sealed class IssueEngineTests
 
         Assert.Equal(Status.Active, engine.GetState().Issues[issueId].Status);
         Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
-            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+            comment.Comment.Contains("24 hours", StringComparison.Ordinal));
     }
 
     [Fact]
     public void ClaimNext_ResetsMultipleStaleReservationsInIssueSequenceOrder()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-12);
+        var staleAt = now.AddHours(-24);
         var store = new InMemoryEventStore();
         var firstId = AppendActiveIssue(store, "First stale", "repo:first", staleAt, staleAt,
             "Reservation owner: codexThreadId=first");
@@ -573,7 +573,7 @@ public sealed class IssueEngineTests
     public void ClaimNext_RejectsEmptyCodexThreadIdBeforeSemicolon()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-13);
+        var staleAt = now.AddHours(-25);
         var store = new InMemoryEventStore();
         var issueId = AppendActiveIssue(store, "Malformed", "repo:malformed", staleAt, staleAt,
             "Reservation owner: codexThreadId=; reservedAt=2026-02-14T00:00:00Z");
@@ -588,7 +588,7 @@ public sealed class IssueEngineTests
     public void ClaimNext_DoesNotResetReadyForReviewOrHistoricalReservationComment()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-13);
+        var staleAt = now.AddHours(-25);
         var store = new InMemoryEventStore();
         var reviewId = AppendActiveIssue(store, "Review", "repo:review", staleAt, staleAt,
             "Reservation owner: codexThreadId=review");
@@ -605,14 +605,14 @@ public sealed class IssueEngineTests
         Assert.Equal(Status.ReadyForReview, engine.GetState().Issues[reviewId].Status);
         Assert.Equal(Status.Active, engine.GetState().Issues[historicalId].Status);
         Assert.DoesNotContain(store.LoadAll(), issueEvent => issueEvent is CommentAdded comment &&
-            comment.Comment.Contains("12 hours", StringComparison.Ordinal));
+            comment.Comment.Contains("24 hours", StringComparison.Ordinal));
     }
 
     [Fact]
     public void ClaimNext_DryRunSimulatesStaleResetWithoutPersistingCleanupOrClaim()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-12);
+        var staleAt = now.AddHours(-24);
         var store = new InMemoryEventStore();
         var staleId = AppendActiveIssue(store, "Stale", "repo:shared", staleAt, staleAt,
             "Reservation owner: codexThreadId=unavailable", priority: 3);
@@ -633,7 +633,7 @@ public sealed class IssueEngineTests
     public void ClaimNext_PersistsStaleCleanupWhenNoCandidateExists()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
-        var staleAt = now.AddHours(-12);
+        var staleAt = now.AddHours(-24);
         var store = new InMemoryEventStore();
         var staleId = AppendActiveIssue(store, "Stale", "repo:only", staleAt, staleAt,
             "Reservation owner: codexThreadId=thread-stale", priority: 3);
