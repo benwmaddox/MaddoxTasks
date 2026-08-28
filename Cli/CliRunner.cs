@@ -8,6 +8,7 @@ using MaddoxTasks.Application;
 using MaddoxTasks.Domain;
 using MaddoxTasks.Infrastructure;
 using MaddoxTasks.Ui;
+using MaddoxTasks.Web;
 
 namespace MaddoxTasks.Cli;
 
@@ -22,6 +23,7 @@ public static class CliRunner
 
         root.SetHandler((string dbPath) => RunTui(dbPath), dbOption);
         root.AddCommand(BuildTuiCommand(dbOption));
+        root.AddCommand(BuildServeCommand(dbOption));
         root.AddCommand(BuildListCommand(dbOption));
         root.AddCommand(BuildCreateCommand(dbOption));
         root.AddCommand(BuildStatusCommand(dbOption));
@@ -39,6 +41,37 @@ public static class CliRunner
     {
         var command = new CliCommand("tui", "Run interactive terminal UI.");
         command.SetHandler((string dbPath) => RunTui(dbPath), dbOption);
+        return command;
+    }
+
+    private static CliCommand BuildServeCommand(Option<string> dbOption)
+    {
+        var hostOption = new Option<string>("--host", () => WebServer.DefaultHost,
+            "Address to bind the web server. Default: 0.0.0.0 (all network interfaces).");
+        var portOption = new Option<int>("--port", () => WebServer.DefaultPort,
+            "TCP port for the web server. Default: 5000.");
+
+        var command = new CliCommand("serve", "Run the LAN-friendly web UI server.");
+        command.AddOption(hostOption);
+        command.AddOption(portOption);
+        command.SetHandler((string dbPath, string host, int port) =>
+        {
+            if (!WebServer.TryValidateBinding(host, port, out var error))
+            {
+                Console.Error.WriteLine(error);
+                return;
+            }
+
+            try
+            {
+                WebServer.Run(dbPath, host, port);
+            }
+            catch (Exception exception)
+            {
+                Console.Error.WriteLine($"Unable to start web server: {exception.Message}");
+            }
+        }, dbOption, hostOption, portOption);
+
         return command;
     }
 

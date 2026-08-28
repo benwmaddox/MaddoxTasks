@@ -91,6 +91,51 @@ Issue tokens support:
 Tip: in TUI, press `Enter` on an issue to open detail view. Inside detail view, use `c` comment, `s` status, `d` description, `h` description history, and `q`/`Esc` to go back.
 Comments and description history show `By` (`user`, `agent`, or a model id such as `gpt-5.2`).
 
+## LAN Web UI (Desktop and Mobile)
+
+Run the server alongside the CLI or TUI when a browser is more convenient:
+
+Windows:
+
+```powershell
+.\MaddoxTasks.exe serve
+.\MaddoxTasks.exe serve --host 0.0.0.0 --port 5000 --db D:\Data\MaddoxTasks.db
+```
+
+Linux/macOS:
+
+```bash
+./MaddoxTasks serve
+./MaddoxTasks serve --host 0.0.0.0 --port 5000 --db /data/MaddoxTasks.db
+```
+
+The default bind address is `0.0.0.0` (all interfaces) and the default port is
+`5000`. On startup the server prints a localhost URL and the LAN IPv4 URLs it
+finds. Open one of those URLs on the desktop or a phone/tablet on the same
+network. If the device cannot connect, allow the selected TCP port through the
+computer's firewall and check that the network is not isolating wireless
+clients. Use `--host 127.0.0.1` when the UI should remain local to the computer.
+
+The server intentionally has no authentication in this first iteration. Bind
+to a trusted, private network only, do not forward the port to the internet,
+and stop the server when it is not needed. The browser UI reads and writes the
+same event-sourced SQLite database as the CLI/TUI; the existing atomic store
+keeps concurrent processes safe. Changes made on another device appear after
+the automatic refresh (or press the refresh button / `r`).
+
+The board groups issues by status and includes search, status/priority filters,
+issue creation (including parent and due date), status and priority editing,
+description, labels, comments, and history. Every mutation has a visible
+button and touch targets are sized for mobile use. Keyboard shortcuts are:
+
+- `Up`/`Down` or `j`/`k`: navigate issues; `Enter`: open the selected issue
+- `n`: new issue; `s`: status; `p`: priority; `t`: labels
+- `d`: mark the selected issue done (or focus description in detail); `c`: comment
+- `/`: search; `r`: refresh; `?`: help; `Esc`: close the current panel
+
+Shortcuts are ignored while typing in a form. The JSON API is available under
+`/api/issues` for clients that need the same browser operations.
+
 Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
 
 New issues default to `Next` across the CLI, TUI, and agent command surfaces. Use the explicit `--status Backlog` CLI/TUI choice or `"status": "Backlog"` agent field when a new issue should remain in Backlog. Existing issues are not migrated or reordered.
