@@ -7,6 +7,94 @@ namespace MaddoxTasks.Tests;
 public sealed class IssueEngineTests
 {
     [Fact]
+    public void RequeueBlocked_EmptyStateSucceedsWithoutEvents()
+    {
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, new FrozenClock(new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc)));
+
+        var result = engine.RequeueBlocked();
+
+        Assert.True(result.Success);
+        Assert.False(result.DryRun);
+        Assert.Empty(result.ChangedIssueIds);
+        Assert.Empty(result.SkippedIssueIds);
+        Assert.Empty(store.LoadAll());
+    }
+
+    [Fact]
+    public void RequeueBlocked_DryRunReportsStableSnapshotWithoutWriting()
+    {
+        var timestamp = new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStore();
+        var blocked = IssueId.New();
+        var skipped = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), blocked, timestamp, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), skipped, timestamp, "Next", null, Status.Next, Priority.From(3), null, null));
+        var eventCount = store.LoadAll().Count;
+        var engine = new IssueEngine(store, new FrozenClock(timestamp.AddHours(1)));
+
+        var result = engine.RequeueBlocked(dryRun: true);
+
+        Assert.True(result.Success);
+        Assert.True(result.DryRun);
+        Assert.Equal([blocked], result.ChangedIssueIds);
+        Assert.Equal([skipped], result.SkippedIssueIds);
+        Assert.Equal(eventCount, store.LoadAll().Count);
+        Assert.Equal(Status.Blocked, engine.GetState().Issues[blocked].Status);
+    }
+
+    [Fact]
+    public void RequeueBlocked_MixedHierarchyPreservesFieldsAndIsIdempotent()
+    {
+        var createdAt = new DateTime(2026, 8, 29, 12, 0, 0, DateTimeKind.Utc);
+        var requeuedAt = new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Unspecified);
+        var store = new InMemoryEventStore();
+        var parent = IssueId.New();
+        var child = IssueId.New();
+        var skipped = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), parent, createdAt, "Parent", "Parent description", Status.Blocked, Priority.From(1), null, createdAt.AddDays(3)));
+        store.Append(new LabelAdded(Guid.NewGuid(), parent, createdAt.AddMinutes(1), "repo:Zeta"));
+        store.Append(new CommentAdded(Guid.NewGuid(), parent, createdAt.AddMinutes(2), "Keep this comment", "tester"));
+        store.Append(new IssueCreated(Guid.NewGuid(), child, createdAt.AddMinutes(3), "Child", "Child description", Status.Blocked, Priority.From(5), parent, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), child, createdAt.AddMinutes(4), "repo:alpha"));
+        store.Append(new IssueCreated(Guid.NewGuid(), skipped, createdAt.AddMinutes(5), "Skipped", null, Status.Done, Priority.From(2), null, null));
+        var eventsBefore = store.LoadAll().Count;
+        var engine = new IssueEngine(store, new FrozenClock(requeuedAt));
+
+        var result = engine.RequeueBlocked();
+
+        Assert.True(result.Success);
+        Assert.Equal([parent, child], result.ChangedIssueIds);
+        Assert.Equal([skipped], result.SkippedIssueIds);
+        var appended = store.LoadAll().Skip(eventsBefore).ToArray();
+        Assert.Equal(2, appended.Length);
+        Assert.All(appended, issueEvent => Assert.IsType<StatusChanged>(issueEvent));
+        Assert.Equal([parent, child], appended.Select(issueEvent => issueEvent.IssueId).ToArray());
+        Assert.All(appended, issueEvent => Assert.Equal(DateTimeKind.Utc, issueEvent.Timestamp.Kind));
+        Assert.All(appended, issueEvent => Assert.Equal(DateTime.SpecifyKind(requeuedAt, DateTimeKind.Utc), issueEvent.Timestamp));
+
+        var state = engine.GetState();
+        var parentAfter = state.Issues[parent];
+        Assert.Equal(Status.Next, parentAfter.Status);
+        Assert.Equal(1, parentAfter.Priority.Value);
+        Assert.Equal("Parent description", parentAfter.Description);
+        Assert.Equal(createdAt.AddDays(3), parentAfter.DueDate);
+        Assert.Equal(["repo:Zeta"], parentAfter.Labels);
+        Assert.Equal(["zeta"], parentAfter.Repositories);
+        Assert.Equal("Keep this comment", Assert.Single(parentAfter.Comments).Comment);
+        var childAfter = state.Issues[child];
+        Assert.Equal(parent, childAfter.ParentId);
+        Assert.Equal(5, childAfter.Priority.Value);
+        Assert.Equal(["repo:alpha"], childAfter.Labels);
+
+        var repeat = engine.RequeueBlocked();
+        Assert.True(repeat.Success);
+        Assert.Empty(repeat.ChangedIssueIds);
+        Assert.Equal([parent, child, skipped], repeat.SkippedIssueIds);
+        Assert.Equal(eventsBefore + 2, store.LoadAll().Count);
+    }
+
+    [Fact]
     public void CreateIssue_DefaultsToNext_AndAllowsExplicitBacklog()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));

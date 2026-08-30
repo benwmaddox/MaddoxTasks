@@ -1,6 +1,7 @@
 using MaddoxTasks.Application;
 using MaddoxTasks.Domain;
 using MaddoxTasks.Infrastructure;
+using Microsoft.Data.Sqlite;
 
 namespace MaddoxTasks.Tests;
 
@@ -11,6 +12,43 @@ public sealed class SqliteEventStoreTests : IDisposable
     public SqliteEventStoreTests()
     {
         _dbPath = Path.Combine(Path.GetTempPath(), $"maddoxtasks-tests-{Guid.NewGuid():N}.db");
+    }
+
+    [Fact]
+    public void RequeueBlocked_RollsBackEveryStatusWhenSecondInsertFails()
+    {
+        var timestamp = new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc);
+        var store = new SqliteEventStore(_dbPath);
+        var first = IssueId.New();
+        var second = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), first, timestamp, "First", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), second, timestamp, "Second", null, Status.Blocked, Priority.From(3), null, null));
+        var eventCount = store.LoadAll().Count;
+
+        var connectionString = new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString();
+        using (var connection = new SqliteConnection(connectionString))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = $"""
+                CREATE TRIGGER FailSecondRequeue
+                BEFORE INSERT ON Events
+                WHEN NEW.EventType = 'StatusChanged' AND NEW.IssueId = '{second}'
+                BEGIN
+                    SELECT RAISE(FAIL, 'injected second status failure');
+                END;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        var result = new IssueEngine(store, new FrozenClockForSqliteReservations(timestamp.AddHours(1))).RequeueBlocked();
+
+        Assert.False(result.Success);
+        Assert.Contains("injected second status failure", result.Message, StringComparison.Ordinal);
+        Assert.Equal(eventCount, store.LoadAll().Count);
+        var state = IssueState.Replay(store.LoadAll());
+        Assert.Equal(Status.Blocked, state.Issues[first].Status);
+        Assert.Equal(Status.Blocked, state.Issues[second].Status);
     }
 
     [Fact]

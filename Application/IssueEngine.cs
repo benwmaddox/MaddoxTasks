@@ -89,6 +89,47 @@ public sealed class IssueEngine
         }
     }
 
+    public RequeueBlockedResult RequeueBlocked(bool dryRun = false)
+    {
+        try
+        {
+            return _eventStore.ExecuteAtomic(events =>
+            {
+                var state = IssueState.Replay(events);
+                var changedIssueIds = state.OrderedIssues
+                    .Where(issue => issue.Status == Status.Blocked)
+                    .Select(issue => issue.Id)
+                    .ToArray();
+                var skippedIssueIds = state.OrderedIssues
+                    .Where(issue => issue.Status != Status.Blocked)
+                    .Select(issue => issue.Id)
+                    .ToArray();
+                var timestamp = NormalizeUtc(_clock.UtcNow);
+                var plannedEvents = changedIssueIds
+                    .Select(issueId => (IssueEvent)new StatusChanged(Guid.NewGuid(), issueId, timestamp, Status.Next))
+                    .ToArray();
+                var action = dryRun ? "would be requeued" : "requeued";
+                var result = new RequeueBlockedResult(
+                    true,
+                    $"{changedIssueIds.Length} blocked issue(s) {action} to Next.",
+                    dryRun,
+                    changedIssueIds,
+                    skippedIssueIds);
+
+                return new EventStoreOperation<RequeueBlockedResult>(dryRun ? [] : plannedEvents, result);
+            });
+        }
+        catch (Exception exception)
+        {
+            return new RequeueBlockedResult(
+                false,
+                $"Unexpected failure: {exception.Message}",
+                dryRun,
+                [],
+                []);
+        }
+    }
+
     public IssueView? ClaimNext(bool dryRun = false)
     {
         return _eventStore.ExecuteAtomic(events =>

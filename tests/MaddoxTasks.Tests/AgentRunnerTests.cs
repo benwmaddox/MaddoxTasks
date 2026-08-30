@@ -9,6 +9,59 @@ namespace MaddoxTasks.Tests;
 public sealed class AgentRunnerTests
 {
     [Fact]
+    public void ExecuteCommandJson_RequeueBlockedSerializesDedicatedStableResponse()
+    {
+        var timestamp = new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var first = IssueId.New();
+        var skipped = IssueId.New();
+        var second = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), first, timestamp, "First", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), skipped, timestamp, "Skipped", null, Status.Next, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), second, timestamp, "Second", null, Status.Blocked, Priority.From(3), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(timestamp.AddHours(1)));
+
+        using var preview = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"RequeueBlocked","dryRun":true}"""));
+
+        Assert.Equal(["success", "message", "dryRun", "changedIssueIds", "skippedIssueIds"],
+            preview.RootElement.EnumerateObject().Select(property => property.Name).ToArray());
+        Assert.True(preview.RootElement.GetProperty("success").GetBoolean());
+        Assert.True(preview.RootElement.GetProperty("dryRun").GetBoolean());
+        Assert.Equal([first.ToString(), second.ToString()], preview.RootElement.GetProperty("changedIssueIds").EnumerateArray().Select(item => item.GetString()!).ToArray());
+        Assert.Equal([skipped.ToString()], preview.RootElement.GetProperty("skippedIssueIds").EnumerateArray().Select(item => item.GetString()!).ToArray());
+        Assert.Equal(Status.Blocked, engine.GetState().Issues[first].Status);
+
+        using var applied = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine, """{"type":"requeueblocked"}"""));
+        Assert.True(applied.RootElement.GetProperty("success").GetBoolean());
+        Assert.False(applied.RootElement.GetProperty("dryRun").GetBoolean());
+        Assert.Equal(Status.Next, engine.GetState().Issues[first].Status);
+        Assert.Equal(Status.Next, engine.GetState().Issues[second].Status);
+    }
+
+    [Theory]
+    [InlineData("null")]
+    [InlineData("\"true\"")]
+    [InlineData("1")]
+    [InlineData("{}")]
+    public void ExecuteCommandJson_RequeueBlockedRejectsNonBooleanDryRun(string dryRunJson)
+    {
+        var engine = new IssueEngine(
+            new InMemoryEventStoreForAgentTests(),
+            new FrozenClockForAgentTests(new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc)));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"RequeueBlocked","dryRun":{{dryRunJson}}}"""));
+
+        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Field 'dryRun' must be a boolean.", response.RootElement.GetProperty("message").GetString());
+        Assert.Empty(response.RootElement.GetProperty("changedIssueIds").EnumerateArray());
+        Assert.Empty(engine.GetEventLog());
+    }
+
+    [Fact]
     public void ExecuteCommandJson_CreateDefaultsToNext_ReportsStatus_AndSupportsBacklog()
     {
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));

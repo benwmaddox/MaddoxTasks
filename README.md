@@ -187,6 +187,17 @@ Comment example:
 }
 ```
 
+Requeue every currently `Blocked` issue to `Next` in one atomic command:
+
+```json
+{
+  "type": "RequeueBlocked",
+  "dryRun": true
+}
+```
+
+`dryRun` is an optional boolean that defaults to `false`. Preview and apply both return `changedIssueIds` (the Blocked issues that would change or changed) and `skippedIssueIds` (every other issue in the same snapshot), with both arrays ordered by issue sequence. Preview writes nothing. Apply appends only `StatusChanged` events and commits all changes together; an empty or repeated run succeeds without writing events. All task content, labels, repositories, comments, priority, and hierarchy remain unchanged.
+
 PowerShell tip: prefer `--file` or stdin here-string over inline `--json` to avoid escaping problems.
 If actor is omitted for `UpdateDescription`/`AddComment`, default resolution order is `--actor`, then env vars (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`), then Claude settings (`.claude/settings.local.json`, `.claude/settings.json`, `~/.claude/settings.json` model), then Codex config (`~/.codex/config.toml` model + reasoning effort), then `agent`.
 
