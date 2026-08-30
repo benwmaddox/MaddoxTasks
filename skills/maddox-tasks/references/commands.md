@@ -98,6 +98,7 @@ Supported `type` values (all available agent commands):
 - `RemoveLabel`
 - `UpdateDescription`
 - `AddComment`
+- `RequeueBlocked`
 
 Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels.
 
@@ -128,6 +129,17 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
   "newStatus": "Active"
 }
 ```
+
+`RequeueBlocked`:
+
+```json
+{
+  "type": "RequeueBlocked",
+  "dryRun": true
+}
+```
+
+`dryRun` is optional, must be a JSON boolean, and defaults to `false`. The dedicated response contains `success`, `message`, `dryRun`, `changedIssueIds`, and `skippedIssueIds`. Changed IDs are all issues that were `Blocked` in the atomic snapshot; skipped IDs are every non-Blocked issue in that snapshot. Both GUID arrays follow issue sequence. Preview reports would-change IDs without appending events. Apply writes only `StatusChanged` events from `Blocked` to `Next` and commits them as one transaction. Zero-change and repeat executions succeed without appending events. Priority, descriptions, comments, labels, repository identities, due dates, and parent/child relationships are preserved.
 
 `ChangePriority`:
 

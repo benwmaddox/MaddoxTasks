@@ -26,9 +26,17 @@ function Invoke-PublishedAgent {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
 
-    foreach ($argument in $Arguments) {
-        [void]$startInfo.ArgumentList.Add($argument)
-    }
+    # Windows PowerShell uses the .NET Framework ProcessStartInfo surface,
+    # which does not expose ArgumentList. These validator arguments contain no
+    # embedded quotes; quote whitespace-bearing paths for native parsing.
+    $startInfo.Arguments = (($Arguments | ForEach-Object {
+                if ($_ -match '[\s"]') {
+                    '"' + ($_ -replace '"', '\"') + '"'
+                }
+                else {
+                    $_
+                }
+            }) -join ' ')
 
     $process = [System.Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
@@ -78,7 +86,8 @@ function Convert-AgentJson {
     }
 
     try {
-        return ConvertFrom-Json -InputObject $Json
+        $parsed = ConvertFrom-Json -InputObject $Json
+        return $parsed
     }
     catch {
         throw "$Step returned invalid JSON: $($_.Exception.Message). Output: $($Json.Trim())"
@@ -218,7 +227,55 @@ try {
         throw "agent next did not expose repository 'published-smoke'."
     }
 
-    Write-Host "[smoke] PASS: agent issues, agent next, and agent command completed SQLite-backed validation."
+    $blockCommandPath = Join-Path $tempRoot "block-command.json"
+    Write-CommandFile -Path $blockCommandPath -Command ([ordered]@{
+            type      = "ChangeStatus"
+            issueId   = $issueId
+            newStatus = "Blocked"
+        })
+    $blockResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $blockCommandPath) -WorkingDirectory $tempRoot
+    [void](Assert-CommandSucceeded -Response $blockResponse -Step "ChangeStatus Blocked")
+
+    $requeuePreviewPath = Join-Path $tempRoot "requeue-preview-command.json"
+    Write-CommandFile -Path $requeuePreviewPath -Command ([ordered]@{
+            type   = "RequeueBlocked"
+            dryRun = $true
+        })
+    $requeuePreviewResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $requeuePreviewPath) -WorkingDirectory $tempRoot
+    $requeuePreview = Assert-CommandSucceeded -Response $requeuePreviewResponse -Step "RequeueBlocked preview"
+    if ($requeuePreview.dryRun -ne $true) {
+        throw "RequeueBlocked preview did not report dryRun=true."
+    }
+    if (@($requeuePreview.changedIssueIds).Count -ne 1 -or [string]$requeuePreview.changedIssueIds[0] -ne $issueId) {
+        throw "RequeueBlocked preview did not report the expected changed issue '$issueId'."
+    }
+    if (@($requeuePreview.skippedIssueIds).Count -ne 1 -or [string]$requeuePreview.skippedIssueIds[0] -ne [string]$backlogResult.issueId) {
+        throw "RequeueBlocked preview did not report the backlog issue as skipped."
+    }
+
+    $afterPreviewResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "issues") -WorkingDirectory $tempRoot
+    $afterPreview = @(Convert-AgentJson -Json $afterPreviewResponse.StdOut -Step "agent issues after RequeueBlocked preview")
+    if ([string]$afterPreview[0].status -ne "Blocked") {
+        throw "RequeueBlocked preview mutated the blocked issue."
+    }
+
+    $requeueApplyPath = Join-Path $tempRoot "requeue-apply-command.json"
+    Write-CommandFile -Path $requeueApplyPath -Command ([ordered]@{
+            type = "RequeueBlocked"
+        })
+    $requeueApplyResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $requeueApplyPath) -WorkingDirectory $tempRoot
+    $requeueApply = Assert-CommandSucceeded -Response $requeueApplyResponse -Step "RequeueBlocked apply"
+    if ($requeueApply.dryRun -ne $false -or @($requeueApply.changedIssueIds).Count -ne 1 -or [string]$requeueApply.changedIssueIds[0] -ne $issueId) {
+        throw "RequeueBlocked apply did not report the expected changed issue '$issueId'."
+    }
+
+    $afterApplyResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "issues") -WorkingDirectory $tempRoot
+    $afterApply = @(Convert-AgentJson -Json $afterApplyResponse.StdOut -Step "agent issues after RequeueBlocked apply")
+    if ([string]$afterApply[0].status -ne "Next") {
+        throw "RequeueBlocked apply did not move the blocked issue to Next."
+    }
+
+    Write-Host "[smoke] PASS: agent issues, agent next, agent command, and RequeueBlocked completed SQLite-backed validation."
 }
 catch {
     $validationError = $_.Exception

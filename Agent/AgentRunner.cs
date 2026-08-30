@@ -13,6 +13,11 @@ public static partial class AgentRunner
         var resolvedDefaultActor = ResolveDefaultActor(defaultActor);
         var normalizedJson = NormalizeIncomingJson(json);
 
+        if (TryExecuteRequeueBlocked(normalizedJson, engine, out var bulkResponse))
+        {
+            return bulkResponse;
+        }
+
         if (!TryParseCommand(normalizedJson, engine, resolvedDefaultActor, out var command, out var error))
         {
             return SerializeResponse(new AgentCommandResponse(false, error, null, null, null));
@@ -32,6 +37,63 @@ public static partial class AgentRunner
                 result.IssueId?.ToString(),
                 result.EventId?.ToString(),
                 finalStatus));
+    }
+
+    private static bool TryExecuteRequeueBlocked(string json, IssueEngine engine, out string response)
+    {
+        response = string.Empty;
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return false;
+        }
+
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        using (document)
+        {
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetProperty(root, "type", out var typeElement) ||
+                typeElement.ValueKind != JsonValueKind.String ||
+                !string.Equals(typeElement.GetString()?.Trim(), "RequeueBlocked", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            var dryRun = false;
+            if (TryGetProperty(root, "dryRun", out var dryRunElement))
+            {
+                if (dryRunElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    response = SerializeResponse(new RequeueBlockedResponse(
+                        false,
+                        "Field 'dryRun' must be a boolean.",
+                        false,
+                        [],
+                        []));
+                    return true;
+                }
+
+                dryRun = dryRunElement.GetBoolean();
+            }
+
+            var result = engine.RequeueBlocked(dryRun);
+            response = SerializeResponse(new RequeueBlockedResponse(
+                result.Success,
+                result.Message,
+                result.DryRun,
+                result.ChangedIssueIds.Select(issueId => issueId.ToString()).ToArray(),
+                result.SkippedIssueIds.Select(issueId => issueId.ToString()).ToArray()));
+            return true;
+        }
     }
 
     public static string GetIssuesJson(IssueEngine engine, IssueFilter? filter, bool includeDone)
@@ -648,6 +710,9 @@ public static partial class AgentRunner
     private static string SerializeResponse(AgentCommandResponse response)
         => JsonSerializer.Serialize(response, PrettyJsonContext.AgentCommandResponse);
 
+    private static string SerializeResponse(RequeueBlockedResponse response)
+        => JsonSerializer.Serialize(response, PrettyJsonContext.RequeueBlockedResponse);
+
     private static readonly AgentJsonContext PrettyJsonContext = new(new JsonSerializerOptions(JsonDefaults.Options)
     {
         WriteIndented = true
@@ -659,6 +724,13 @@ public static partial class AgentRunner
         string? IssueId,
         string? EventId,
         Status? Status);
+
+    private sealed record RequeueBlockedResponse(
+        bool Success,
+        string Message,
+        bool DryRun,
+        string[] ChangedIssueIds,
+        string[] SkippedIssueIds);
 
     private sealed record AgentIssueDto(
         int Sequence,
@@ -685,6 +757,7 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(AgentIssueDto[]))]
     [JsonSerializable(typeof(AgentIssueDto))]
     [JsonSerializable(typeof(AgentCommandResponse))]
+    [JsonSerializable(typeof(RequeueBlockedResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]
     [JsonSerializable(typeof(ReviewReconciliationOutcome))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;
