@@ -304,7 +304,7 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void ActiveTasksRequireDisjointRepositories()
+    public void ActiveTasksRequireDisjointReservationKeys()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStore();
@@ -312,23 +312,19 @@ public sealed class IssueEngineTests
         var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("First", null, Priority.From(3), null, null)).IssueId);
         var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Second", null, Priority.From(3), null, null)).IssueId);
 
-        Assert.False(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
-        Assert.True(engine.Execute(new AddLabel(first, "Repo:StasisLang")).Success);
         Assert.True(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
-        Assert.True(engine.Execute(new AddLabel(second, "repo:stasislang")).Success);
 
         var conflict = engine.Execute(new ChangeStatus(second, Status.Active));
         Assert.False(conflict.Success);
         Assert.Contains("already reserved", conflict.Message, StringComparison.OrdinalIgnoreCase);
 
-        Assert.True(engine.Execute(new RemoveLabel(second, "repo:stasislang")).Success);
         Assert.True(engine.Execute(new AddLabel(second, "repo:Other")).Success);
         Assert.True(engine.Execute(new ChangeStatus(second, Status.Active)).Success);
         Assert.Equal(["other"], engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == second).Issue.Repositories);
     }
 
     [Fact]
-    public void ActiveRepositoryEditsCannotRemoveLastReservation()
+    public void RemovingLastRepositoryMovesActiveIssueToMissingReservationWhenAvailable()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var store = new InMemoryEventStore();
@@ -338,8 +334,42 @@ public sealed class IssueEngineTests
         Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Active)).Success);
 
         var result = engine.Execute(new RemoveLabel(issueId, "repo:one"));
+        Assert.True(result.Success);
+        Assert.Empty(engine.QueryIssues(includeDone: true).Single().Issue.Repositories);
+    }
+
+    [Fact]
+    public void RemovingLastRepositoryIsBlockedWhenMissingReservationIsHeld()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var missing = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Missing", null, Priority.From(3), null, null)).IssueId);
+        var backed = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Backed", null, Priority.From(3), null, null)).IssueId);
+        Assert.True(engine.Execute(new ChangeStatus(missing, Status.ReadyForReview)).Success);
+        Assert.True(engine.Execute(new AddLabel(backed, "repo:one")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(backed, Status.Active)).Success);
+
+        var result = engine.Execute(new RemoveLabel(backed, "repo:one"));
+
         Assert.False(result.Success);
-        Assert.Contains("at least one repo", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("'missing'", result.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(["one"], engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == backed).Issue.Repositories);
+    }
+
+    [Fact]
+    public void AddingRepositoryToActiveIssueReleasesMissingReservation()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("First", null, Priority.From(3), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Second", null, Priority.From(3), null, null)).IssueId);
+        Assert.True(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
+
+        Assert.True(engine.Execute(new AddLabel(first, "repo:known")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(second, Status.ReadyForReview)).Success);
+
+        Assert.Equal(["known"], engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == first).Issue.Repositories);
+        Assert.Empty(engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == second).Issue.Repositories);
     }
 
     [Fact]
@@ -359,12 +389,31 @@ public sealed class IssueEngineTests
         Assert.True(engine.Execute(new ChangeStatus(noRepo, Status.Next)).Success);
         Assert.True(engine.Execute(new ChangeStatus(blocked, Status.Active)).Success);
 
-        var claim = engine.ClaimNext();
-        Assert.NotNull(claim);
-        Assert.Equal(available, claim!.Issue.Id);
-        Assert.Equal(Status.Active, claim.Issue.Status);
+        var missingClaim = engine.ClaimNext();
+        Assert.NotNull(missingClaim);
+        Assert.Equal(noRepo, missingClaim!.Issue.Id);
+        Assert.Empty(missingClaim.Issue.Repositories);
+        Assert.Equal(Status.Active, missingClaim.Issue.Status);
+
+        var repositoryClaim = engine.ClaimNext();
+        Assert.NotNull(repositoryClaim);
+        Assert.Equal(available, repositoryClaim!.Issue.Id);
         Assert.Null(engine.ClaimNext());
         Assert.Equal(Status.Active, engine.QueryIssues(includeDone: true).Single(view => view.Issue.Id == blocked).Issue.Status);
+    }
+
+    [Fact]
+    public void MissingReservationConflictsWithExplicitMissingRepository()
+    {
+        var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStore(), clock);
+        var missing = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("No repo", null, Priority.From(1), null, null)).IssueId);
+        var explicitMissing = Assert.IsAssignableFrom<IssueId>(engine.Execute(new CreateIssue("Explicit missing", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(explicitMissing, "repo:missing")).Success);
+
+        Assert.Equal(missing, engine.ClaimNext()!.Issue.Id);
+        Assert.Null(engine.ClaimNext());
+        Assert.False(engine.Execute(new ChangeStatus(explicitMissing, Status.ReadyForReview)).Success);
     }
 
     [Fact]
@@ -514,7 +563,7 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void ClaimNext_FallsThroughWhenFirstFamilyHasNoEligibleNodes()
+    public void ClaimNext_ClaimsRepositoryLessChildBeforeFallingThroughFamily()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
         var engine = new IssueEngine(new InMemoryEventStore(), clock);
@@ -537,8 +586,9 @@ public sealed class IssueEngineTests
         var claim = engine.ClaimNext();
 
         Assert.NotNull(claim);
-        Assert.Equal(secondRoot, claim!.Issue.Id);
-        Assert.Equal(Status.Next, engine.GetState().Issues[noRepoChild].Status);
+        Assert.Equal(noRepoChild, claim!.Issue.Id);
+        Assert.Equal(Status.Active, engine.GetState().Issues[noRepoChild].Status);
+        Assert.Equal(Status.Next, engine.GetState().Issues[secondRoot].Status);
     }
 
     [Fact]

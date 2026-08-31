@@ -75,22 +75,31 @@ try {
     for ($iteration = 1; $MaxIterations -eq 0 -or $iteration -le $MaxIterations; $iteration++) {
         $claim = Invoke-MaddoxClaim -DryRun:$Preview
         if ($null -eq $claim) {
-            Write-Host "No repository-backed Next task is available; stopping."
+            Write-Host "No claimable Next task is available; stopping."
             break
         }
 
     $repositories = @($claim.repositories)
-    if ($repositories.Count -eq 0) { throw "Claimed issue $($claim.issueId) has no repositories." }
     # Resolve every reservation before starting Codex. This makes an invalid
     # secondary repository fail before any work begins.
     $repositoryPaths = @($repositories | ForEach-Object { Resolve-ReservedRepository -Repository $_ })
-    $repositoryPath = $repositoryPaths[0]
-    $selection = ($repositories -join ", ")
-    $repositoryMappings = for ($repositoryIndex = 0; $repositoryIndex -lt $repositories.Count; $repositoryIndex++) {
-        "  $($repositories[$repositoryIndex]) -> $($repositoryPaths[$repositoryIndex])"
+    if ($repositories.Count -eq 0) {
+        if (-not (Test-Path -LiteralPath $RepoRoot -PathType Container)) {
+            throw "RepoRoot was not found at '$RepoRoot'."
+        }
+        $repositoryPath = $RepoRoot
+        $repositoryMappingText = "  missing (no repository specified; working directory is RepoRoot: $RepoRoot)"
+        Write-Host "Claimed issue $($claim.sequence) '$($claim.title)' with missing repository scope; impact scope is unknown."
     }
-    $repositoryMappingText = $repositoryMappings -join "`n"
-    Write-Host "Claimed issue $($claim.sequence) '$($claim.title)' for repositories: $selection"
+    else {
+        $repositoryPath = $repositoryPaths[0]
+        $selection = ($repositories -join ", ")
+        $repositoryMappings = for ($repositoryIndex = 0; $repositoryIndex -lt $repositories.Count; $repositoryIndex++) {
+            "  $($repositories[$repositoryIndex]) -> $($repositoryPaths[$repositoryIndex])"
+        }
+        $repositoryMappingText = $repositoryMappings -join "`n"
+        Write-Host "Claimed issue $($claim.sequence) '$($claim.title)' for repositories: $selection"
+    }
 
     if ($Preview) {
         Write-Host "Preview only; MaddoxTasks was not mutated and Codex was not started."
@@ -103,9 +112,9 @@ Work only on the already claimed Maddox Tasks issue below. Do not run MaddoxTask
 Selected issue (exact JSON):
 $($claim | ConvertTo-Json -Depth 10 -Compress)
 
-All reserved repositories are writable for this run. Exact repository-to-path mappings:
+Repository scope for this run:
 $repositoryMappingText
-The first reserved repository is the working directory. Do not select another task.
+If no repository was specified, the impact scope is unknown: inspect from RepoRoot and make only changes required by the issue. Otherwise, all reserved repositories are writable and the first reserved repository is the working directory. Do not select another task.
 When complete, update the Maddox task as appropriate and leave a concise progress comment.
 "@
 

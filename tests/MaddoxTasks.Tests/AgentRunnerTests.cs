@@ -425,11 +425,11 @@ model_reasoning_effort = "high"
         var engine = new IssueEngine(store, clock);
         var result = engine.Execute(new CreateIssue("Task", null, Priority.From(3), null, null, Status.Backlog));
         var issueId = Assert.IsAssignableFrom<IssueId>(result.IssueId);
-        Assert.True(engine.Execute(new AddLabel(issueId, "repo:alpha")).Success);
         Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Next)).Success);
 
         using var preview = JsonDocument.Parse(AgentRunner.GetClaimJson(engine, dryRun: true));
         Assert.Equal("Next", preview.RootElement.GetProperty("status").GetString());
+        Assert.Empty(preview.RootElement.GetProperty("repositories").EnumerateArray());
         Assert.Equal(Status.Next, engine.QueryIssues(includeDone: true).Single().Issue.Status);
     }
     private static bool ResponseSuccess(string responseJson)

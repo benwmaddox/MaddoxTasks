@@ -98,6 +98,7 @@ public static class StatusText
 public static class RepositoryLabels
 {
     public const string Prefix = "repo:";
+    public const string MissingReservation = "missing";
 
     public static string Normalize(string repository)
     {
@@ -138,6 +139,17 @@ public static class RepositoryLabels
 
     public static bool Overlaps(IEnumerable<string> left, IEnumerable<string> right)
         => left.Intersect(right, StringComparer.OrdinalIgnoreCase).Any();
+
+    public static IReadOnlyList<string> GetReservationKeys(IEnumerable<string> repositories)
+    {
+        var keys = repositories
+            .Select(Normalize)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        return keys.Length == 0 ? [MissingReservation] : keys;
+    }
 }
 
 public readonly record struct Priority(int Value)

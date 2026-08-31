@@ -110,11 +110,12 @@ public static class CommandPlanner
             throw new CommandValidationException($"Issue {command.IssueId} does not have label '{normalized}'.");
         }
 
-        if (issue.Status.HoldsRepositoryReservation() && RepositoryLabels.TryGetRepository(normalized, out _)
-            && issue.Repositories.Count <= 1)
+        if (issue.Status.HoldsRepositoryReservation() && RepositoryLabels.TryGetRepository(normalized, out var repository))
         {
-            throw new CommandValidationException(
-                $"Cannot remove repository label from reserving issue {command.IssueId}: at least one repo:<name> label is required.");
+            var repositories = issue.Repositories
+                .Where(candidate => !string.Equals(candidate, repository, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            ValidateActiveReservation(issue, repositories, state);
         }
 
         return new LabelRemoved(Guid.NewGuid(), command.IssueId, timestamp, normalized);
@@ -160,30 +161,20 @@ public static class CommandPlanner
 
     private static void ValidateActiveReservation(Issue issue, IEnumerable<string> repositories, IssueState state)
     {
-        var normalizedRepositories = repositories
-            .Select(RepositoryLabels.Normalize)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-
-        if (normalizedRepositories.Length == 0)
-        {
-            throw new CommandValidationException(
-                $"Cannot move issue {issue.Id} into a reservation-holding status: at least one repo:<name> label is required.");
-        }
+        var reservationKeys = RepositoryLabels.GetReservationKeys(repositories);
 
         foreach (var activeIssue in state.Issues.Values
                      .Where(candidate => candidate.Id != issue.Id && candidate.Status.HoldsRepositoryReservation())
                      .OrderBy(candidate => state.GetSequence(candidate.Id)))
         {
-            var overlap = normalizedRepositories
-                .Intersect(activeIssue.Repositories, StringComparer.OrdinalIgnoreCase)
+            var overlap = reservationKeys
+                .Intersect(RepositoryLabels.GetReservationKeys(activeIssue.Repositories), StringComparer.OrdinalIgnoreCase)
                 .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault();
             if (overlap is not null)
             {
                 throw new CommandValidationException(
-                    $"Cannot reserve repository '{overlap}': it is already reserved by reserving issue {activeIssue.Id}.");
+                    $"Cannot reserve repository scope '{overlap}': it is already reserved by reserving issue {activeIssue.Id}.");
             }
         }
     }

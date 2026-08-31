@@ -157,15 +157,15 @@ public sealed class IssueEngine
                     issue.Apply(auditEvent);
                 }
 
-                var activeRepositories = state.OrderedIssues
+                var activeReservationKeys = state.OrderedIssues
                     .Where(issue => issue.Status.HoldsRepositoryReservation())
-                    .SelectMany(issue => issue.Repositories)
+                    .SelectMany(issue => RepositoryLabels.GetReservationKeys(issue.Repositories))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
                 var candidate = state.SelectHierarchical(
                     issue => issue.Status == Status.Next &&
-                             issue.Repositories.Count > 0 &&
-                             !issue.Repositories.Any(activeRepositories.Contains));
+                             !RepositoryLabels.GetReservationKeys(issue.Repositories)
+                                 .Any(activeReservationKeys.Contains));
 
                 if (candidate is null)
                 {
