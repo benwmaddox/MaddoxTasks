@@ -135,6 +135,36 @@ public sealed class SqliteEventStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task ConcurrentClaims_AllowOnlyOneMissingReservationAndOneBackedReservation()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        for (var index = 0; index < 2; index++)
+        {
+            _ = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+                new CreateIssue($"Missing {index}", null, Priority.From(1), null, null)).IssueId);
+        }
+
+        var backed = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+            new CreateIssue("Backed", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(setup.Execute(new AddLabel(backed, "repo:backed")).Success);
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext()));
+
+        Assert.Equal(2, claims.Count(claim => claim is not null));
+        Assert.Single(claims.Where(claim => claim is not null), claim => claim!.Issue.Repositories.Count == 0);
+        Assert.Single(claims.Where(claim => claim is not null), claim => claim!.Issue.Repositories.SequenceEqual(["backed"]));
+        var active = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll()).OrderedIssues
+            .Where(issue => issue.Status == Status.Active)
+            .ToArray();
+        Assert.Equal(2, active.Length);
+        Assert.Single(active, issue => issue.Repositories.Count == 0);
+    }
+
+    [Fact]
     public async Task ConcurrentClaims_ResetStaleCodexReservationOnlyOnce()
     {
         var now = new DateTime(2026, 2, 14, 12, 0, 0, DateTimeKind.Utc);
