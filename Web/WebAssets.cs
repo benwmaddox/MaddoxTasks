@@ -109,6 +109,7 @@ internal static class WebAssets
     .priority.p2 { color: #ffc578; }
     .labels { display: flex; flex-wrap: wrap; gap: .35rem; }
     .tag { display: inline-flex; align-items: center; max-width: 100%; border: 1px solid #46536a; border-radius: 999px; padding: .14rem .45rem; color: #c4d6ec; background: #202b3d; font-size: .78rem; overflow-wrap: anywhere; }
+    .tag.repository-tag { border-color: #9a6a35; color: #ffe0b3; background: #3b2b1c; }
     .tag button { min-width: 44px; min-height: 44px; margin: -.45rem -.35rem -.45rem .05rem; border: 0; padding: 0 .15rem; background: transparent; color: inherit; }
     .status-chip { display: inline-flex; border-radius: 999px; padding: .14rem .45rem; font-size: .75rem; font-weight: 650; }
     .status-active { color: #98edb6; background: #214b36; }
@@ -133,6 +134,7 @@ internal static class WebAssets
     .section { display: grid; gap: .55rem; }
     .section-heading { color: var(--muted); font-size: .85rem; text-transform: uppercase; letter-spacing: .08em; }
     .history-item, .comment-item { padding: .55rem .65rem; border-left: 3px solid #46536a; background: var(--panel-soft); border-radius: 0 8px 8px 0; overflow-wrap: anywhere; }
+    .lock-item { display: grid; gap: .4rem; padding: .7rem; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-soft); }
     .history-item .meta, .comment-item .meta { color: var(--muted); font-size: .78rem; margin-bottom: .25rem; }
     .alert { padding: .7rem; border: 1px solid #75424b; border-radius: 8px; color: #ffd2d1; background: #351e25; }
     #toast { position: fixed; right: 1rem; bottom: max(1rem, env(safe-area-inset-bottom)); z-index: 30; max-width: min(420px, calc(100vw - 2rem)); padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 9px; background: #202a38; box-shadow: 0 8px 30px #0008; }
@@ -160,6 +162,7 @@ internal static class WebAssets
     <header class="topbar">
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span><h1>MaddoxTasks</h1></div>
       <div class="top-actions">
+        <button id="locks-button" type="button">Repository locks</button>
         <button id="refresh-button" class="icon" type="button" title="Refresh (r)" aria-label="Refresh">↻</button>
         <button id="help-button" class="icon" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
         <button id="new-button" class="primary" type="button">New issue</button>
@@ -212,6 +215,12 @@ internal static class WebAssets
       </div>
     </section>
   </div>
+  <div id="locks-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="locks-heading">
+    <section class="panel">
+      <div class="modal-header"><h2 id="locks-heading">Repository locks</h2><button class="icon subtle" type="button" data-close="locks-overlay" aria-label="Close">×</button></div>
+      <div id="locks-body" class="modal-body"><div class="muted">Loading repository locks...</div></div>
+    </section>
+  </div>
   <div id="toast" class="hidden" role="status" aria-live="polite"></div>
 
   <script>
@@ -227,7 +236,16 @@ internal static class WebAssets
     }
     function statusLabel(status) { return status === 'ReadyForReview' ? 'Ready for Review' : status; }
     function statusClass(status) { return 'status-' + String(status).toLowerCase(); }
+    function compareIssuePriority(left, right) { return left.priority - right.priority || left.sequence - right.sequence; }
+    function compareBoardOrder(left, right) { return statuses.indexOf(left.status) - statuses.indexOf(right.status) || compareIssuePriority(left, right); }
     function issueById(id) { return state.issues.find(issue => issue.id === id); }
+    function repositoryName(label) { return String(label).toLowerCase().startsWith('repo:') ? String(label).slice(5) : null; }
+    function labelTag(label, removable = false) {
+      const repository = repositoryName(label);
+      const text = repository === null ? label : `Repository: ${repository}`;
+      const removeButton = removable ? ` <button type="button" class="remove-label" data-label="${escapeHtml(label)}" aria-label="Remove ${escapeHtml(label)}">×</button>` : '';
+      return `<span class="tag${repository === null ? '' : ' repository-tag'}">${escapeHtml(text)}${removeButton}</span>`;
+    }
     function isTyping(target) { return target && (target.matches('input, textarea, select, [contenteditable="true"]') || target.isContentEditable); }
     function showToast(message, kind = 'success') {
       const toast = byId('toast');
@@ -259,10 +277,40 @@ internal static class WebAssets
       if (byId('include-done').checked) params.set('includeDone', 'true');
       return params.toString();
     }
-    async function refresh(silent = false) {
+    function captureDetailDraft() {
+      if (!state.detail || byId('detail-overlay').classList.contains('hidden')) return null;
+      const description = byId('edit-description');
+      const label = byId('new-label');
+      const comment = byId('new-comment');
+      if (!description || !label || !comment) return null;
+      const active = document.activeElement;
+      return {
+        issueId: state.detail.id,
+        dirty: description.value !== (state.detail.description || '') || label.value !== '' || comment.value !== '',
+        values: { 'edit-description': description.value, 'new-label': label.value, 'new-comment': comment.value },
+        activeId: active && active.id,
+        selectionStart: active && 'selectionStart' in active ? active.selectionStart : null,
+        selectionEnd: active && 'selectionEnd' in active ? active.selectionEnd : null,
+        panelScrollTop: byId('detail-body').closest('.panel').scrollTop,
+        documentScrollY: window.scrollY
+      };
+    }
+    function restoreDetailDraft(draft) {
+      if (!draft || !draft.dirty || !state.detail || draft.issueId !== state.detail.id) return;
+      Object.entries(draft.values).forEach(([id, value]) => { const element = byId(id); if (element) element.value = value; });
+      const active = draft.activeId && byId(draft.activeId);
+      if (active) {
+        active.focus({ preventScroll: true });
+        if (draft.selectionStart !== null && 'setSelectionRange' in active) active.setSelectionRange(draft.selectionStart, draft.selectionEnd);
+      }
+      byId('detail-body').closest('.panel').scrollTop = draft.panelScrollTop;
+      window.scrollTo({ top: draft.documentScrollY });
+    }
+    async function refresh(silent = false, preserveDetailDraft = silent) {
+      const draft = preserveDetailDraft ? captureDetailDraft() : null;
       try {
         const payload = await api('/api/issues' + (queryString() ? '?' + queryString() : ''));
-        state.issues = payload.issues || [];
+        state.issues = (payload.issues || []).sort(compareBoardOrder);
         if (!state.issues.length) {
           state.selected = -1;
           state.selectedId = null;
@@ -273,7 +321,7 @@ internal static class WebAssets
         }
         renderBoard();
         showError('');
-        if (state.detail) await loadDetail(state.detail.id, true);
+        if (state.detail) await loadDetail(state.detail.id, true, draft);
       } catch (error) {
         showError(error.message);
         if (!silent) showToast(error.message, 'error');
@@ -282,7 +330,7 @@ internal static class WebAssets
     function renderBoard() {
       board.textContent = '';
       statuses.forEach(status => {
-        const issues = state.issues.filter(issue => issue.status === status);
+        const issues = state.issues.filter(issue => issue.status === status).sort(compareIssuePriority);
         const column = document.createElement('section');
         column.className = 'column';
         column.innerHTML = `<div class="column-header"><strong>${escapeHtml(statusLabel(status))}</strong><span class="count">${issues.length}</span></div><div class="column-items"></div>`;
@@ -298,10 +346,10 @@ internal static class WebAssets
       card.className = 'issue-card' + (state.selectedId === issue.id ? ' selected' : '');
       card.dataset.id = issue.id;
       card.setAttribute('aria-label', `${issue.shortId} ${issue.title}, ${statusLabel(issue.status)}`);
-      const tags = (issue.labels || []).slice(0, 4).map(label => `<span class="tag">${escapeHtml(label)}</span>`).join('');
+      const tags = (issue.labels || []).slice(0, 4).map(label => labelTag(label)).join('');
       const due = issue.dueDate ? `Due ${escapeHtml(new Date(issue.dueDate).toLocaleDateString())}` : '';
       card.innerHTML = `<div class="card-top"><span class="card-id">${escapeHtml(issue.shortId)} · ${escapeHtml(issue.id.slice(0, 8))}</span><span class="priority p${issue.priority}">P${issue.priority}</span></div><div class="card-title">${escapeHtml(issue.title)}</div><div class="card-meta"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><span>${due}</span></div>${tags ? `<div class="labels">${tags}</div>` : ''}`;
-      card.addEventListener('click', () => { selectIssue(state.issues.indexOf(issue)); openDetail(issue.id); });
+      card.addEventListener('click', () => { selectIssue(state.issues.findIndex(candidate => candidate.id === issue.id)); openDetail(issue.id); });
       card.addEventListener('focus', () => state.selectedId = issue.id);
       return card;
     }
@@ -313,7 +361,7 @@ internal static class WebAssets
       const selectedCard = board.querySelector(`[data-id="${CSS.escape(state.selectedId)}"]`);
       if (selectedCard) selectedCard.focus({ preventScroll: true });
     }
-    function closeOverlay(id) { byId(id).classList.add('hidden'); }
+    function closeOverlay(id) { byId(id).classList.add('hidden'); if (id === 'detail-overlay') state.detail = null; }
     function openOverlay(id) { byId(id).classList.remove('hidden'); }
     function openCreate() {
       byId('create-form').reset();
@@ -338,11 +386,14 @@ internal static class WebAssets
         const box = byId('create-error'); box.textContent = error.message; box.classList.remove('hidden');
       }
     }
-    async function loadDetail(id, silent = false) {
+    async function loadDetail(id, silent = false, draft = null) {
       try {
         const payload = await api('/api/issues/' + encodeURIComponent(id));
+        if (!state.detail || state.detail.id !== id) return;
+        const currentDraft = draft ? captureDetailDraft() || draft : null;
         state.detail = payload.issue;
         renderDetail();
+        restoreDetailDraft(currentDraft);
       } catch (error) {
         if (!silent) showToast(error.message, 'error');
       }
@@ -358,7 +409,7 @@ internal static class WebAssets
       if (!issue) return;
       byId('detail-heading').textContent = `${issue.shortId} · ${issue.title}`;
       const statusOptions = statuses.map(status => `<option value="${status}"${status === issue.status ? ' selected' : ''}>${escapeHtml(statusLabel(status))}</option>`).join('');
-      const labelTags = (issue.labels || []).map(label => `<span class="tag">${escapeHtml(label)} <button type="button" class="remove-label" data-label="${escapeHtml(label)}" aria-label="Remove ${escapeHtml(label)}">×</button></span>`).join('');
+      const labelTags = (issue.labels || []).map(label => labelTag(label, true)).join('');
       const comments = (issue.comments || []).slice().reverse().map(comment => `<article class="comment-item"><div class="meta">${escapeHtml(comment.actor)} · ${escapeHtml(new Date(comment.timestamp).toLocaleString())}</div><div>${escapeHtml(comment.comment)}</div></article>`).join('') || '<div class="muted">No comments yet.</div>';
       const history = (issue.history || []).slice().reverse().map(item => `<article class="history-item"><div class="meta">${escapeHtml(new Date(item.timestamp).toLocaleString())} · ${escapeHtml(item.eventType)}</div><div>${historyText(item)}</div></article>`).join('') || '<div class="muted">No history.</div>';
       byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><div class="button-row"><button type="button" id="done-button" class="primary">${issue.status === 'Done' ? 'Reopen as Next' : 'Done'}</button><button type="button" id="close-detail">Close</button></div></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label"><button type="button" id="add-label">Add label</button></div></div><div class="section"><div class="section-heading">Comments</div><div class="section">${comments}</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
@@ -381,34 +432,45 @@ internal static class WebAssets
       return item.eventType;
     }
     async function mutateStatus(status) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); showToast('Status updated.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); showToast('Status updated.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function mutatePriority(priority) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/priority`, { method: 'PATCH', body: JSON.stringify({ priority }) }); showToast('Priority updated.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/priority`, { method: 'PATCH', body: JSON.stringify({ priority }) }); showToast('Priority updated.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function mutateDescription(description) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/description`, { method: 'PATCH', body: JSON.stringify({ description }) }); showToast('Description updated.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/description`, { method: 'PATCH', body: JSON.stringify({ description }) }); showToast('Description updated.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function addLabel() {
       const input = byId('new-label'); const label = input.value.trim(); if (!label) return;
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels`, { method: 'POST', body: JSON.stringify({ label }) }); showToast('Label added.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels`, { method: 'POST', body: JSON.stringify({ label }) }); showToast('Label added.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function removeLabel(label) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' }); showToast('Label removed.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' }); showToast('Label removed.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function addComment() {
       const input = byId('new-comment'); const comment = input.value.trim(); if (!comment) return;
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/comments`, { method: 'POST', body: JSON.stringify({ comment }) }); showToast('Comment added.'); await refresh(true); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/comments`, { method: 'POST', body: JSON.stringify({ comment }) }); showToast('Comment added.'); await refresh(true, false); }
       catch (error) { showToast(error.message, 'error'); }
+    }
+    async function openRepositoryLocks() {
+      openOverlay('locks-overlay');
+      byId('locks-body').innerHTML = '<div class="muted">Loading repository locks...</div>';
+      try {
+        const payload = await api('/api/repository-locks');
+        const locks = payload.locks || [];
+        byId('locks-body').innerHTML = locks.length ? locks.map(lock => `<article class="lock-item"><div>${labelTag('repo:' + lock.repository)} <span class="priority p${lock.priority}">P${lock.priority}</span></div><strong>${escapeHtml(lock.shortId)} · ${escapeHtml(lock.title)}</strong><span class="status-chip ${statusClass(lock.status)}">${escapeHtml(statusLabel(lock.status))}</span></article>`).join('') : '<div class="muted">No repositories are currently locked.</div>';
+      } catch (error) {
+        byId('locks-body').innerHTML = `<div class="alert" role="alert">${escapeHtml(error.message)}</div>`;
+      }
     }
     function focusDetail(id) { const element = byId(id); if (element) element.focus(); }
     async function handleKey(event) {
-      if (event.key === 'Escape') { ['create-overlay', 'detail-overlay', 'help-overlay'].forEach(closeOverlay); return; }
+      if (event.key === 'Escape') { ['create-overlay', 'detail-overlay', 'help-overlay', 'locks-overlay'].forEach(closeOverlay); return; }
       if (isTyping(event.target)) return;
       if (event.key === '?') { openOverlay('help-overlay'); return; }
       if (event.key === '/') { event.preventDefault(); byId('search').focus(); return; }
@@ -445,6 +507,7 @@ internal static class WebAssets
     }
     statuses.forEach(status => byId('status-filter').insertAdjacentHTML('beforeend', `<option value="${status}">${escapeHtml(statusLabel(status))}</option>`));
     byId('new-button').onclick = openCreate;
+    byId('locks-button').onclick = openRepositoryLocks;
     byId('refresh-button').onclick = () => refresh();
     byId('help-button').onclick = () => openOverlay('help-overlay');
     byId('create-form').addEventListener('submit', submitCreate);

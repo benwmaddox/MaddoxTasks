@@ -107,6 +107,108 @@ public sealed class WebServerTests
         }
     }
 
+    [Fact]
+    public async Task RepositoryLocksReportReservingIssuesInDeterministicOrder()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"MaddoxTasks-web-locks-{Guid.NewGuid():N}.db");
+        using var app = WebServer.CreateApplication(databasePath, "127.0.0.1", 0);
+        using var client = new HttpClient();
+
+        try
+        {
+            await app.StartAsync();
+            client.BaseAddress = new Uri(app.Urls.Single().TrimEnd('/') + "/");
+
+            using (var emptyResponse = await client.GetAsync("api/repository-locks"))
+            {
+                Assert.Equal(HttpStatusCode.OK, emptyResponse.StatusCode);
+                using var emptyJson = JsonDocument.Parse(await emptyResponse.Content.ReadAsStringAsync());
+                Assert.Equal(0, emptyJson.RootElement.GetProperty("count").GetInt32());
+                Assert.Empty(emptyJson.RootElement.GetProperty("locks").EnumerateArray());
+            }
+
+            var activeId = await CreateIssueAsync(client, "Active lock", priority: 2);
+            await AddLabelAsync(client, activeId, "repo:zeta");
+            await AddLabelAsync(client, activeId, "repo:alpha");
+            await ChangeStatusAsync(client, activeId, "Active");
+
+            var reviewId = await CreateIssueAsync(client, "Review lock", priority: 1);
+            await AddLabelAsync(client, reviewId, "repo:beta");
+            await ChangeStatusAsync(client, reviewId, "ReadyForReview");
+
+            var missingId = await CreateIssueAsync(client, "Missing scope", priority: 3);
+            await ChangeStatusAsync(client, missingId, "Active");
+
+            var ignoredId = await CreateIssueAsync(client, "Next is not locked", priority: 1);
+            await AddLabelAsync(client, ignoredId, "repo:ignored");
+
+            using var response = await client.GetAsync("api/repository-locks");
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var locks = json.RootElement.GetProperty("locks").EnumerateArray().ToArray();
+
+            Assert.Equal(4, json.RootElement.GetProperty("count").GetInt32());
+            Assert.Equal(["alpha", "beta", "missing", "zeta"],
+                locks.Select(item => item.GetProperty("repository").GetString()!).ToArray());
+            Assert.Equal([activeId, reviewId, missingId, activeId],
+                locks.Select(item => item.GetProperty("issueId").GetString()!).ToArray());
+            Assert.Equal(["Active", "ReadyForReview", "Active", "Active"],
+                locks.Select(item => item.GetProperty("status").GetString()!).ToArray());
+            Assert.Equal([2, 1, 3, 2],
+                locks.Select(item => item.GetProperty("priority").GetInt32()).ToArray());
+            Assert.DoesNotContain(locks, item => item.GetProperty("issueId").GetString() == ignoredId);
+        }
+        finally
+        {
+            await app.StopAsync();
+            TryDelete(databasePath);
+            TryDelete(databasePath + "-shm");
+            TryDelete(databasePath + "-wal");
+        }
+    }
+
+    [Fact]
+    public void EmbeddedWebUiIncludesPriorityLocksRepositoryTagsAndDraftPreservation()
+    {
+        var html = WebAssets.IndexHtml;
+
+        Assert.Contains("id=\"locks-button\"", html, StringComparison.Ordinal);
+        Assert.Contains("/api/repository-locks", html, StringComparison.Ordinal);
+        Assert.Contains("repository-tag", html, StringComparison.Ordinal);
+        Assert.Contains("Repository: ${repository}", html, StringComparison.Ordinal);
+        Assert.Contains("left.priority - right.priority || left.sequence - right.sequence", html,
+            StringComparison.Ordinal);
+        Assert.Contains("captureDetailDraft", html, StringComparison.Ordinal);
+        Assert.Contains("restoreDetailDraft", html, StringComparison.Ordinal);
+        Assert.Contains("selectionStart", html, StringComparison.Ordinal);
+        Assert.Contains("panelScrollTop", html, StringComparison.Ordinal);
+        Assert.Contains("setInterval(() => refresh(true), 10000)", html, StringComparison.Ordinal);
+        Assert.Contains("await refresh(true, false)", html, StringComparison.Ordinal);
+    }
+
+    private static async Task<string> CreateIssueAsync(HttpClient client, string title, int priority)
+    {
+        using var response = await client.PostAsync("api/issues",
+            Json($$"""{"title":"{{title}}","priority":{{priority}},"status":"Next"}"""));
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return Assert.IsType<string>(json.RootElement.GetProperty("issueId").GetString());
+    }
+
+    private static async Task AddLabelAsync(HttpClient client, string issueId, string label)
+    {
+        using var response = await client.PostAsync($"api/issues/{issueId}/labels",
+            Json($$"""{"label":"{{label}}"}"""));
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static async Task ChangeStatusAsync(HttpClient client, string issueId, string status)
+    {
+        using var response = await client.SendAsync(new HttpRequestMessage(HttpMethod.Patch,
+            $"api/issues/{issueId}/status") { Content = Json($$"""{"status":"{{status}}"}""") });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
     private static StringContent Json(string json)
         => new(json, Encoding.UTF8, "application/json");
 

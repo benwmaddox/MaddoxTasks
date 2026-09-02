@@ -33,6 +33,7 @@ internal static class WebEndpoints
         }));
 
         app.MapGet("/api/issues", context => GetIssuesAsync(context, engine));
+        app.MapGet("/api/repository-locks", context => GetRepositoryLocksAsync(context, engine));
         app.MapGet("/api/issues/{token}", context => GetIssueAsync(context, engine));
         app.MapPost("/api/issues", context => CreateIssueAsync(context, engine));
 
@@ -113,6 +114,39 @@ internal static class WebEndpoints
             writer.WriteBoolean("success", true);
             writer.WritePropertyName("issue");
             WriteIssue(writer, view, includeHistory: true, engine);
+        });
+    }
+
+    private static async Task GetRepositoryLocksAsync(HttpContext context, IssueEngine engine)
+    {
+        var locks = engine.QueryIssues(includeDone: true)
+            .Where(view => view.Issue.Status.HoldsRepositoryReservation())
+            .SelectMany(view => RepositoryLabels.GetReservationKeys(view.Issue.Repositories)
+                .Select(repository => (Repository: repository, View: view)))
+            .OrderBy(item => item.Repository, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(item => item.View.Sequence)
+            .ToArray();
+
+        await WriteJson(context, StatusCodes.Status200OK, writer =>
+        {
+            writer.WriteBoolean("success", true);
+            writer.WriteNumber("count", locks.Length);
+            writer.WriteStartArray("locks");
+            foreach (var item in locks)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("repository", item.Repository);
+                writer.WriteNumber("sequence", item.View.Sequence);
+                writer.WriteString("issueId", item.View.Issue.Id.ToString());
+                writer.WriteString("shortId", item.View.ShortId);
+                writer.WriteString("title", item.View.Issue.Title);
+                writer.WriteString("status", item.View.Issue.Status.ToString());
+                writer.WriteString("statusLabel", item.View.Issue.Status.ToDisplayString());
+                writer.WriteNumber("priority", item.View.Issue.Priority.Value);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
         });
     }
 
