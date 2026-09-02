@@ -125,8 +125,12 @@ the automatic refresh (or press the refresh button / `r`).
 
 The board groups issues by status and includes search, status/priority filters,
 issue creation (including parent and due date), status and priority editing,
-description, labels, comments, and history. Every mutation has a visible
-button and touch targets are sized for mobile use. Keyboard shortcuts are:
+description, labels, comments, and history. Issues within each status column are
+ordered by priority (P1 first) and then issue sequence. Repository labels are
+shown as distinct `Repository: <name>` tags, and the Repository locks button lists
+the Active and Ready for Review task blocking each reserved repository. Every
+mutation has a visible button and touch targets are sized for mobile use. Keyboard
+shortcuts are:
 
 - `Up`/`Down` or `j`/`k`: navigate issues; `Enter`: open the selected issue
 - `n`: new issue; `s`: status; `p`: priority; `t`: labels
@@ -134,7 +138,10 @@ button and touch targets are sized for mobile use. Keyboard shortcuts are:
 - `/`: search; `r`: refresh; `?`: help; `Esc`: close the current panel
 
 Shortcuts are ignored while typing in a form. The JSON API is available under
-`/api/issues` for clients that need the same browser operations.
+`/api/issues` for clients that need the same browser operations. The 10-second
+automatic refresh preserves unsaved description, label, and comment drafts along
+with focus, selection, and scroll position; a successful mutation reloads server
+state. Current reservation blockers are also available from `/api/repository-locks`.
 
 Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
 
