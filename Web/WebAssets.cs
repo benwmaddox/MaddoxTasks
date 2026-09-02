@@ -240,6 +240,10 @@ internal static class WebAssets
     function compareBoardOrder(left, right) { return statuses.indexOf(left.status) - statuses.indexOf(right.status) || compareIssuePriority(left, right); }
     function issueById(id) { return state.issues.find(issue => issue.id === id); }
     function repositoryName(label) { return String(label).toLowerCase().startsWith('repo:') ? String(label).slice(5) : null; }
+    function visibleIssueLabels(labels) {
+      const allLabels = labels || [];
+      return allLabels.filter(label => repositoryName(label) !== null).concat(allLabels.filter(label => repositoryName(label) === null)).slice(0, 4);
+    }
     function labelTag(label, removable = false) {
       const repository = repositoryName(label);
       const text = repository === null ? label : `Repository: ${repository}`;
@@ -286,7 +290,11 @@ internal static class WebAssets
       const active = document.activeElement;
       return {
         issueId: state.detail.id,
-        dirty: description.value !== (state.detail.description || '') || label.value !== '' || comment.value !== '',
+        dirtyFields: {
+          description: description.value !== (state.detail.description || ''),
+          label: label.value !== '',
+          comment: comment.value !== ''
+        },
         values: { 'edit-description': description.value, 'new-label': label.value, 'new-comment': comment.value },
         activeId: active && active.id,
         selectionStart: active && 'selectionStart' in active ? active.selectionStart : null,
@@ -296,17 +304,25 @@ internal static class WebAssets
       };
     }
     function restoreDetailDraft(draft) {
-      if (!draft || !draft.dirty || !state.detail || draft.issueId !== state.detail.id) return;
-      Object.entries(draft.values).forEach(([id, value]) => { const element = byId(id); if (element) element.value = value; });
+      if (!draft || !state.detail || draft.issueId !== state.detail.id) return;
+      const fieldIds = { description: 'edit-description', label: 'new-label', comment: 'new-comment' };
+      Object.entries(draft.dirtyFields).forEach(([field, dirty]) => {
+        const id = fieldIds[field];
+        const element = dirty && byId(id);
+        if (element) element.value = draft.values[id];
+      });
       const active = draft.activeId && byId(draft.activeId);
       if (active) {
         active.focus({ preventScroll: true });
-        if (draft.selectionStart !== null && 'setSelectionRange' in active) active.setSelectionRange(draft.selectionStart, draft.selectionEnd);
+        if (draft.selectionStart !== null && 'setSelectionRange' in active) {
+          const end = Math.min(draft.selectionEnd, active.value.length);
+          active.setSelectionRange(Math.min(draft.selectionStart, end), end);
+        }
       }
       byId('detail-body').closest('.panel').scrollTop = draft.panelScrollTop;
       window.scrollTo({ top: draft.documentScrollY });
     }
-    async function refresh(silent = false, preserveDetailDraft = silent) {
+    async function refresh(silent = false, preserveDetailDraft = true) {
       const draft = preserveDetailDraft ? captureDetailDraft() : null;
       try {
         const payload = await api('/api/issues' + (queryString() ? '?' + queryString() : ''));
@@ -346,7 +362,7 @@ internal static class WebAssets
       card.className = 'issue-card' + (state.selectedId === issue.id ? ' selected' : '');
       card.dataset.id = issue.id;
       card.setAttribute('aria-label', `${issue.shortId} ${issue.title}, ${statusLabel(issue.status)}`);
-      const tags = (issue.labels || []).slice(0, 4).map(label => labelTag(label)).join('');
+      const tags = visibleIssueLabels(issue.labels).map(label => labelTag(label)).join('');
       const due = issue.dueDate ? `Due ${escapeHtml(new Date(issue.dueDate).toLocaleDateString())}` : '';
       card.innerHTML = `<div class="card-top"><span class="card-id">${escapeHtml(issue.shortId)} · ${escapeHtml(issue.id.slice(0, 8))}</span><span class="priority p${issue.priority}">P${issue.priority}</span></div><div class="card-title">${escapeHtml(issue.title)}</div><div class="card-meta"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><span>${due}</span></div>${tags ? `<div class="labels">${tags}</div>` : ''}`;
       card.addEventListener('click', () => { selectIssue(state.issues.findIndex(candidate => candidate.id === issue.id)); openDetail(issue.id); });
@@ -412,7 +428,7 @@ internal static class WebAssets
       const labelTags = (issue.labels || []).map(label => labelTag(label, true)).join('');
       const comments = (issue.comments || []).slice().reverse().map(comment => `<article class="comment-item"><div class="meta">${escapeHtml(comment.actor)} · ${escapeHtml(new Date(comment.timestamp).toLocaleString())}</div><div>${escapeHtml(comment.comment)}</div></article>`).join('') || '<div class="muted">No comments yet.</div>';
       const history = (issue.history || []).slice().reverse().map(item => `<article class="history-item"><div class="meta">${escapeHtml(new Date(item.timestamp).toLocaleString())} · ${escapeHtml(item.eventType)}</div><div>${historyText(item)}</div></article>`).join('') || '<div class="muted">No history.</div>';
-      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><div class="button-row"><button type="button" id="done-button" class="primary">${issue.status === 'Done' ? 'Reopen as Next' : 'Done'}</button><button type="button" id="close-detail">Close</button></div></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label"><button type="button" id="add-label">Add label</button></div></div><div class="section"><div class="section-heading">Comments</div><div class="section">${comments}</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
+      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><div class="button-row"><button type="button" id="done-button" class="primary">${issue.status === 'Done' ? 'Reopen as Next' : 'Done'}</button><button type="button" id="close-detail">Close</button></div></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><div class="section">${comments}</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
       byId('close-detail').onclick = () => closeOverlay('detail-overlay');
       byId('done-button').onclick = () => mutateStatus(issue.status === 'Done' ? 'Next' : 'Done');
       byId('edit-status').onchange = event => mutateStatus(event.target.value);
@@ -432,29 +448,30 @@ internal static class WebAssets
       return item.eventType;
     }
     async function mutateStatus(status) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); showToast('Status updated.'); await refresh(true, false); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); showToast('Status updated.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function mutatePriority(priority) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/priority`, { method: 'PATCH', body: JSON.stringify({ priority }) }); showToast('Priority updated.'); await refresh(true, false); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/priority`, { method: 'PATCH', body: JSON.stringify({ priority }) }); showToast('Priority updated.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function mutateDescription(description) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/description`, { method: 'PATCH', body: JSON.stringify({ description }) }); showToast('Description updated.'); await refresh(true, false); }
+      const issueId = state.detail.id;
+      try { await api(`/api/issues/${encodeURIComponent(issueId)}/description`, { method: 'PATCH', body: JSON.stringify({ description }) }); if (state.detail && state.detail.id === issueId) state.detail.description = description; showToast('Description updated.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function addLabel() {
       const input = byId('new-label'); const label = input.value.trim(); if (!label) return;
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels`, { method: 'POST', body: JSON.stringify({ label }) }); showToast('Label added.'); await refresh(true, false); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels`, { method: 'POST', body: JSON.stringify({ label }) }); if (input.value.trim() === label) input.value = ''; showToast('Label added.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function removeLabel(label) {
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' }); showToast('Label removed.'); await refresh(true, false); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels/${encodeURIComponent(label)}`, { method: 'DELETE' }); showToast('Label removed.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function addComment() {
       const input = byId('new-comment'); const comment = input.value.trim(); if (!comment) return;
-      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/comments`, { method: 'POST', body: JSON.stringify({ comment }) }); showToast('Comment added.'); await refresh(true, false); }
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/comments`, { method: 'POST', body: JSON.stringify({ comment }) }); if (input.value.trim() === comment) input.value = ''; showToast('Comment added.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function openRepositoryLocks() {

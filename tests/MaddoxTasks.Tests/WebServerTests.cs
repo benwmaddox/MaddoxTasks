@@ -142,6 +142,10 @@ public sealed class WebServerTests
             var ignoredId = await CreateIssueAsync(client, "Next is not locked", priority: 1);
             await AddLabelAsync(client, ignoredId, "repo:ignored");
 
+            var blockedId = await CreateIssueAsync(client, "Blocked is not locked", priority: 1);
+            await AddLabelAsync(client, blockedId, "repo:blocked");
+            await ChangeStatusAsync(client, blockedId, "Blocked");
+
             using var response = await client.GetAsync("api/repository-locks");
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
@@ -154,9 +158,16 @@ public sealed class WebServerTests
                 locks.Select(item => item.GetProperty("issueId").GetString()!).ToArray());
             Assert.Equal(["Active", "ReadyForReview", "Active", "Active"],
                 locks.Select(item => item.GetProperty("status").GetString()!).ToArray());
+            Assert.Equal(["Active", "Ready for Review", "Active", "Active"],
+                locks.Select(item => item.GetProperty("statusLabel").GetString()!).ToArray());
+            Assert.Equal(["Active lock", "Review lock", "Missing scope", "Active lock"],
+                locks.Select(item => item.GetProperty("title").GetString()!).ToArray());
+            Assert.All(locks, item => Assert.False(string.IsNullOrWhiteSpace(
+                item.GetProperty("shortId").GetString())));
             Assert.Equal([2, 1, 3, 2],
                 locks.Select(item => item.GetProperty("priority").GetInt32()).ToArray());
             Assert.DoesNotContain(locks, item => item.GetProperty("issueId").GetString() == ignoredId);
+            Assert.DoesNotContain(locks, item => item.GetProperty("issueId").GetString() == blockedId);
         }
         finally
         {
@@ -176,14 +187,20 @@ public sealed class WebServerTests
         Assert.Contains("/api/repository-locks", html, StringComparison.Ordinal);
         Assert.Contains("repository-tag", html, StringComparison.Ordinal);
         Assert.Contains("Repository: ${repository}", html, StringComparison.Ordinal);
+        Assert.Contains("visibleIssueLabels(issue.labels)", html, StringComparison.Ordinal);
+        Assert.Contains("Use repo:&lt;name&gt; to identify and reserve a related repository.", html,
+            StringComparison.Ordinal);
         Assert.Contains("left.priority - right.priority || left.sequence - right.sequence", html,
             StringComparison.Ordinal);
         Assert.Contains("captureDetailDraft", html, StringComparison.Ordinal);
         Assert.Contains("restoreDetailDraft", html, StringComparison.Ordinal);
+        Assert.Contains("dirtyFields", html, StringComparison.Ordinal);
         Assert.Contains("selectionStart", html, StringComparison.Ordinal);
         Assert.Contains("panelScrollTop", html, StringComparison.Ordinal);
+        Assert.Contains("async function refresh(silent = false, preserveDetailDraft = true)", html,
+            StringComparison.Ordinal);
         Assert.Contains("setInterval(() => refresh(true), 10000)", html, StringComparison.Ordinal);
-        Assert.Contains("await refresh(true, false)", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("await refresh(true, false)", html, StringComparison.Ordinal);
     }
 
     private static async Task<string> CreateIssueAsync(HttpClient client, string title, int priority)
