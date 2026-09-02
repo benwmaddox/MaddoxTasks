@@ -139,9 +139,10 @@ shortcuts are:
 
 Shortcuts are ignored while typing in a form. The JSON API is available under
 `/api/issues` for clients that need the same browser operations. The 10-second
-automatic refresh preserves unsaved description, label, and comment drafts along
-with focus, selection, and scroll position; a successful mutation reloads server
-state. Current reservation blockers are also available from `/api/repository-locks`.
+automatic and manual refresh preserve unsaved description, label, and comment
+drafts along with focus, selection, and scroll position. A successful mutation
+reloads server state while clearing only the submitted field. Current reservation
+blockers are also available from `/api/repository-locks`.
 
 Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, and `Rejected`. `Done` and `Rejected` are terminal statuses; open views hide both by default, while `--include-done` includes all terminal tasks (the option name is retained for compatibility).
 
