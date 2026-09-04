@@ -29,7 +29,7 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
 
     public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null)
     {
-        var argumentList = arguments.ToArray();
+        var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
         log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, workingDirectory });
         using var process = new Process { StartInfo = new ProcessStartInfo { FileName = executable, WorkingDirectory = workingDirectory, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true } };
         foreach (var argument in argumentList) process.StartInfo.ArgumentList.Add(argument);
@@ -49,6 +49,18 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     public void Dispose() => containment.Dispose();
     private static async Task ReadAsync(StreamReader reader, StringBuilder target, Action<string>? callback) { while (await reader.ReadLineAsync() is { } line) { target.AppendLine(line); callback?.Invoke(line); } }
     private static string SafeError(string error) => error.Length > 1000 ? error[..1000] : error;
+}
+
+public static class ProcessArguments
+{
+    public static string[] Prepare(string executable, IEnumerable<string> arguments, string workingDirectory)
+    {
+        var values = arguments.ToArray();
+        if (!Path.GetFileNameWithoutExtension(executable).Equals("git", StringComparison.OrdinalIgnoreCase)) return values;
+
+        var safeDirectory = Path.GetFullPath(workingDirectory).Replace('\\', '/');
+        return ["-c", $"safe.directory={safeDirectory}", .. values];
+    }
 }
 
 public interface IRollingLog { void Write(string level, string message, object? data = null); }
