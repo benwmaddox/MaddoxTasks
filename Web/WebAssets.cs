@@ -87,10 +87,11 @@ internal static class WebAssets
     .toolbar .check { display: flex; align-items: center; gap: .45rem; min-height: 44px; white-space: nowrap; }
     .toolbar .check input { width: 20px; height: 20px; min-height: 20px; }
     .board {
-      display: grid; grid-template-columns: repeat(7, minmax(180px, 1fr)); gap: .65rem;
-      align-items: start; overflow-x: auto; padding-bottom: .35rem;
+      display: flex; gap: .65rem;
+      align-items: flex-start; overflow-x: auto; padding-bottom: .35rem;
     }
-    .column { min-height: 8rem; border: 1px solid var(--line); border-radius: var(--radius); background: #161b24b8; }
+    .column { flex: 1 1 180px; min-width: 180px; min-height: 8rem; border: 1px solid var(--line); border-radius: var(--radius); background: #161b24b8; }
+    .column.empty-column { flex: 0 0 110px; min-width: 110px; }
     .column-header { display: flex; justify-content: space-between; align-items: center; gap: .5rem; padding: .65rem .7rem; border-bottom: 1px solid var(--line); }
     .column-header strong { font-size: .9rem; }
     .count { color: var(--muted); font-size: .8rem; }
@@ -140,7 +141,11 @@ internal static class WebAssets
     #toast { position: fixed; right: 1rem; bottom: max(1rem, env(safe-area-inset-bottom)); z-index: 30; max-width: min(420px, calc(100vw - 2rem)); padding: .75rem 1rem; border: 1px solid var(--line); border-radius: 9px; background: #202a38; box-shadow: 0 8px 30px #0008; }
     #toast.error { border-color: #874752; color: #ffd3d3; }
     #toast.success { border-color: #3f805b; color: #caffdc; }
-    @media (max-width: 1100px) { .board { grid-template-columns: repeat(4, minmax(210px, 1fr)); } }
+    @media (max-width: 1100px) {
+      .board { display: grid; grid-template-columns: repeat(4, minmax(210px, 1fr)); }
+      .column { min-width: 0; }
+      .column.empty-column { flex: 1 1 auto; min-width: 0; }
+    }
     @media (max-width: 700px) {
       .app-shell { padding: .65rem; }
       .topbar { align-items: flex-start; }
@@ -149,7 +154,7 @@ internal static class WebAssets
       .toolbar label:first-child { grid-column: 1 / -1; }
       .toolbar .filter-actions { grid-column: 1 / -1; }
       .board { grid-template-columns: 1fr; overflow-x: visible; }
-      .column { min-height: 0; }
+      .column { min-width: 0; min-height: 0; }
       .column-items { grid-template-columns: 1fr; }
       .form-grid { grid-template-columns: 1fr; }
       .form-grid .full { grid-column: auto; }
@@ -349,7 +354,7 @@ internal static class WebAssets
       boardStatuses.forEach(status => {
         const issues = state.issues.filter(issue => issue.status === status).sort(compareIssuePriority);
         const column = document.createElement('section');
-        column.className = 'column';
+        column.className = 'column' + (issues.length === 0 ? ' empty-column' : '');
         column.innerHTML = `<div class="column-header"><strong>${escapeHtml(statusLabel(status))}</strong><span class="count">${issues.length}</span></div><div class="column-items"></div>`;
         const items = column.querySelector('.column-items');
         if (issues.length === 0) items.innerHTML = '<div class="empty">No issues</div>';
