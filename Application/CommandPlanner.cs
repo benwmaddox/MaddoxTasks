@@ -1,4 +1,5 @@
 using MaddoxTasks.Domain;
+using static MaddoxTasks.Domain.TextNormalization;
 
 namespace MaddoxTasks.Application;
 
@@ -62,7 +63,7 @@ public static class CommandPlanner
             IssueId.New(),
             timestamp,
             title,
-            command.Description?.Trim() ?? string.Empty,
+            NormalizeLineBreaks(command.Description?.Trim() ?? string.Empty),
             command.Status,
             command.Priority,
             command.ParentId,
@@ -141,7 +142,7 @@ public static class CommandPlanner
     private static IssueEvent PlanDescriptionUpdate(UpdateDescription command, IssueState state, DateTime timestamp)
     {
         var issue = RequireIssue(command.IssueId, state);
-        var normalized = command.Description?.Trim() ?? string.Empty;
+        var normalized = NormalizeLineBreaks(command.Description?.Trim() ?? string.Empty);
         var actor = NormalizeActor(command.Actor);
 
         if (string.Equals(issue.Description, normalized, StringComparison.Ordinal))
@@ -155,7 +156,7 @@ public static class CommandPlanner
     private static IssueEvent PlanCommentAdd(AddComment command, IssueState state, DateTime timestamp)
     {
         _ = RequireIssue(command.IssueId, state);
-        var normalized = command.Comment?.Trim() ?? string.Empty;
+        var normalized = NormalizeLineBreaks(command.Comment?.Trim() ?? string.Empty);
         var actor = NormalizeActor(command.Actor);
 
         if (string.IsNullOrWhiteSpace(normalized))
