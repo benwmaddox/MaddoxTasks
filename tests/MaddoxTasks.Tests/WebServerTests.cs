@@ -241,7 +241,7 @@ public sealed class WebServerTests
     [Fact]
     public void EmbeddedWebUiCompressesEmptyColumnsOnDesktopOnly()
     {
-        var html = WebAssets.IndexHtml;
+        var html = WebAssets.IndexHtml.ReplaceLineEndings("\n");
         Assert.Contains(".board {\n      display: flex; gap: .65rem;", html, StringComparison.Ordinal);
         Assert.Contains("column.className = 'column' + (issues.length === 0 ? ' empty-column' : '');",
             html, StringComparison.Ordinal);

@@ -1,5 +1,6 @@
 using System.Globalization;
 using MaddoxTasks.Application;
+using static MaddoxTasks.Domain.TextNormalization;
 
 namespace MaddoxTasks.Domain;
 
@@ -211,7 +212,7 @@ public sealed class Issue
         {
             case IssueCreated created:
                 Title = created.Title;
-                Description = created.Description ?? string.Empty;
+                Description = NormalizeLineBreaks(created.Description ?? string.Empty);
                 Status = created.Status;
                 Priority = created.Priority;
                 ParentId = created.ParentId;
@@ -241,11 +242,11 @@ public sealed class Issue
                 UpdatedAt = labelsSet.Timestamp;
                 break;
             case DescriptionUpdated descriptionUpdated:
-                Description = descriptionUpdated.Description;
+                Description = NormalizeLineBreaks(descriptionUpdated.Description);
                 UpdatedAt = descriptionUpdated.Timestamp;
                 break;
             case CommentAdded commentAdded:
-                _comments.Add(new IssueComment(commentAdded.Timestamp, commentAdded.Comment, commentAdded.Actor));
+                _comments.Add(new IssueComment(commentAdded.Timestamp, NormalizeLineBreaks(commentAdded.Comment), commentAdded.Actor));
                 UpdatedAt = commentAdded.Timestamp;
                 break;
             default:
