@@ -6,6 +6,32 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class WorkerPolicyTests
 {
     [Fact]
+    public void WorkspaceCleanupPolicy_RequiresExactOwnedRootAndTaskBranch()
+    {
+        using var directory = new TemporaryDirectory();
+        var root = Path.Combine(directory.Path, "worktrees"); Directory.CreateDirectory(root);
+        var job = CreateJob();
+        job.Workspaces = [new Workspace("Repo", Path.Combine(root, "repo-1"), "codex/task-1-fix", "origin")];
+        Assert.True(WorkspaceCleanupPolicy.IsProvenOwned(job, root));
+        job.Workspaces[0] = job.Workspaces[0] with { Directory = Path.Combine(directory.Path, "outside") };
+        Assert.False(WorkspaceCleanupPolicy.IsProvenOwned(job, root));
+        job.Workspaces[0] = job.Workspaces[0] with { Directory = Path.Combine(root, "repo-1"), Branch = "codex/task-2-wrong" };
+        Assert.False(WorkspaceCleanupPolicy.IsProvenOwned(job, root));
+    }
+
+    [Fact]
+    public void WorkspaceCleanupPolicy_RejectsDuplicateEntriesAndFindsInvisiblePendingDoneJobs()
+    {
+        using var directory = new TemporaryDirectory();
+        var root = Path.Combine(directory.Path, "worktrees"); Directory.CreateDirectory(root);
+        var job = CreateJob(JobPhases.Done); job.CleanupPending = true;
+        var workspace = new Workspace("Repo", Path.Combine(root, "repo-1"), "codex/task-1-fix", "origin");
+        job.Workspaces = [workspace, workspace];
+        Assert.False(WorkspaceCleanupPolicy.IsProvenOwned(job, root));
+        Assert.Equal([job], WorkspaceCleanupPolicy.Pending([job, CreateJob(JobPhases.Done)]));
+        Assert.Empty(DashboardPolicy.VisibleJobs([job], DateTime.UtcNow, TimeSpan.FromMinutes(10)));
+    }
+    [Fact]
     public void ReviewWindow_RequiresUninterruptedGreenAndResetsForFeedback()
     {
         var window = new ReviewWindow();
