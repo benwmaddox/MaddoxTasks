@@ -462,6 +462,14 @@ public sealed class WorkerPolicyTests
         Assert.Equal(["--version"], codex);
     }
 
+    [Fact]
+    public void ProcessRunner_DecodesChildOutputAndErrorsAsUtf8()
+    {
+        var startInfo = ProcessRunner.CreateStartInfo("codex", @"D:\code");
+        Assert.Equal(System.Text.Encoding.UTF8.CodePage, startInfo.StandardOutputEncoding?.CodePage);
+        Assert.Equal(System.Text.Encoding.UTF8.CodePage, startInfo.StandardErrorEncoding?.CodePage);
+    }
+
     private static Job CreateJob(string phase = JobPhases.Claimed, DateTime? started = null) => new()
     {
         Task = new TaskDto(1, Guid.NewGuid().ToString(), "Task", "Description", ["Repo"]),

@@ -31,7 +31,7 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     {
         var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
         log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, workingDirectory });
-        using var process = new Process { StartInfo = new ProcessStartInfo { FileName = executable, WorkingDirectory = workingDirectory, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true } };
+        using var process = new Process { StartInfo = CreateStartInfo(executable, workingDirectory) };
         foreach (var argument in argumentList) process.StartInfo.ArgumentList.Add(argument);
         process.Start();
         containment.Add(process);
@@ -47,6 +47,17 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     }
 
     public void Dispose() => containment.Dispose();
+    public static ProcessStartInfo CreateStartInfo(string executable, string workingDirectory) => new()
+    {
+        FileName = executable,
+        WorkingDirectory = workingDirectory,
+        UseShellExecute = false,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        StandardOutputEncoding = Encoding.UTF8,
+        StandardErrorEncoding = Encoding.UTF8,
+        CreateNoWindow = true
+    };
     private static async Task ReadAsync(StreamReader reader, StringBuilder target, Action<string>? callback) { while (await reader.ReadLineAsync() is { } line) { target.AppendLine(line); callback?.Invoke(line); } }
     private static string SafeError(string error) => error.Length > 1000 ? error[..1000] : error;
 }
