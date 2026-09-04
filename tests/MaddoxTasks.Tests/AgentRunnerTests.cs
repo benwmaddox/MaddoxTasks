@@ -9,6 +9,82 @@ namespace MaddoxTasks.Tests;
 public sealed class AgentRunnerTests
 {
     [Fact]
+    public void SplitIssue_AtomicallyCreatesOneNextChildPerRepositoryAndCompletesParent()
+    {
+        var now = new DateTime(2026, 9, 4, 14, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var parent = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), parent, now, "Coordinate changes", "Across projects", Status.Active, Priority.From(1), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(now.AddMinutes(1)));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SplitIssue","issueId":"{{parent}}","children":[{"title":"Update Zeta","description":"Apply the policy to Zeta.","repository":"Zeta"},{"title":"Update Alpha","description":"Apply the policy to Alpha.","repository":"alpha"}]}"""));
+
+        Assert.True(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Done", response.RootElement.GetProperty("parent").GetProperty("status").GetString());
+        var children = response.RootElement.GetProperty("children").EnumerateArray().ToArray();
+        Assert.Equal(2, children.Length);
+        Assert.All(children, child =>
+        {
+            Assert.Equal("Next", child.GetProperty("status").GetString());
+            Assert.Equal(1, child.GetProperty("priority").GetInt32());
+            Assert.Equal(parent.ToString(), child.GetProperty("parentId").GetString());
+            Assert.Single(child.GetProperty("repositories").EnumerateArray());
+        });
+        Assert.Equal(["zeta", "alpha"], children.Select(child => child.GetProperty("repositories")[0].GetString()!).ToArray());
+
+        var state = engine.GetState();
+        Assert.Equal(Status.Done, state.Issues[parent].Status);
+        Assert.Equal(2, state.OrderedIssues.Count(issue => issue.ParentId == parent));
+        Assert.Equal(5, engine.GetEventLog().Count - 1);
+        Assert.Equal(2, engine.GetEventLog().OfType<IssueCreated>().Count() - 1);
+        Assert.Equal(2, engine.GetEventLog().OfType<RepositoryLabelsSet>().Count());
+        Assert.Single(engine.GetEventLog().OfType<StatusChanged>());
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("[{\"title\":\"Only\",\"description\":\"One\",\"repository\":\"alpha\"}]")]
+    [InlineData("[{\"title\":\"A\",\"description\":\"One\",\"repository\":\"alpha\"},{\"title\":\"B\",\"description\":\"Two\",\"repository\":\"ALPHA\"}]")]
+    public void SplitIssue_RejectsInvalidChildrenWithoutPartialMutation(string childrenJson)
+    {
+        var now = new DateTime(2026, 9, 4, 14, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var parent = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), parent, now, "Parent", "Description", Status.Active, Priority.From(2), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(now.AddMinutes(1)));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SplitIssue","issueId":"{{parent}}","children":{{childrenJson}}}"""));
+
+        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(Status.Active, engine.GetState().Issues[parent].Status);
+        Assert.Single(engine.GetEventLog());
+        Assert.DoesNotContain(engine.GetState().OrderedIssues, issue => issue.ParentId == parent);
+    }
+
+    [Fact]
+    public void SplitIssue_RejectsReservedRepositoryWithoutPartialMutation()
+    {
+        var now = new DateTime(2026, 9, 4, 14, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var parent = IssueId.New();
+        var reserved = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), parent, now, "Parent", "Description", Status.Active, Priority.From(2), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), reserved, now, "Reserved", null, Status.ReadyForReview, Priority.From(2), null, null));
+        store.Append(new RepositoryLabelsSet(Guid.NewGuid(), reserved, now, ["busy"]));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(now.AddMinutes(1)));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SplitIssue","issueId":"{{parent}}","children":[{"title":"A","description":"One","repository":"busy"},{"title":"B","description":"Two","repository":"free"}]}"""));
+
+        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Contains("already reserved", response.RootElement.GetProperty("message").GetString());
+        Assert.Equal(3, engine.GetEventLog().Count);
+        Assert.Equal(Status.Active, engine.GetState().Issues[parent].Status);
+    }
+
+    [Fact]
     public void SetRepositoryLabels_RejectsConflictWithoutPartialChange()
     {
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);

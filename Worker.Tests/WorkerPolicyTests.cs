@@ -335,7 +335,11 @@ public sealed class WorkerPolicyTests
         Assert.Equal("replacement", job.PendingDescription);
         Assert.Equal("please adjust", Assert.Single(job.PendingHumanComments).Comment);
         Assert.False(TaskUpdatePolicy.Ingest(job, live));
-        Assert.Equal("Clarification queued", TaskUpdatePolicy.DashboardPhase(job, job.Phase));
+        Assert.Equal("Task update queued", TaskUpdatePolicy.DashboardPhase(job, job.Phase));
+
+        TaskUpdatePolicy.BeginApplying(job);
+        Assert.Equal("Applying task update", TaskUpdatePolicy.DashboardPhase(job, job.Phase));
+        TaskUpdatePolicy.EndApplying(job);
 
         var batch = TaskUpdatePolicy.Capture(job);
         TaskUpdatePolicy.MarkDelivered(job, batch);
@@ -377,6 +381,43 @@ public sealed class WorkerPolicyTests
         Assert.Equal("second", job.PendingDescription);
         Assert.Equal("second", Assert.Single(job.PendingHumanComments).Comment);
     }
+
+    [Fact]
+    public void TaskUpdatePolicy_InFlightStateIsTransientAcrossJournalRecovery()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"maddox-worker-{Guid.NewGuid():N}.json");
+        try
+        {
+            var job = CreateJob();
+            job.PendingDescription = "updated";
+            TaskUpdatePolicy.BeginApplying(job);
+            new Journal { Jobs = [job] }.Save(path);
+
+            var recovered = Assert.Single(Journal.Load(path).Jobs);
+            Assert.False(recovered.TaskUpdateInFlight);
+            Assert.Equal("Task update queued", TaskUpdatePolicy.DashboardPhase(recovered, recovered.Phase));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
+    public void ClarificationPolicy_ParsesAssignmentAndOneRepositoryPerSplitChild()
+    {
+        var assignment = ClarificationPolicy.Parse("""{"action":"assign","repositories":["MaddoxTasks","StasisLang"],"children":[],"rationale":"coupled","confidence":0.9,"ambiguous":false}""");
+        Assert.Equal("assign", assignment.Action);
+        Assert.Equal(["MaddoxTasks", "StasisLang"], assignment.Repositories);
+
+        var split = ClarificationPolicy.Parse("""{"action":"split","repositories":[],"children":[{"title":"A","description":"Do A","repository":"Alpha","rationale":"independent"},{"title":"B","description":"Do B","repository":"Beta","rationale":"independent"}],"rationale":"independent work","confidence":0.95,"ambiguous":false}""");
+        Assert.Equal("split", split.Action);
+        Assert.Equal(["Alpha", "Beta"], split.Children.Select(child => child.Repository));
+    }
+
+    [Theory]
+    [InlineData("{\"action\":\"split\",\"repositories\":[],\"children\":[{\"title\":\"A\",\"description\":\"Do A\",\"repository\":\"Alpha\",\"rationale\":\"x\"}],\"rationale\":\"x\",\"confidence\":1,\"ambiguous\":false}")]
+    [InlineData("{\"action\":\"split\",\"repositories\":[],\"children\":[{\"title\":\"A\",\"description\":\"Do A\",\"repository\":\"Alpha\",\"rationale\":\"x\"},{\"title\":\"B\",\"description\":\"Do B\",\"repository\":\"alpha\",\"rationale\":\"x\"}],\"rationale\":\"x\",\"confidence\":1,\"ambiguous\":false}")]
+    [InlineData("{\"action\":\"assign\",\"repositories\":[\"Alpha\"],\"children\":[],\"rationale\":\"unclear\",\"confidence\":0.2,\"ambiguous\":true}")]
+    public void ClarificationPolicy_RejectsInvalidOrAmbiguousDecisions(string json)
+        => Assert.Throws<InvalidDataException>(() => ClarificationPolicy.Parse(json));
 
     [Fact]
     public void BlockedReassessmentPolicy_AllowsOnlyOneSameSessionAttempt()

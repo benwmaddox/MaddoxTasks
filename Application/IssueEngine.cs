@@ -89,6 +89,75 @@ public sealed class IssueEngine
         }
     }
 
+    public SplitIssueResult ExecuteSplitIssue(SplitIssue command)
+    {
+        try
+        {
+            return _eventStore.ExecuteAtomic(events =>
+            {
+                var state = IssueState.Replay(events);
+                if (!state.TryGetIssue(command.IssueId, out var parent))
+                    throw new CommandValidationException($"Issue '{command.IssueId}' was not found.");
+                if (parent.Status.IsTerminal())
+                    throw new CommandValidationException("A terminal issue cannot be split.");
+                if (command.Children.Count < 2)
+                    throw new CommandValidationException("A split requires at least two child issues.");
+
+                var children = command.Children.Select(child =>
+                {
+                    var title = child.Title?.Trim() ?? string.Empty;
+                    var description = TextNormalization.NormalizeLineBreaks(child.Description?.Trim() ?? string.Empty);
+                    var repository = child.Repository?.Trim() ?? string.Empty;
+                    if (title.Length == 0) throw new CommandValidationException("Every split child requires a title.");
+                    if (description.Length == 0) throw new CommandValidationException("Every split child requires a description.");
+                    if (repository.Length == 0) throw new CommandValidationException("Every split child requires exactly one repository.");
+                    if (repository.StartsWith(RepositoryLabels.Prefix, StringComparison.OrdinalIgnoreCase) || repository.Any(char.IsControl))
+                        throw new CommandValidationException("Child repositories must be names without the 'repo:' prefix.");
+                    return new SplitIssueChild(title, description, RepositoryLabels.Normalize(repository));
+                }).ToArray();
+
+                var duplicate = children.GroupBy(child => child.Repository, StringComparer.OrdinalIgnoreCase)
+                    .FirstOrDefault(group => group.Count() > 1)?.Key;
+                if (duplicate is not null)
+                    throw new CommandValidationException($"Repository '{duplicate}' may belong to only one split child.");
+
+                var requested = children.Select(child => child.Repository).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                foreach (var reserved in state.OrderedIssues.Where(issue => issue.Id != parent.Id && issue.Status.HoldsRepositoryReservation()))
+                {
+                    var overlap = RepositoryLabels.GetReservationKeys(reserved.Repositories).FirstOrDefault(requested.Contains);
+                    if (overlap is not null)
+                        throw new CommandValidationException($"Cannot assign repository scope '{overlap}': it is already reserved by reserving issue {reserved.Id}.");
+                }
+
+                var timestamp = NormalizeUtc(_clock.UtcNow);
+                var planned = new List<IssueEvent>();
+                foreach (var child in children)
+                {
+                    var childId = IssueId.New();
+                    planned.Add(new IssueCreated(Guid.NewGuid(), childId, timestamp, child.Title, child.Description, Status.Next, parent.Priority, parent.Id, null));
+                    planned.Add(new RepositoryLabelsSet(Guid.NewGuid(), childId, timestamp, [child.Repository]));
+                }
+                planned.Add(new StatusChanged(Guid.NewGuid(), parent.Id, timestamp, Status.Done));
+
+                var after = IssueState.Replay(events.Concat(planned).ToArray());
+                var parentView = new IssueView(after.GetSequence(parent.Id), after.Issues[parent.Id]);
+                var childViews = planned.OfType<IssueCreated>()
+                    .Select(created => new IssueView(after.GetSequence(created.IssueId), after.Issues[created.IssueId]))
+                    .ToArray();
+                return new EventStoreOperation<SplitIssueResult>(planned,
+                    new SplitIssueResult(true, $"Issue split into {childViews.Length} child issues.", parentView, childViews));
+            });
+        }
+        catch (CommandValidationException exception)
+        {
+            return new SplitIssueResult(false, exception.Message, null, []);
+        }
+        catch (Exception exception)
+        {
+            return new SplitIssueResult(false, $"Unexpected failure: {exception.Message}", null, []);
+        }
+    }
+
     public RequeueBlockedResult RequeueBlocked(bool dryRun = false)
     {
         try
@@ -268,4 +337,6 @@ public enum ConditionalStatusChangeResult
     AlreadyChanged,
     NotFound
 }
+
+public sealed record SplitIssueResult(bool Success, string Message, IssueView? Parent, IReadOnlyList<IssueView> Children);
 

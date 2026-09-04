@@ -35,6 +35,10 @@ public sealed record RemoveLabel(
 
 public sealed record SetRepositoryLabels(IssueId IssueId, IReadOnlyList<string> Repositories) : Command;
 
+public sealed record SplitIssueChild(string Title, string Description, string Repository);
+
+public sealed record SplitIssue(IssueId IssueId, IReadOnlyList<SplitIssueChild> Children);
+
 public sealed record UpdateDescription(
     IssueId IssueId,
     string Description,

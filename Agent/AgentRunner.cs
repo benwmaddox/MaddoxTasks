@@ -18,6 +18,11 @@ public static partial class AgentRunner
             return bulkResponse;
         }
 
+        if (TryExecuteSplitIssue(normalizedJson, engine, out var splitResponse))
+        {
+            return splitResponse;
+        }
+
         if (!TryParseCommand(normalizedJson, engine, resolvedDefaultActor, out var command, out var error))
         {
             return SerializeResponse(new AgentCommandResponse(false, error, null, null, null));
@@ -46,6 +51,57 @@ public static partial class AgentRunner
                 result.IssueId?.ToString(),
                 result.EventId?.ToString(),
                 finalStatus));
+    }
+
+    private static bool TryExecuteSplitIssue(string json, IssueEngine engine, out string response)
+    {
+        response = string.Empty;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+
+        JsonDocument document;
+        try { document = JsonDocument.Parse(json); }
+        catch (JsonException) { return false; }
+
+        using (document)
+        {
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetProperty(root, "type", out var typeElement) ||
+                typeElement.ValueKind != JsonValueKind.String ||
+                !string.Equals(typeElement.GetString()?.Trim(), "SplitIssue", StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (!TryResolveIssue(root, engine, out var issueId, out var error))
+            {
+                response = SerializeResponse(new SplitIssueResponse(false, error, null, []));
+                return true;
+            }
+            if (!TryGetProperty(root, "children", out var childrenElement) || childrenElement.ValueKind != JsonValueKind.Array)
+            {
+                response = SerializeResponse(new SplitIssueResponse(false, "children must be an array with at least two child scopes.", null, []));
+                return true;
+            }
+
+            var children = new List<SplitIssueChild>();
+            foreach (var element in childrenElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object ||
+                    !TryGetString(element, "title", true, out var title, out error) ||
+                    !TryGetString(element, "description", true, out var description, out error) ||
+                    !TryGetString(element, "repository", true, out var repository, out error))
+                {
+                    response = SerializeResponse(new SplitIssueResponse(false, string.IsNullOrWhiteSpace(error) ? "Each child must be an object." : error, null, []));
+                    return true;
+                }
+                children.Add(new SplitIssueChild(title!, description!, repository!));
+            }
+
+            var result = engine.ExecuteSplitIssue(new SplitIssue(issueId, children));
+            var parent = result.Parent is null ? null : ToAgentIssueDto(result.Parent);
+            var childDtos = result.Children.Select(ToAgentIssueDto).ToArray();
+            response = SerializeResponse(new SplitIssueResponse(result.Success, result.Message, parent, childDtos));
+            return true;
+        }
     }
 
     private static bool TryExecuteRequeueBlocked(string json, IssueEngine engine, out string response)
@@ -738,6 +794,9 @@ public static partial class AgentRunner
     private static string SerializeResponse(RequeueBlockedResponse response)
         => JsonSerializer.Serialize(response, PrettyJsonContext.RequeueBlockedResponse);
 
+    private static string SerializeResponse(SplitIssueResponse response)
+        => JsonSerializer.Serialize(response, PrettyJsonContext.SplitIssueResponse);
+
     private static readonly AgentJsonContext PrettyJsonContext = new(new JsonSerializerOptions(JsonDefaults.Options)
     {
         WriteIndented = true
@@ -757,6 +816,7 @@ public static partial class AgentRunner
         string[] ChangedIssueIds,
         string[] SkippedIssueIds);
     private sealed record SetRepositoryLabelsResponse(bool Success, string Message, string IssueId, string[] Repositories, AgentIssueDto Issue);
+    private sealed record SplitIssueResponse(bool Success, string Message, AgentIssueDto? Parent, AgentIssueDto[] Children);
 
     private sealed record AgentIssueDto(
         int Sequence,
@@ -785,6 +845,7 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(AgentCommandResponse))]
     [JsonSerializable(typeof(RequeueBlockedResponse))]
     [JsonSerializable(typeof(SetRepositoryLabelsResponse))]
+    [JsonSerializable(typeof(SplitIssueResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]
     [JsonSerializable(typeof(ReviewReconciliationOutcome))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;

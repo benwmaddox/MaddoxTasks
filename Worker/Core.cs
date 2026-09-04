@@ -86,6 +86,52 @@ public sealed record TaskDto(int Sequence, string IssueId, string Title, string 
     public DateTime UpdatedAt { get; init; }
 }
 public sealed record PendingTaskUpdateBatch(string? Description, TaskCommentDto[] Comments);
+public sealed record ClarificationChild(string Title, string Description, string Repository, string Rationale);
+public sealed record ClarificationDecision(string Action, string[] Repositories, ClarificationChild[] Children, string Rationale, double Confidence, bool Ambiguous);
+
+public static class ClarificationPolicy
+{
+    public static ClarificationDecision Parse(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        var action = root.GetProperty("action").GetString()?.Trim().ToLowerInvariant() ?? string.Empty;
+        var repositories = root.GetProperty("repositories").EnumerateArray().Select(item => item.GetString()?.Trim() ?? string.Empty).ToArray();
+        var children = root.GetProperty("children").EnumerateArray().Select(item => new ClarificationChild(
+            item.GetProperty("title").GetString()?.Trim() ?? string.Empty,
+            item.GetProperty("description").GetString()?.Trim() ?? string.Empty,
+            item.GetProperty("repository").GetString()?.Trim() ?? string.Empty,
+            item.GetProperty("rationale").GetString()?.Trim() ?? string.Empty)).ToArray();
+        var decision = new ClarificationDecision(action, repositories, children,
+            root.GetProperty("rationale").GetString()?.Trim() ?? string.Empty,
+            root.GetProperty("confidence").GetDouble(), root.GetProperty("ambiguous").GetBoolean());
+        Validate(decision);
+        return decision;
+    }
+
+    private static void Validate(ClarificationDecision decision)
+    {
+        if (string.IsNullOrWhiteSpace(decision.Rationale)) throw new InvalidDataException("Clarification requires a rationale.");
+        if (double.IsNaN(decision.Confidence) || decision.Confidence is < 0 or > 1) throw new InvalidDataException("Clarification confidence must be between 0 and 1.");
+        if (decision.Ambiguous) throw new InvalidDataException("Codex reported material repository ambiguity: " + decision.Rationale);
+        if (decision.Action == "assign")
+        {
+            if (decision.Repositories.Length == 0 || decision.Repositories.Any(string.IsNullOrWhiteSpace))
+                throw new InvalidDataException("Repository assignment requires at least one repository.");
+            if (decision.Repositories.Distinct(StringComparer.OrdinalIgnoreCase).Count() != decision.Repositories.Length)
+                throw new InvalidDataException("Repository assignment must not contain duplicate repositories.");
+            if (decision.Children.Length != 0) throw new InvalidDataException("Repository assignment must not contain split children.");
+            return;
+        }
+        if (decision.Action != "split") throw new InvalidDataException("Clarification action must be 'assign' or 'split'.");
+        if (decision.Repositories.Length != 0) throw new InvalidDataException("A split must describe repositories through its child tasks only.");
+        if (decision.Children.Length < 2) throw new InvalidDataException("A split requires at least two child tasks.");
+        if (decision.Children.Any(child => string.IsNullOrWhiteSpace(child.Title) || string.IsNullOrWhiteSpace(child.Description) || string.IsNullOrWhiteSpace(child.Repository) || string.IsNullOrWhiteSpace(child.Rationale)))
+            throw new InvalidDataException("Every split child requires a title, description, rationale, and exactly one repository.");
+        var unique = decision.Children.Select(child => child.Repository).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+        if (unique != decision.Children.Length) throw new InvalidDataException("Each split child must own a unique repository.");
+    }
+}
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
 public sealed record PullRequestState(string Url, string Repository);
 public sealed record ReviewFeedback(string ThreadId, string CommentNodeId, long CommentDatabaseId, string Body, string Url);
@@ -147,6 +193,8 @@ public sealed class Job
     public string? PendingDescription { get; set; }
     public List<TaskCommentDto> PendingHumanComments { get; set; } = [];
     public bool TaskUpdateWindowClosed { get; set; }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public bool TaskUpdateInFlight { get; set; }
     public bool BlockedReassessmentAttempted { get; set; }
 }
 
@@ -188,6 +236,8 @@ public static class TaskUpdatePolicy
 
     public static bool HasPending(Job job) => job.PendingDescription is not null || job.PendingHumanComments.Count > 0;
     public static PendingTaskUpdateBatch Capture(Job job) => new(job.PendingDescription, [.. job.PendingHumanComments]);
+    public static void BeginApplying(Job job) => job.TaskUpdateInFlight = true;
+    public static void EndApplying(Job job) => job.TaskUpdateInFlight = false;
     public static void MarkDelivered(Job job, PendingTaskUpdateBatch batch)
     {
         if (batch.Description is not null && string.Equals(job.PendingDescription, batch.Description, StringComparison.Ordinal)) job.PendingDescription = null;
@@ -195,7 +245,9 @@ public static class TaskUpdatePolicy
         job.PendingHumanComments.RemoveAll(comment => delivered.Contains(CommentKey(comment)));
     }
     public static string CommentKey(TaskCommentDto comment) => $"{comment.Timestamp.ToUniversalTime():O}\n{comment.Actor}\n{comment.Comment}";
-    public static string DashboardPhase(Job job, string phase) => HasPending(job) ? "Clarification queued" : phase;
+    public static string DashboardPhase(Job job, string phase) => job.TaskUpdateInFlight
+        ? "Applying task update"
+        : HasPending(job) ? "Task update queued" : phase;
 }
 
 public static class BlockedReassessmentPolicy
@@ -609,6 +661,7 @@ public static class BlockedWorkspaceAdoption
         candidate.PendingDescription = null;
         candidate.PendingHumanComments.Clear();
         candidate.TaskUpdateWindowClosed = false;
+        candidate.TaskUpdateInFlight = false;
         candidate.BlockedReassessmentAttempted = false;
         return candidate;
     }
