@@ -423,6 +423,12 @@ public static class DashboardSegments
 
     public static string FormatUpdateTimestamp(DateTimeOffset localTime) => localTime.ToString("h:mm tt", CultureInfo.InvariantCulture);
 
+    public static string FormatElapsed(TimeSpan elapsed)
+    {
+        var wholeSeconds = TimeSpan.FromSeconds(Math.Max(0, Math.Floor(elapsed.TotalSeconds)));
+        return wholeSeconds.ToString("g", CultureInfo.InvariantCulture);
+    }
+
     public static ConsoleSegment[] JobHeader(Job job, string phase, TimeSpan elapsed) =>
     [
         new($"#{job.Task.Sequence}", Tag),
@@ -430,7 +436,7 @@ public static class DashboardSegments
         new(job.Task.Title, Title),
         new(" [", Structural),
         new(phase, Tag),
-        new($"] {elapsed:g}", Structural)
+        new($"] {FormatElapsed(elapsed)}", Structural)
     ];
 
     public static ConsoleSegment[] RepositoryLine(string repositories, string? pullRequests) =>
