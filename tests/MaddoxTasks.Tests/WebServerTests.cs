@@ -183,6 +183,8 @@ public sealed class WebServerTests
     {
         var html = WebAssets.IndexHtml;
 
+        Assert.Contains("id=\"edit-status\"", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("id=\"done-button\"", html, StringComparison.Ordinal);
         Assert.Contains("id=\"locks-button\"", html, StringComparison.Ordinal);
         Assert.Contains("/api/repository-locks", html, StringComparison.Ordinal);
         Assert.Contains("repository-tag", html, StringComparison.Ordinal);
