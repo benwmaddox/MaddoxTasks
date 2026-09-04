@@ -494,6 +494,12 @@ public sealed class WorkerHost
     {
         while (!ct.IsCancellationRequested)
         {
+            foreach (var job in SnapshotCleanupPending())
+            {
+                try { await CleanupAsync(job, ct); }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch (Exception exception) { log.Write("warning", "job.cleanup.deferred", new { job.Task.Sequence, error = exception.Message }); }
+            }
             foreach (var job in SnapshotJobs(JobPhases.Monitoring))
             {
                 try { await MonitorJobAsync(job, ct); }
@@ -524,9 +530,11 @@ public sealed class WorkerHost
         if (job.PullRequests.Count > 0 && snapshots.All(snapshot => snapshot.Merged))
         {
             await ReconcileAsync(ct);
-            await CleanupAsync(job, ct);
-            await ChangeStatusAsync(job, "Done", ct);
+            job.CleanupPending = true;
             SetPhase(job, JobPhases.Done);
+            try { await CleanupAsync(job, ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception exception) { log.Write("warning", "job.cleanup.deferred", new { job.Task.Sequence, error = exception.Message }); }
             return;
         }
 
@@ -571,13 +579,24 @@ public sealed class WorkerHost
 
     private async Task CleanupAsync(Job job, CancellationToken ct)
     {
+        var forceAllowed = WorkspaceCleanupPolicy.IsProvenOwned(job, config.Current.WorktreeRoot);
         foreach (var workspace in job.Workspaces)
         {
             var source = Path.GetFullPath(Path.Combine(config.Current.RepoRoot, workspace.Repository));
-            if (Directory.Exists(workspace.Directory)) await RequireAsync("git", ["worktree", "remove", workspace.Directory], source, ct);
+            if (Directory.Exists(workspace.Directory))
+            {
+                var remove = await processes.RunAsync("git", ["worktree", "remove", workspace.Directory], source, ct);
+                if (remove.ExitCode != 0)
+                {
+                    if (!forceAllowed) throw new InvalidOperationException("Cleanup ownership could not be proven: " + workspace.Directory);
+                    await RequireAsync("git", ["worktree", "remove", "--force", workspace.Directory], source, ct);
+                }
+            }
             var branch = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{workspace.Branch}"], source, ct);
             if (branch.ExitCode == 0) await RequireAsync("git", ["branch", "-D", workspace.Branch], source, ct);
         }
+        job.CleanupPending = false;
+        Save(job);
         log.Write("info", "job.cleaned", new { job.Task.Sequence });
     }
 
@@ -707,6 +726,7 @@ public sealed class WorkerHost
     }
     private void Save(Job job) { lock (journalGate) journal.Save(journalPath); _ = RenderAsync(); }
     private Job[] SnapshotJobs(string phase) { lock (journalGate) return journal.Jobs.Where(job => job.Phase == phase).ToArray(); }
+    private Job[] SnapshotCleanupPending() { lock (journalGate) return WorkspaceCleanupPolicy.Pending(journal.Jobs).ToArray(); }
     private async Task RenderAsync()
     {
         if (Console.IsOutputRedirected) return;

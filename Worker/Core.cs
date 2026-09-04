@@ -134,6 +134,28 @@ public sealed class Job
     public Dictionary<string, string> ExecutionStartHeads { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public bool PullRequestCommentRecorded { get; set; }
     public bool CodexResultCommentRecorded { get; set; }
+    public bool CleanupPending { get; set; }
+}
+
+public static class WorkspaceCleanupPolicy
+{
+    public static bool IsProvenOwned(Job job, string worktreeRoot)
+    {
+        if (job.Workspaces.Count == 0) return false;
+        var root = Path.GetFullPath(worktreeRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var repositories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var workspace in job.Workspaces)
+        {
+            if (string.IsNullOrWhiteSpace(workspace.Repository) || string.IsNullOrWhiteSpace(workspace.Directory) || string.IsNullOrWhiteSpace(workspace.Branch)) return false;
+            string path; try { path = Path.GetFullPath(workspace.Directory); } catch { return false; }
+            if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !paths.Add(path) || !repositories.Add(workspace.Repository)) return false;
+            if (!workspace.Branch.StartsWith($"codex/task-{job.Task.Sequence}-", StringComparison.Ordinal)) return false;
+        }
+        return true;
+    }
+
+    public static IReadOnlyList<Job> Pending(IEnumerable<Job> jobs) => jobs.Where(job => job.Phase == JobPhases.Done && job.CleanupPending).ToArray();
 }
 
 public sealed class PublicationProgress
