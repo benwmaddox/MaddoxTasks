@@ -97,6 +97,7 @@ Supported `type` values (all available agent commands):
 - `AddLabel`
 - `RemoveLabel`
 - `SetRepositoryLabels`
+- `SplitIssue`
 - `UpdateDescription`
 - `AddComment`
 - `RequeueBlocked`
@@ -183,6 +184,21 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
 ```
 
 The nonempty repository list replaces only `repo:` labels. Values are normalized and deduplicated case-insensitively. Reservation conflicts are checked in the same event-store transaction, so failure leaves all labels unchanged. The success response includes the canonical `repositories` array.
+
+`SplitIssue`:
+
+```json
+{
+  "type": "SplitIssue",
+  "issueId": "1",
+  "children": [
+    { "title": "Update Alpha", "description": "Apply the change to Alpha.", "repository": "Alpha" },
+    { "title": "Update Beta", "description": "Apply the change to Beta.", "repository": "Beta" }
+  ]
+}
+```
+
+At least two children are required. Each child must have a nonempty title and description and exactly one repository; repositories must be unique case-insensitively. Children inherit the source priority, start in `Next`, and use the source as `parentId`. The source becomes `Done`. Existing `IssueCreated`, `RepositoryLabelsSet`, and `StatusChanged` events are appended as one atomic transaction, so any validation or reservation conflict leaves the source and all prospective children unchanged.
 
 `UpdateDescription`:
 

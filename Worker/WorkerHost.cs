@@ -165,7 +165,7 @@ public sealed class WorkerHost
     {
         var repair = mode == RecoveryMode.ResumeRepair;
         var resume = mode is RecoveryMode.ResumeInitial or RecoveryMode.ResumeRepair;
-        if (job.Task.Repositories.Length == 0) await ClarifyAsync(job, ct);
+        if (job.Task.Repositories.Length == 0 && !await ClarifyAsync(job, ct)) return;
         if (job.Task.Repositories.Length == 0 || job.Phase == JobPhases.Blocked) return;
         if (job.Workspaces.Count == 0)
         {
@@ -213,15 +213,28 @@ public sealed class WorkerHost
         var arguments = resume && job.ThreadId is not null
             ? new List<string> { "exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", envelope }
             : BuildInitialCodexArguments(job, schema, envelope);
-        var run = await RunCodexAsync(job, arguments, ct);
-        if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + run.Error.Trim());
-        if (resumeBatch is not null)
+        ExecResult run;
+        string resultJson;
+        if (resumeBatch is not null) TaskUpdatePolicy.BeginApplying(job);
+        try
         {
-            lock (journalGate)
+            await RenderAsync();
+            run = await RunCodexAsync(job, arguments, ct);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + run.Error.Trim());
+            resultJson = ExtractResult(run.Output);
+            if (resumeBatch is not null)
             {
-                TaskUpdatePolicy.MarkDelivered(job, resumeBatch);
-                journal.Save(journalPath);
+                lock (journalGate)
+                {
+                    TaskUpdatePolicy.MarkDelivered(job, resumeBatch);
+                    journal.Save(journalPath);
+                }
             }
+        }
+        finally
+        {
+            if (resumeBatch is not null) TaskUpdatePolicy.EndApplying(job);
+            await RenderAsync();
         }
         if (!job.ExactReservationOwnerRecorded && job.ThreadId is not null)
         {
@@ -229,7 +242,6 @@ public sealed class WorkerHost
             job.ExactReservationOwnerRecorded = true;
             Save(job);
         }
-        var resultJson = ExtractResult(run.Output);
         resultJson = await DeliverPendingTaskUpdatesAsync(job, resultJson, schema, ct);
         await CleanIgnoredGeneratedOutputsAsync(job, ct);
         job.PendingResultJson = resultJson;
@@ -260,12 +272,24 @@ public sealed class WorkerHost
             var batch = TaskUpdatePolicy.Capture(job);
             var update = BuildTaskUpdatePrompt(batch);
             var prompt = "Reassess the blocked result after worker-owned best-effort ignored-output cleanup. Cleanup failures or ignored generated residue are warnings, not blockers. Return completed or noChanges unless another substantive implementation blocker remains."
-                + (string.IsNullOrWhiteSpace(update) ? string.Empty : "\n\nInclude this newly queued human clarification in the reassessment:\n" + update)
+                + (string.IsNullOrWhiteSpace(update) ? string.Empty : "\n\nInclude this newly queued human task update in the reassessment:\n" + update)
                 + "\nReturn the normal required structured result schema.";
-            var run = await RunContinuationAsync(job, schema, prompt, ct);
-            if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + run.Error.Trim());
-            var reassessedJson = ExtractResult(run.Output);
-            TaskUpdatePolicy.MarkDelivered(job, batch);
+            var applyingTaskUpdate = TaskUpdatePolicy.HasPending(job);
+            if (applyingTaskUpdate) TaskUpdatePolicy.BeginApplying(job);
+            string reassessedJson;
+            try
+            {
+                await RenderAsync();
+                var run = await RunContinuationAsync(job, schema, prompt, ct);
+                if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + run.Error.Trim());
+                reassessedJson = ExtractResult(run.Output);
+                if (applyingTaskUpdate) TaskUpdatePolicy.MarkDelivered(job, batch);
+            }
+            finally
+            {
+                if (applyingTaskUpdate) TaskUpdatePolicy.EndApplying(job);
+                await RenderAsync();
+            }
             job.PendingResultJson = reassessedJson;
             Save(job);
             await CleanIgnoredGeneratedOutputsAsync(job, ct);
@@ -334,13 +358,23 @@ public sealed class WorkerHost
                 batch = TaskUpdatePolicy.Capture(job);
             }
             var prompt = BuildTaskUpdatePrompt(batch) + "\nContinue the same task with these updates and return the normal required structured result schema.";
-            var run = await RunContinuationAsync(job, schema, prompt, ct);
-            if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + run.Error.Trim());
-            resultJson = ExtractResult(run.Output);
-            lock (journalGate)
+            TaskUpdatePolicy.BeginApplying(job);
+            try
             {
-                TaskUpdatePolicy.MarkDelivered(job, batch);
-                journal.Save(journalPath);
+                await RenderAsync();
+                var run = await RunContinuationAsync(job, schema, prompt, ct);
+                if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + run.Error.Trim());
+                resultJson = ExtractResult(run.Output);
+                lock (journalGate)
+                {
+                    TaskUpdatePolicy.MarkDelivered(job, batch);
+                    journal.Save(journalPath);
+                }
+            }
+            finally
+            {
+                TaskUpdatePolicy.EndApplying(job);
+                await RenderAsync();
             }
         }
     }
@@ -357,26 +391,37 @@ public sealed class WorkerHost
         return "HUMAN TASK UPDATES (ordered, authoritative delta):\n" + JsonSerializer.Serialize(new { descriptionReplacement = batch.Description, userComments = batch.Comments });
     }
 
-    private async Task ClarifyAsync(Job job, CancellationToken ct)
+    private async Task<bool> ClarifyAsync(Job job, CancellationToken ct)
     {
         SetPhase(job, JobPhases.Clarifying);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(config.Current.ClarificationTimeout);
         var schema = WriteSchema("clarify", ClarifySchema);
-        var prompt = $"Read-only investigation. Given this exact task JSON, identify the smallest unambiguous repository directory set beneath {config.Current.RepoRoot}. Do not edit anything.\n{JsonSerializer.Serialize(job.Task)}";
+        var prompt = $"Read-only investigation. Given this exact task JSON, identify the smallest unambiguous repository directory set beneath {config.Current.RepoRoot}. Do not edit anything. Choose action=assign when the objective should remain one task, including tightly coupled multi-repository work. Choose action=split only when each repository has a genuinely independently executable objective; a split must create exactly one child task per repository, with at least two children and no repository repeated.\n{JsonSerializer.Serialize(job.Task)}";
         ExecResult run;
         try { run = await RunCodexAsync(job, ["exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--sandbox", "read-only", "--skip-git-repo-check", "-C", config.Current.RepoRoot, prompt], timeout.Token); }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException("Repository clarification timed out."); }
         if (run.ExitCode != 0) throw new InvalidOperationException("Repository clarification failed: " + run.Error.Trim());
-        using var document = JsonDocument.Parse(ExtractResult(run.Output));
-        var root = document.RootElement;
-        var repositories = root.GetProperty("repositories").EnumerateArray().Select(value => value.GetString()!).ToArray();
-        if (root.GetProperty("ambiguous").GetBoolean() || repositories.Length == 0) throw new InvalidOperationException("Codex could not determine an unambiguous repository: " + root.GetProperty("rationale").GetString());
-        foreach (var repository in repositories) await ValidateRepositoryAsync(repository, ct);
-        var response = await RunCommandAsync(new { type = "SetRepositoryLabels", issueId = job.Task.IssueId, repositories }, null, ct);
-        if (response.ExitCode != 0 || !TryReadSuccess(response.Output)) throw new InvalidOperationException("Repository assignment failed: " + response.Output.Trim() + response.Error.Trim());
-        job.Task = job.Task with { Repositories = repositories };
+        var decision = ClarificationPolicy.Parse(ExtractResult(run.Output));
+        var proposedRepositories = decision.Action == "split"
+            ? decision.Children.Select(child => child.Repository).ToArray()
+            : decision.Repositories;
+        foreach (var repository in proposedRepositories) await ValidateRepositoryAsync(repository, ct);
+
+        if (decision.Action == "split")
+        {
+            var children = decision.Children.Select(child => new { child.Title, child.Description, child.Repository }).ToArray();
+            var response = await RunCommandAsync(new { type = "SplitIssue", issueId = job.Task.IssueId, children }, null, ct);
+            if (response.ExitCode != 0 || !TryReadSuccess(response.Output)) throw new InvalidOperationException("Task split failed: " + response.Output.Trim() + response.Error.Trim());
+            SetPhase(job, JobPhases.Done);
+            return false;
+        }
+
+        var assignment = await RunCommandAsync(new { type = "SetRepositoryLabels", issueId = job.Task.IssueId, repositories = decision.Repositories }, null, ct);
+        if (assignment.ExitCode != 0 || !TryReadSuccess(assignment.Output)) throw new InvalidOperationException("Repository assignment failed: " + assignment.Output.Trim() + assignment.Error.Trim());
+        job.Task = job.Task with { Repositories = decision.Repositories };
         Save(job);
+        return true;
     }
 
     private async Task ValidateRepositoryAsync(string repository, CancellationToken ct)
@@ -709,6 +754,8 @@ public sealed class WorkerHost
 
     private async Task CleanupAsync(Job job, CancellationToken ct)
     {
+        if (!WorkspaceCleanupPolicy.CanDelete(job))
+            throw new InvalidOperationException("Destructive workspace cleanup is allowed only for completed jobs with pending cleanup.");
         var forceAllowed = WorkspaceCleanupPolicy.IsProvenOwned(job, config.Current.WorktreeRoot);
         foreach (var workspace in job.Workspaces)
         {
@@ -965,6 +1012,6 @@ public sealed class WorkerHost
     private static string WriteSchema(string name, string body) { var path = Path.Combine(Path.GetTempPath(), $"maddox-{name}-schema.json"); File.WriteAllText(path, body); return path; }
     private sealed record WorkItem(Job Job, RecoveryMode Mode);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
-    private const string ClarifySchema = """{"type":"object","properties":{"repositories":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"},"confidence":{"type":"number"},"ambiguous":{"type":"boolean"}},"required":["repositories","rationale","confidence","ambiguous"],"additionalProperties":false}""";
+    private const string ClarifySchema = """{"type":"object","properties":{"action":{"enum":["assign","split"]},"repositories":{"type":"array","items":{"type":"string"}},"children":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"repository":{"type":"string"},"rationale":{"type":"string"}},"required":["title","description","repository","rationale"],"additionalProperties":false}},"rationale":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"ambiguous":{"type":"boolean"}},"required":["action","repositories","children","rationale","confidence","ambiguous"],"additionalProperties":false}""";
     private const string ResultSchema = """{"type":"object","properties":{"status":{"enum":["completed","noChanges","blocked"]},"summary":{"type":"string"},"validationEvidence":{"type":"array","items":{"type":"string"}},"repositories":{"type":"array","items":{"type":"object","properties":{"repository":{"type":"string"},"changed":{"type":"boolean"}},"required":["repository","changed"],"additionalProperties":false}},"commitMessage":{"type":"string"},"prTitle":{"type":"string"},"prBody":{"type":"string"},"checkDispositions":{"type":"array","items":{"type":"object","properties":{"checkId":{"type":"string"},"addressed":{"type":"boolean"},"summary":{"type":"string"}},"required":["checkId","addressed","summary"],"additionalProperties":false}},"threadDispositions":{"type":"array","items":{"type":"object","properties":{"threadId":{"type":"string"},"addressed":{"type":"boolean"},"replyBody":{"type":"string"}},"required":["threadId","addressed","replyBody"],"additionalProperties":false}}},"required":["status","summary","validationEvidence","repositories","commitMessage","prTitle","prBody","checkDispositions","threadDispositions"],"additionalProperties":false}""";
 }

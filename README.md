@@ -207,6 +207,21 @@ Atomically replace only an issue's repository labels while preserving every othe
 
 The repository list must be nonempty. Names are normalized and deduplicated case-insensitively, and the entire command is rejected without changes if any requested repository is reserved by another `Active` or `ReadyForReview` issue.
 
+Atomically replace a coordination issue with one independently executable child per repository:
+
+```json
+{
+  "type": "SplitIssue",
+  "issueId": "1",
+  "children": [
+    { "title": "Update Alpha", "description": "Apply the change to Alpha.", "repository": "Alpha" },
+    { "title": "Update Beta", "description": "Apply the change to Beta.", "repository": "Beta" }
+  ]
+}
+```
+
+A split requires at least two children. Every child inherits the parent priority, starts in `Next`, references the source as its parent, and owns exactly one repository that no sibling may repeat case-insensitively. On success the source becomes `Done`. Validation, child creation, repository-label assignment, and source completion are one transaction; any failure writes nothing.
+
 Requeue every currently `Blocked` issue to `Next` in one atomic command:
 
 ```json
@@ -256,6 +271,10 @@ Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly
 local shutdown. The visible dashboard keeps recently blocked work for
 `blockedDisplayDuration` (10 minutes by default), then rolls it off while the
 durable journal and JSONL logs retain the full record.
+Blocked jobs retain their owned worktrees and branches, including tracked changes
+and non-ignored untracked files, for diagnosis or later recovery. Destructive
+worktree and branch cleanup is eligible only after the job reaches `Done`;
+best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
 
