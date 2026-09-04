@@ -120,6 +120,23 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void Journal_LoadsLegacyJobsWithoutTaskUpdateState()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "journal.json");
+        File.WriteAllText(path, """
+        {"Jobs":[{"Task":{"Sequence":1,"IssueId":"issue","Title":"Task","Description":"original","Repositories":["Repo"]},"Phase":"Implementing","StartedUtc":"2026-09-04T12:00:00Z","Prompt":"prompt","Model":"model","Effort":"medium"}]}
+        """);
+
+        var job = Assert.Single(Journal.Load(path).Jobs);
+        Assert.Null(job.ObservedDescription);
+        Assert.Empty(job.ProcessedHumanCommentKeys);
+        Assert.Empty(job.PendingHumanComments);
+        Assert.False(job.TaskUpdateWindowClosed);
+        Assert.False(job.BlockedReassessmentAttempted);
+    }
+
+    [Fact]
     public void PublicationPolicy_RecoversCommitPushAndPullRequestProgress()
     {
         var progress = new PublicationProgress { CommitCreated = true, Pushed = true, PullRequestUrl = "https://github.com/o/r/pull/1" };
@@ -285,11 +302,119 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void CodexTerminalEventTracker_RequiresStructuredResultBeforeTerminalEvent()
+    {
+        var tracker = new CodexTerminalEventTracker();
+        Assert.False(tracker.Observe("{\"type\":\"turn.completed\"}"));
+        Assert.False(tracker.Observe("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"done\\\"}\"}}"));
+        Assert.True(tracker.Observe("{\"type\":\"turn.completed\"}"));
+
+        var legacy = new CodexTerminalEventTracker();
+        Assert.True(legacy.Observe("{\"type\":\"task_complete\",\"status\":\"blocked\",\"summary\":\"needs input\"}"));
+
+        var session = new CodexTerminalEventTracker();
+        Assert.True(session.Observe("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"{\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"done\\\"}\"}}"));
+
+        var clarification = new CodexTerminalEventTracker();
+        Assert.False(clarification.Observe("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"repositories\\\":[\\\"StasisLang\\\"],\\\"ambiguous\\\":false}\"}}"));
+        Assert.True(clarification.Observe("{\"type\":\"turn.completed\"}"));
+    }
+
+    [Fact]
+    public void TaskUpdatePolicy_SeedsNewClaimsAndQueuesOnlyNewHumanUpdates()
+    {
+        var started = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var old = new TaskCommentDto(started.AddMinutes(-1), "old", "user");
+        var worker = new TaskCommentDto(started.AddMinutes(1), "worker status", "maddox-worker");
+        var claimed = new TaskDto(1, "issue", "Task", "original", ["Repo"]) { Comments = [old], UpdatedAt = started };
+        var job = CreateJob(JobPhases.Implementing, started);
+        TaskUpdatePolicy.Seed(job, claimed);
+
+        var live = claimed with { Description = "replacement", Comments = [old, worker, new TaskCommentDto(started.AddMinutes(2), "please adjust", "USER")], UpdatedAt = started.AddMinutes(2) };
+        Assert.True(TaskUpdatePolicy.Ingest(job, live));
+        Assert.Equal("replacement", job.PendingDescription);
+        Assert.Equal("please adjust", Assert.Single(job.PendingHumanComments).Comment);
+        Assert.False(TaskUpdatePolicy.Ingest(job, live));
+        Assert.Equal("Clarification queued", TaskUpdatePolicy.DashboardPhase(job, job.Phase));
+
+        var batch = TaskUpdatePolicy.Capture(job);
+        TaskUpdatePolicy.MarkDelivered(job, batch);
+        Assert.False(TaskUpdatePolicy.HasPending(job));
+    }
+
+    [Fact]
+    public void TaskUpdatePolicy_LegacyRecoveryOnlyQueuesHumanCommentsAfterStart()
+    {
+        var started = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var job = CreateJob(JobPhases.Implementing, started);
+        var live = job.Task with
+        {
+            Comments =
+            [
+                new TaskCommentDto(started.AddMinutes(-1), "before claim", "user"),
+                new TaskCommentDto(started.AddMinutes(1), "after claim", "user"),
+                new TaskCommentDto(started.AddMinutes(2), "agent output", "gpt-5.6-sol medium")
+            ],
+            UpdatedAt = started.AddMinutes(2)
+        };
+
+        Assert.True(TaskUpdatePolicy.Ingest(job, live));
+        Assert.Equal("after claim", Assert.Single(job.PendingHumanComments).Comment);
+        Assert.False(TaskUpdatePolicy.Ingest(job, live));
+    }
+
+    [Fact]
+    public void TaskUpdatePolicy_DeliveryAcknowledgementPreservesUpdatesArrivingInFlight()
+    {
+        var job = CreateJob();
+        job.PendingDescription = "first";
+        job.PendingHumanComments.Add(new TaskCommentDto(DateTime.UnixEpoch, "first", "user"));
+        var batch = TaskUpdatePolicy.Capture(job);
+        job.PendingDescription = "second";
+        job.PendingHumanComments.Add(new TaskCommentDto(DateTime.UnixEpoch.AddSeconds(1), "second", "user"));
+
+        TaskUpdatePolicy.MarkDelivered(job, batch);
+        Assert.Equal("second", job.PendingDescription);
+        Assert.Equal("second", Assert.Single(job.PendingHumanComments).Comment);
+    }
+
+    [Fact]
+    public void BlockedReassessmentPolicy_AllowsOnlyOneSameSessionAttempt()
+    {
+        var job = CreateJob(JobPhases.Publishing);
+        Assert.False(BlockedReassessmentPolicy.ShouldReassess(job, "blocked"));
+        job.ThreadId = "thread-1";
+        Assert.True(BlockedReassessmentPolicy.ShouldReassess(job, "blocked"));
+        job.BlockedReassessmentAttempted = true;
+        Assert.False(BlockedReassessmentPolicy.ShouldReassess(job, "blocked"));
+        Assert.False(BlockedReassessmentPolicy.ShouldReassess(job, "completed"));
+    }
+
+    [Fact]
     public void ExtractResult_ReadsCodexJsonlAgentMessage()
     {
         var output = "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"completed\\\"}\"}}\n{\"type\":\"turn.completed\"}";
         using var result = JsonDocument.Parse(WorkerHost.ExtractResult(output));
         Assert.Equal("completed", result.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public void ExtractResult_ReadsNestedSessionTaskComplete()
+    {
+        var output = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"{\\\"status\\\":\\\"noChanges\\\",\\\"summary\\\":\\\"already done\\\"}\"}}";
+        using var result = JsonDocument.Parse(WorkerHost.ExtractResult(output));
+        Assert.Equal("noChanges", result.RootElement.GetProperty("status").GetString());
+    }
+
+    [Fact]
+    public void TaskUpdatePrompt_ContainsDescriptionAndOrderedComments()
+    {
+        var batch = new PendingTaskUpdateBatch("ToddlerMatch only", [
+            new TaskCommentDto(DateTime.UnixEpoch, "first", "user"),
+            new TaskCommentDto(DateTime.UnixEpoch.AddSeconds(1), "second", "user")]);
+        var prompt = WorkerHost.BuildTaskUpdatePrompt(batch);
+        Assert.Contains("ToddlerMatch only", prompt);
+        Assert.True(prompt.IndexOf("first", StringComparison.Ordinal) < prompt.IndexOf("second", StringComparison.Ordinal));
     }
 
     [Fact]

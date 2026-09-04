@@ -7,10 +7,11 @@ using Microsoft.Win32.SafeHandles;
 namespace MaddoxTasks.Worker;
 
 public sealed record ExecResult(int ExitCode, string Output, string Error);
+public sealed record TerminalOutputDirective(Func<string, bool> IsTerminal, TimeSpan GracePeriod);
 
 public interface IProcessRunner
 {
-    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null);
+    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null);
 }
 
 public interface IChildProcessContainment : IDisposable { void Add(Process process); }
@@ -27,7 +28,7 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     private readonly IRollingLog log;
     public ProcessRunner(IChildProcessContainment containment, IRollingLog log) { this.containment = containment; this.log = log; }
 
-    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null)
+    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null)
     {
         var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
         log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, workingDirectory });
@@ -38,10 +39,34 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
         using var registration = cancellationToken.Register(() => { try { process.Kill(true); } catch { } });
         var output = new StringBuilder();
         var error = new StringBuilder();
-        var outputTask = ReadAsync(process.StandardOutput, output, outputLine);
+        var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var terminalObserved = false;
+        var outputTask = ReadAsync(process.StandardOutput, output, line =>
+        {
+            outputLine?.Invoke(line);
+            if (terminalOutput is not null && terminalOutput.IsTerminal(line))
+            {
+                terminalObserved = true;
+                terminal.TrySetResult();
+            }
+        });
         var errorTask = ReadAsync(process.StandardError, error, null);
-        await Task.WhenAll(outputTask, errorTask, process.WaitForExitAsync(cancellationToken));
-        var result = new ExecResult(process.ExitCode, output.ToString(), error.ToString());
+        var exitTask = process.WaitForExitAsync(cancellationToken);
+        if (terminalOutput is null) await exitTask;
+        else if (await Task.WhenAny(exitTask, terminal.Task) == terminal.Task)
+        {
+            var graceful = Task.Delay(terminalOutput.GracePeriod, cancellationToken);
+            if (await Task.WhenAny(exitTask, graceful) != exitTask)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                log.Write("warning", "process.terminal.force-kill", new { executable = Path.GetFileName(executable), gracePeriod = terminalOutput.GracePeriod });
+                try { process.Kill(true); } catch (InvalidOperationException) { }
+                await process.WaitForExitAsync(cancellationToken);
+            }
+        }
+        else await exitTask;
+        await Task.WhenAll(outputTask, errorTask);
+        var result = new ExecResult(terminalObserved ? 0 : process.ExitCode, output.ToString(), error.ToString());
         log.Write(result.ExitCode == 0 ? "info" : "error", "process.exit", new { executable = Path.GetFileName(executable), exitCode = result.ExitCode, outputLength = result.Output.Length, error = SafeError(result.Error) });
         return result;
     }

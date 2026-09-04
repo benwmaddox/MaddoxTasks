@@ -79,7 +79,13 @@ public sealed class ConfigState
     }
 }
 
-public sealed record TaskDto(int Sequence, string IssueId, string Title, string Description, string[] Repositories);
+public sealed record TaskCommentDto(DateTime Timestamp, string Comment, string Actor);
+public sealed record TaskDto(int Sequence, string IssueId, string Title, string Description, string[] Repositories)
+{
+    public TaskCommentDto[] Comments { get; init; } = [];
+    public DateTime UpdatedAt { get; init; }
+}
+public sealed record PendingTaskUpdateBatch(string? Description, TaskCommentDto[] Comments);
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
 public sealed record PullRequestState(string Url, string Repository);
 public sealed record ReviewFeedback(string ThreadId, string CommentNodeId, long CommentDatabaseId, string Body, string Url);
@@ -135,6 +141,66 @@ public sealed class Job
     public bool PullRequestCommentRecorded { get; set; }
     public bool CodexResultCommentRecorded { get; set; }
     public bool CleanupPending { get; set; }
+    public DateTime? ObservedTaskUpdatedAt { get; set; }
+    public string? ObservedDescription { get; set; }
+    public HashSet<string> ProcessedHumanCommentKeys { get; set; } = new(StringComparer.Ordinal);
+    public string? PendingDescription { get; set; }
+    public List<TaskCommentDto> PendingHumanComments { get; set; } = [];
+    public bool TaskUpdateWindowClosed { get; set; }
+    public bool BlockedReassessmentAttempted { get; set; }
+}
+
+public static class TaskUpdatePolicy
+{
+    public static bool AcceptsUpdates(Job job) => !job.TaskUpdateWindowClosed && job.Phase is JobPhases.Claimed or JobPhases.Clarifying or JobPhases.Implementing or JobPhases.Repairing;
+
+    public static void Seed(Job job, TaskDto task)
+    {
+        job.ObservedTaskUpdatedAt = task.UpdatedAt;
+        job.ObservedDescription = task.Description;
+        foreach (var comment in task.Comments) job.ProcessedHumanCommentKeys.Add(CommentKey(comment));
+    }
+
+    public static bool Ingest(Job job, TaskDto task)
+    {
+        var changed = false;
+        var legacy = job.ObservedDescription is null && job.ObservedTaskUpdatedAt is null;
+        if (legacy) { job.ObservedDescription = job.Task.Description; changed = true; }
+        if (!string.Equals(job.ObservedDescription, task.Description, StringComparison.Ordinal))
+        {
+            job.ObservedDescription = task.Description;
+            job.PendingDescription = task.Description;
+            changed = true;
+        }
+        foreach (var comment in task.Comments.OrderBy(comment => comment.Timestamp))
+        {
+            var key = CommentKey(comment);
+            if (!job.ProcessedHumanCommentKeys.Add(key)) continue;
+            changed = true;
+            if (!comment.Actor.Equals("user", StringComparison.OrdinalIgnoreCase)) continue;
+            if (legacy && comment.Timestamp <= job.StartedUtc) continue;
+            job.PendingHumanComments.Add(comment);
+        }
+        if (job.ObservedTaskUpdatedAt != task.UpdatedAt) changed = true;
+        job.ObservedTaskUpdatedAt = task.UpdatedAt;
+        return changed;
+    }
+
+    public static bool HasPending(Job job) => job.PendingDescription is not null || job.PendingHumanComments.Count > 0;
+    public static PendingTaskUpdateBatch Capture(Job job) => new(job.PendingDescription, [.. job.PendingHumanComments]);
+    public static void MarkDelivered(Job job, PendingTaskUpdateBatch batch)
+    {
+        if (batch.Description is not null && string.Equals(job.PendingDescription, batch.Description, StringComparison.Ordinal)) job.PendingDescription = null;
+        var delivered = batch.Comments.Select(CommentKey).ToHashSet(StringComparer.Ordinal);
+        job.PendingHumanComments.RemoveAll(comment => delivered.Contains(CommentKey(comment)));
+    }
+    public static string CommentKey(TaskCommentDto comment) => $"{comment.Timestamp.ToUniversalTime():O}\n{comment.Actor}\n{comment.Comment}";
+    public static string DashboardPhase(Job job, string phase) => HasPending(job) ? "Clarification queued" : phase;
+}
+
+public static class BlockedReassessmentPolicy
+{
+    public static bool ShouldReassess(Job job, string? status) => status == "blocked" && !job.BlockedReassessmentAttempted && !string.IsNullOrWhiteSpace(job.ThreadId);
 }
 
 public static class WorkspaceCleanupPolicy
@@ -537,6 +603,13 @@ public static class BlockedWorkspaceAdoption
         candidate.RepairStartedUtc = null;
         candidate.RepairAttemptsByPullRequest.Clear();
         candidate.RepairStartedUtcByPullRequest.Clear();
+        candidate.ObservedTaskUpdatedAt = null;
+        candidate.ObservedDescription = null;
+        candidate.ProcessedHumanCommentKeys.Clear();
+        candidate.PendingDescription = null;
+        candidate.PendingHumanComments.Clear();
+        candidate.TaskUpdateWindowClosed = false;
+        candidate.BlockedReassessmentAttempted = false;
         return candidate;
     }
 
@@ -569,5 +642,55 @@ public static class CodexEventParser
         if (text is null && root.TryGetProperty("item", out var item) && item.ValueKind == JsonValueKind.Object && item.TryGetProperty("text", out var itemText)) text = itemText.GetString();
         if (text is null && root.TryGetProperty("message", out var message) && message.ValueKind == JsonValueKind.String) text = message.GetString();
         return (threadId, text);
+    }
+}
+
+public sealed class CodexTerminalEventTracker
+{
+    private bool structuredResultObserved;
+    public bool Observe(string jsonLine)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(jsonLine);
+            var root = document.RootElement;
+            structuredResultObserved |= ContainsStructuredResult(root);
+            return structuredResultObserved && IsTerminalEvent(root);
+        }
+        catch (JsonException) { return false; }
+    }
+
+    private static bool ContainsStructuredResult(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            if (element.TryGetProperty("status", out var status) && status.ValueKind == JsonValueKind.String
+                && element.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.String) return true;
+            if (element.TryGetProperty("result", out var result))
+            {
+                if (result.ValueKind == JsonValueKind.Object) return true;
+                if (result.ValueKind == JsonValueKind.String && IsJsonObject(result.GetString())) return true;
+            }
+            if (element.TryGetProperty("item", out var item) && item.ValueKind == JsonValueKind.Object
+                && item.TryGetProperty("type", out var itemType) && itemType.GetString() == "agent_message"
+                && item.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String && IsJsonObject(text.GetString())) return true;
+            if (element.TryGetProperty("last_agent_message", out var lastMessage) && lastMessage.ValueKind == JsonValueKind.String && IsJsonObject(lastMessage.GetString())) return true;
+            if (element.TryGetProperty("payload", out var payload) && payload.ValueKind == JsonValueKind.Object && ContainsStructuredResult(payload)) return true;
+        }
+        return false;
+    }
+
+    private static bool IsTerminalEvent(JsonElement root)
+    {
+        var type = root.TryGetProperty("type", out var eventType) ? eventType.GetString() : null;
+        if (type is "turn.completed" or "task_complete") return true;
+        return type == "event_msg" && root.TryGetProperty("payload", out var payload) && payload.ValueKind == JsonValueKind.Object
+            && payload.TryGetProperty("type", out var payloadType) && payloadType.GetString() == "task_complete";
+    }
+
+    private static bool IsJsonObject(string? text)
+    {
+        try { using var document = JsonDocument.Parse(text ?? string.Empty); return document.RootElement.ValueKind == JsonValueKind.Object; }
+        catch (JsonException) { return false; }
     }
 }
