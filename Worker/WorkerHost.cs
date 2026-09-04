@@ -299,9 +299,9 @@ public sealed class WorkerHost
         if (inside.ExitCode != 0 || inside.Output.Trim() != "true" || remote.ExitCode != 0 || string.IsNullOrWhiteSpace(remote.Output)) throw new InvalidOperationException("Repository has no usable Git origin: " + repository);
     }
 
-    private static List<string> BuildInitialCodexArguments(Job job, string schema, string envelope)
+    public static List<string> BuildInitialCodexArguments(Job job, string schema, string envelope)
     {
-        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--sandbox", "workspace-write", "--approve-for-me", "-C", job.Workspaces[0].Directory };
+        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--approve-for-me", "-C", job.Workspaces[0].Directory };
         foreach (var workspace in job.Workspaces.Skip(1)) { arguments.Add("--add-dir"); arguments.Add(workspace.Directory); }
         arguments.Add(envelope);
         return arguments;

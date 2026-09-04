@@ -219,6 +219,29 @@ public sealed class WorkerPolicyTests
         gate.Release();
     }
 
+    [Fact]
+    public void InitialCodexArguments_UseApproveForMeWithoutConflictingSandboxOption()
+    {
+        var job = CreateJob();
+        job.Workspaces.Add(new Workspace("Repo", @"D:\code\Repo-worktree", "codex/task-1", "https://github.com/example/Repo.git"));
+
+        var arguments = WorkerHost.BuildInitialCodexArguments(job, "schema.json", "prompt");
+
+        Assert.Contains("--approve-for-me", arguments);
+        Assert.DoesNotContain("--sandbox", arguments);
+    }
+
+    [Fact]
+    public void ProcessArguments_AddExactSafeDirectoryForGitOnly()
+    {
+        var workingDirectory = Path.GetFullPath(@"D:\code\Repo");
+        var git = ProcessArguments.Prepare("git", ["status", "--porcelain"], workingDirectory);
+        var codex = ProcessArguments.Prepare("codex", ["--version"], workingDirectory);
+
+        Assert.Equal(["-c", $"safe.directory={workingDirectory.Replace('\\', '/')}", "status", "--porcelain"], git);
+        Assert.Equal(["--version"], codex);
+    }
+
     private static Job CreateJob(string phase = JobPhases.Claimed, DateTime? started = null) => new()
     {
         Task = new TaskDto(1, Guid.NewGuid().ToString(), "Task", "Description", ["Repo"]),
