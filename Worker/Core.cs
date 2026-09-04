@@ -412,6 +412,23 @@ public static class DashboardPolicy
     private static DateTime ChangedAt(Job job) => job.PhaseChangedUtc > DateTime.MinValue ? job.PhaseChangedUtc : job.StartedUtc;
 }
 
+public static class MonitoringDisplay
+{
+    public static string Describe(Job job, DateTime nowUtc, TimeSpan quietPeriod, bool autoMergeAllowed)
+    {
+        if (job.ReadyForReviewRecorded)
+            return autoMergeAllowed ? "Ready to auto-merge" : "Waiting for your PR decision";
+        if (job.ReviewWindow.GreenSinceUtc is not { } greenSince)
+            return "Waiting on CI/review window";
+
+        var remaining = quietPeriod - (nowUtc - greenSince);
+        if (remaining <= TimeSpan.Zero)
+            return "Waiting on CI/review window";
+        var minutes = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
+        return $"Waiting on CI/review window · {minutes}m left";
+    }
+}
+
 public sealed record ConsoleSegment(string Text, ConsoleColor Color);
 
 public static class DashboardSegments
