@@ -36,10 +36,12 @@ public sealed record WorkerConfig(
     string GhExe,
     string RepoRoot,
     string WorktreeRoot,
-    TimeSpan? BlockedDisplayDuration = null)
+    TimeSpan? BlockedDisplayDuration = null,
+    TimeSpan? CapacityFillInterval = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
+    public TimeSpan EffectiveCapacityFillInterval => CapacityFillInterval ?? TimeSpan.FromMinutes(1);
 
     public static WorkerConfig Load(string path)
     {
@@ -59,6 +61,7 @@ public sealed record WorkerConfig(
         if (RepairMaxAttempts < 1 || RepairMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("Repair bounds must be positive.");
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
         if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
+        if (CapacityFillInterval is { } capacityFillInterval && capacityFillInterval <= TimeSpan.Zero) throw new InvalidDataException("capacityFillInterval must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");
@@ -521,6 +524,69 @@ public sealed class FreshClaimAllowance
         if (used || !capacity.TryReserve()) return false;
         used = true;
         return true;
+    }
+}
+
+public enum FreshClaimOutcome
+{
+    NotAttempted,
+    ClaimedWithSpareCapacity,
+    ClaimedAtCapacity,
+    Unavailable
+}
+
+public sealed class ClaimCadence
+{
+    private readonly DateTime startedUtc;
+    private DateTime? lastStartupClaimUtc;
+    private DateTime normalAnchorUtc;
+
+    public ClaimCadence(DateTime startedUtc)
+    {
+        this.startedUtc = startedUtc;
+        normalAnchorUtc = startedUtc;
+    }
+
+    public bool StartupFillActive { get; private set; } = true;
+
+    public DateTime NextTickUtc(WorkerConfig config) => StartupFillActive
+        ? lastStartupClaimUtc is { } claimedUtc ? claimedUtc + config.EffectiveCapacityFillInterval : startedUtc
+        : normalAnchorUtc + config.ClaimInterval;
+
+    public bool IsDue(DateTime nowUtc, WorkerConfig config) => nowUtc >= NextTickUtc(config);
+
+    public void CompleteAutomaticTick(FreshClaimOutcome outcome, DateTime nowUtc, int active, int limit)
+    {
+        if (StartupFillActive)
+        {
+            if (outcome == FreshClaimOutcome.ClaimedWithSpareCapacity && limit > 0 && active < limit)
+            {
+                lastStartupClaimUtc = nowUtc;
+                return;
+            }
+
+            StartupFillActive = false;
+        }
+
+        normalAnchorUtc = nowUtc;
+    }
+
+    public void CompleteManualTick(FreshClaimOutcome outcome, DateTime nowUtc, int active, int limit)
+    {
+        if (StartupFillActive)
+        {
+            if (outcome != FreshClaimOutcome.ClaimedAtCapacity && limit > 0 && active < limit) return;
+            StartupFillActive = false;
+        }
+
+        normalAnchorUtc = nowUtc;
+    }
+
+    public void EndStartupFillIfAtCapacity(DateTime nowUtc, int active, int limit)
+    {
+        if (!StartupFillActive || limit > 0 && active < limit) return;
+        StartupFillActive = false;
+        normalAnchorUtc = nowUtc;
     }
 }
 

@@ -264,7 +264,12 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 .\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
-The worker claims at most one fresh task per scheduling tick. Set
+On startup, the worker claims at most one fresh task immediately, then attempts
+one additional fresh claim per `capacityFillInterval` (one minute by default)
+while capacity remains. Reaching the concurrency cap or receiving an empty or
+failed claim ends this startup ramp; subsequent capacity openings do not restart
+it. Afterward, fresh claims return to the normal `claimInterval` cadence, still
+at most one per tick. Follow-up work remains immediate and takes priority. Set
 `maxConcurrentCodexProcesses` to `0` to pause new Codex work while keeping PR
 monitoring and reconciliation active; running Codex processes drain naturally.
 Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly
