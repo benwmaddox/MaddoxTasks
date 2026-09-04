@@ -18,6 +18,7 @@ public sealed class WorkerHost
     private readonly HashSet<string> queued = new(StringComparer.Ordinal);
     private readonly object journalGate = new();
     private readonly object queueGate = new();
+    private readonly object wakeGate = new();
     private readonly SemaphoreSlim wakeScheduler = new(0, 1);
     private readonly SemaphoreSlim renderLock = new(1, 1);
     private readonly CancellationTokenSource stop = new();
@@ -25,6 +26,7 @@ public sealed class WorkerHost
     private volatile bool paused;
     private volatile string? configError;
     private DateTime nextTickUtc;
+    private SchedulerWakeReason pendingWakeReasons;
 
     public WorkerHost(string configPath, string? stateDirectory = null, IClock? clock = null, IProcessRunner? processes = null, IRollingLog? log = null, IGitHubClient? github = null)
     {
@@ -49,14 +51,29 @@ public sealed class WorkerHost
         await PreflightAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct) };
+        var cadence = new ClaimCadence(clock.UtcNow);
+        var wakeReasons = SchedulerWakeReason.Timer;
+        _ = TakeSchedulerWakeReasons();
         try
         {
             while (!ct.IsCancellationRequested)
             {
-                await TickAsync(ct);
-                nextTickUtc = clock.UtcNow + config.Current.ClaimInterval;
+                var now = clock.UtcNow;
+                cadence.EndStartupFillIfAtCapacity(now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                var automaticDue = cadence.IsDue(now, config.Current);
+                var manual = wakeReasons.HasFlag(SchedulerWakeReason.Manual);
+                var followup = !followups.IsEmpty;
+                if (automaticDue || manual || followup)
+                {
+                    var outcome = await TickAsync(ct, automaticDue || manual);
+                    now = clock.UtcNow;
+                    if (automaticDue) cadence.CompleteAutomaticTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                    else if (manual) cadence.CompleteManualTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                }
+                cadence.EndStartupFillIfAtCapacity(clock.UtcNow, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                nextTickUtc = cadence.NextTickUtc(config.Current);
                 await RenderAsync();
-                await WaitForTickAsync(config.Current.ClaimInterval, ct);
+                wakeReasons = await WaitForTickAsync(nextTickUtc - clock.UtcNow, ct);
             }
         }
         finally
@@ -69,27 +86,38 @@ public sealed class WorkerHost
 
     public void RequestStop() => stop.Cancel();
 
-    internal async Task TickAsync(CancellationToken ct)
+    internal async Task<FreshClaimOutcome> TickAsync(CancellationToken ct, bool allowFreshClaim = true)
     {
         log.Write("info", "scheduler.tick", new { active = capacity.Active, queued = followups.Count, paused });
         await ReconcileAsync(ct);
         DrainFollowups(ct);
-        if (paused) return;
+        if (paused || !allowFreshClaim) return FreshClaimOutcome.NotAttempted;
         var freshClaim = new FreshClaimAllowance();
         if (freshClaim.TryReserve(capacity))
         {
+            var admittedWithSpareCapacity = capacity.Active < config.Current.MaxConcurrentCodexProcesses;
             if (!ClaimAdmission.TrySnapshot(config.Current, configPath, out var claimSnapshot, out var promptError))
             {
                 configError = "Cannot claim: " + promptError;
                 log.Write("error", "claim.prompt.rejected", new { error = promptError });
                 capacity.Release();
                 await RenderAsync();
-                return;
+                return FreshClaimOutcome.Unavailable;
             }
             ExecResult claim;
             try { claim = await RunMaddoxAsync("claim", ct); }
-            catch { capacity.Release(); throw; }
-            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output) || claim.Output.Trim() == "null") { capacity.Release(); return; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { capacity.Release(); throw; }
+            catch (Exception exception)
+            {
+                capacity.Release();
+                log.Write("error", "claim.failed", new { error = exception.Message });
+                return FreshClaimOutcome.Unavailable;
+            }
+            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output) || claim.Output.Trim() == "null")
+            {
+                capacity.Release();
+                return FreshClaimOutcome.Unavailable;
+            }
             Job job;
             try
             {
@@ -113,7 +141,9 @@ public sealed class WorkerHost
             }
             catch { capacity.Release(); throw; }
             _ = RunReservedJobAsync(job, RecoveryMode.Initial, ct);
+            return admittedWithSpareCapacity ? FreshClaimOutcome.ClaimedWithSpareCapacity : FreshClaimOutcome.ClaimedAtCapacity;
         }
+        return FreshClaimOutcome.NotAttempted;
     }
 
     private void DrainFollowups(CancellationToken ct)
@@ -142,7 +172,7 @@ public sealed class WorkerHost
             try { await BlockAsync(job, exception.Message, ct); }
             catch (Exception blockException) { log.Write("error", "job.block.failed", new { job.Task.Sequence, error = blockException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
         }
-        finally { capacity.Release(); SignalScheduler(); await RenderAsync(); }
+        finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); await RenderAsync(); }
     }
 
     private async Task EnsureReservationAttributionAsync(Job job, CancellationToken ct)
@@ -804,17 +834,33 @@ public sealed class WorkerHost
             followups.Enqueue(new WorkItem(job, mode));
         }
         log.Write("info", "job.queued", new { job.Task.Sequence, mode });
-        SignalScheduler();
+        SignalScheduler(SchedulerWakeReason.Followup);
     }
-    private void SignalScheduler() { try { wakeScheduler.Release(); } catch (SemaphoreFullException) { } }
-    private async Task WaitForTickAsync(TimeSpan delay, CancellationToken ct)
+    private void SignalScheduler(SchedulerWakeReason reason)
     {
+        lock (wakeGate) pendingWakeReasons |= reason;
+        try { wakeScheduler.Release(); } catch (SemaphoreFullException) { }
+    }
+    private SchedulerWakeReason TakeSchedulerWakeReasons()
+    {
+        lock (wakeGate)
+        {
+            var reasons = pendingWakeReasons;
+            pendingWakeReasons = SchedulerWakeReason.None;
+            return reasons;
+        }
+    }
+    private async Task<SchedulerWakeReason> WaitForTickAsync(TimeSpan delay, CancellationToken ct)
+    {
+        delay = delay > TimeSpan.Zero ? delay : TimeSpan.Zero;
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var timer = clock.Delay(delay, wait.Token);
         var signal = wakeScheduler.WaitAsync(wait.Token);
-        await Task.WhenAny(timer, signal);
+        var completed = await Task.WhenAny(timer, signal);
         wait.Cancel();
         try { await Task.WhenAll(timer, signal); } catch (OperationCanceledException) when (!ct.IsCancellationRequested) { }
+        var reasons = TakeSchedulerWakeReasons();
+        return completed == timer ? reasons | SchedulerWakeReason.Timer : reasons;
     }
 
     private async Task WatchFilesAsync(CancellationToken ct)
@@ -830,7 +876,7 @@ public sealed class WorkerHost
             {
                 await clock.Delay(TimeSpan.FromMilliseconds(250), ct);
                 configStamp = newConfigStamp;
-                if (config.TryReload(configPath, out var error)) { configError = null; log.Write("info", "config.reloaded"); promptPath = ResolvePromptPath(config.Current); SignalScheduler(); }
+                if (config.TryReload(configPath, out var error)) { configError = null; log.Write("info", "config.reloaded"); promptPath = ResolvePromptPath(config.Current); SignalScheduler(SchedulerWakeReason.ConfigurationChanged); }
                 else { configError = error; log.Write("error", "config.reload.rejected", new { error }); await RenderAsync(); }
             }
             var newPromptStamp = File.Exists(promptPath) ? File.GetLastWriteTimeUtc(promptPath) : DateTime.MinValue;
@@ -853,11 +899,22 @@ public sealed class WorkerHost
             if (!Console.KeyAvailable) { await clock.Delay(TimeSpan.FromMilliseconds(100), ct); continue; }
             switch (Console.ReadKey(true).Key)
             {
-                case ConsoleKey.P: paused = !paused; log.Write("info", paused ? "claims.paused" : "claims.resumed"); if (!paused) SignalScheduler(); break;
-                case ConsoleKey.R: SignalScheduler(); break;
+                case ConsoleKey.P: paused = !paused; log.Write("info", paused ? "claims.paused" : "claims.resumed"); if (!paused) SignalScheduler(SchedulerWakeReason.ConfigurationChanged); break;
+                case ConsoleKey.R: SignalScheduler(SchedulerWakeReason.Manual); break;
                 case ConsoleKey.Q: RequestStop(); return;
             }
         }
+    }
+
+    [Flags]
+    private enum SchedulerWakeReason
+    {
+        None = 0,
+        Timer = 1,
+        Followup = 2,
+        CapacityChanged = 4,
+        ConfigurationChanged = 8,
+        Manual = 16
     }
 
     private async Task<ExecResult> RunCodexAsync(Job job, IEnumerable<string> arguments, CancellationToken ct)
