@@ -118,11 +118,11 @@ public sealed class WorkerPolicyTests
     public void Dashboard_HumanizesKnownStructuredCodexResults()
     {
         var result = DashboardFormatter.LatestLines("""{"status":"completed","summary":"Implemented the fix","repositories":[{"repository":"MaddoxTasks","changed":true}]}""");
-        Assert.Equal(["Summary: Implemented the fix", "Repositories: MaddoxTasks (changed)"], result);
+        Assert.Equal(["Summary: Implemented the fix"], result);
         Assert.DoesNotContain(result, line => line.Contains('{'));
 
         var clarification = DashboardFormatter.LatestLines("""{"repositories":["StasisLang"],"rationale":"The parser lives here","confidence":0.9,"ambiguous":false}""");
-        Assert.Equal(["Repository clarification: identified", "Repositories: StasisLang", "Rationale: The parser lives here"], clarification);
+        Assert.Equal(["Repository clarification: identified", "Rationale: The parser lives here"], clarification);
         Assert.DoesNotContain(clarification, line => line.Contains('{'));
     }
 
@@ -152,6 +152,7 @@ public sealed class WorkerPolicyTests
         var humanized = DashboardFormatter.LatestLines("""{"status":"completed","summary":"Implemented a carefully explained change","repositories":[{"repository":"MaddoxTasks","changed":true}]}""");
         var wrapped = DashboardFormatter.WrapLines(humanized, 24);
         Assert.Equal(3, wrapped.Length);
+        Assert.DoesNotContain(wrapped, line => line.Contains("Repositories:"));
         Assert.All(wrapped, line => Assert.StartsWith("  ", line));
         Assert.DoesNotContain(wrapped, line => line.Contains('{'));
     }
@@ -189,10 +190,19 @@ public sealed class WorkerPolicyTests
         var local = new DateTimeOffset(2026, 9, 4, 21, 7, 0, TimeSpan.FromHours(-4));
         Assert.Equal("9:07 PM", DashboardSegments.FormatUpdateTimestamp(local));
         var segments = DashboardSegments.UpdateLine("  current status", local);
-        Assert.Equal("  Update · 9:07 PM ", segments[0].Text);
+        Assert.Equal("  9:07 PM ", segments[0].Text);
+        Assert.DoesNotContain("Update", segments[0].Text);
         Assert.Equal(ConsoleColor.Cyan, segments[0].Color);
         Assert.Equal("current status", segments[1].Text);
         Assert.Equal(ConsoleColor.White, segments[1].Color);
+    }
+
+    [Fact]
+    public void Dashboard_NormalizesPersistedStructuredJsonBeforeFirstRender()
+    {
+        var lines = DashboardFormatter.NormalizePersistedLatest(["{\"status\":\"completed\",\"summary\":\"Ready\",\"repositories\":[{\"repository\":\"Repo\",\"changed\":true}]}"]);
+        Assert.Equal(["Summary: Ready"], lines);
+        Assert.DoesNotContain(lines, line => line.Contains('{') || line.Contains("Repositories:"));
     }
 
     [Fact]
