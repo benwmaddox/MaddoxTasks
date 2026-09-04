@@ -238,6 +238,24 @@ public sealed class WebServerTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
+    [Fact]
+    public void EmbeddedWebUiCompressesEmptyColumnsOnDesktopOnly()
+    {
+        var html = WebAssets.IndexHtml;
+        Assert.Contains(".board {\n      display: flex; gap: .65rem;", html, StringComparison.Ordinal);
+        Assert.Contains("column.className = 'column' + (issues.length === 0 ? ' empty-column' : '');",
+            html, StringComparison.Ordinal);
+        Assert.Contains(".column { flex: 1 1 180px; min-width: 180px;", html, StringComparison.Ordinal);
+        Assert.Contains(".column.empty-column { flex: 0 0 110px; min-width: 110px; }", html,
+            StringComparison.Ordinal);
+        Assert.Contains(".board { display: grid; grid-template-columns: repeat(4, minmax(210px, 1fr)); }",
+            html, StringComparison.Ordinal);
+        Assert.Contains(".column.empty-column { flex: 1 1 auto; min-width: 0; }", html,
+            StringComparison.Ordinal);
+        Assert.Contains(".board { grid-template-columns: 1fr; overflow-x: visible; }", html,
+            StringComparison.Ordinal);
+    }
+
     private static StringContent Json(string json)
         => new(json, Encoding.UTF8, "application/json");
 
