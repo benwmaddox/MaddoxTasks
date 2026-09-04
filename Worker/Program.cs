@@ -1,5 +1,7 @@
 namespace MaddoxTasks.Worker;
 
+using System.Text;
+
 public sealed record ProgramOptions(bool Stop, string? ConfigPath)
 {
     public static ProgramOptions Parse(string[] args) => args switch
@@ -21,6 +23,8 @@ public static class Program
         {
             var options = ProgramOptions.Parse(args);
             if (options.Stop) return SignalStop();
+
+            Console.OutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
 
             using var mutex = new Mutex(true, "Local\\MaddoxTasks.Worker", out var firstInstance);
             if (!firstInstance) { Console.Error.WriteLine("Worker is already running."); return 2; }
