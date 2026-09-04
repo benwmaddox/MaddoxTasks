@@ -222,6 +222,23 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void MonitoringDisplay_DistinguishesQuietWindowFromManualMergeDecision()
+    {
+        var now = new DateTime(2026, 9, 4, 14, 0, 0, DateTimeKind.Utc);
+        var job = CreateJob(JobPhases.Monitoring, now.AddMinutes(-5));
+        Assert.Equal("Waiting on CI/review window", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), false));
+
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-12);
+        Assert.Equal("Waiting on CI/review window · 18m left", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), false));
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-30);
+        Assert.Equal("Waiting on CI/review window", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
+
+        job.ReadyForReviewRecorded = true;
+        Assert.Equal("Waiting for your PR decision", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), false));
+        Assert.Equal("Ready to auto-merge", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
+    }
+
+    [Fact]
     public void CodexEventParser_ReadsThreadAndNestedAssistantMessage()
     {
         var started = CodexEventParser.Parse("{\"type\":\"thread.started\",\"thread_id\":\"thread-1\"}");

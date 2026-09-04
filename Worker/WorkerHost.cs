@@ -723,7 +723,12 @@ public sealed class WorkerHost
             foreach (var job in DashboardPolicy.VisibleJobs(journal.Jobs, clock.UtcNow, config.Current.EffectiveBlockedDisplayDuration))
             {
                 var width = Math.Max(10, Console.WindowWidth - 1);
-                var phase = job.Phase == JobPhases.Blocked ? "Recently blocked" : job.Phase;
+                var phase = job.Phase switch
+                {
+                    JobPhases.Blocked => "Recently blocked",
+                    JobPhases.Monitoring => MonitoringDisplay.Describe(job, clock.UtcNow, config.Current.ReviewQuietPeriod, IsAutoMergeAllowed(job)),
+                    _ => job.Phase
+                };
                 ConsoleSegmentWriter.WriteLine(DashboardSegments.Truncate(DashboardSegments.JobHeader(job, phase, clock.UtcNow - job.StartedUtc), width));
                 var repositories = job.Workspaces.Count == 0 ? string.Join(", ", job.Task.Repositories) : string.Join(", ", job.Workspaces.Select(workspace => workspace.Repository));
                 var pullRequests = job.PullRequests.Count == 0 ? null : string.Join(", ", job.PullRequests.Select(pr => pr.Url));
