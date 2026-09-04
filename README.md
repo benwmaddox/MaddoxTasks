@@ -271,6 +271,10 @@ Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly
 local shutdown. The visible dashboard keeps recently blocked work for
 `blockedDisplayDuration` (10 minutes by default), then rolls it off while the
 durable journal and JSONL logs retain the full record.
+Blocked jobs retain their owned worktrees and branches, including tracked changes
+and non-ignored untracked files, for diagnosis or later recovery. Destructive
+worktree and branch cleanup is eligible only after the job reaches `Done`;
+best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
 

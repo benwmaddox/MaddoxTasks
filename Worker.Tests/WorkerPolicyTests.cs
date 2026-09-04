@@ -31,6 +31,19 @@ public sealed class WorkerPolicyTests
         Assert.Equal([job], WorkspaceCleanupPolicy.Pending([job, CreateJob(JobPhases.Done)]));
         Assert.Empty(DashboardPolicy.VisibleJobs([job], DateTime.UtcNow, TimeSpan.FromMinutes(10)));
     }
+
+    [Fact]
+    public void WorkspaceCleanupPolicy_NeverSelectsBlockedJobsEvenWhenCleanupWasPreviouslyPending()
+    {
+        var blocked = CreateJob(JobPhases.Blocked);
+        blocked.CleanupPending = true;
+        blocked.Workspaces = [new Workspace("Repo", @"D:\worktrees\task", "codex/task-1-fix", "origin")];
+
+        Assert.False(WorkspaceCleanupPolicy.CanDelete(blocked));
+        Assert.Empty(WorkspaceCleanupPolicy.Pending([blocked]));
+        Assert.True(blocked.CleanupPending);
+        Assert.Single(blocked.Workspaces);
+    }
     [Fact]
     public void ReviewWindow_RequiresUninterruptedGreenAndResetsForFeedback()
     {

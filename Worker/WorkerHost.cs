@@ -754,6 +754,8 @@ public sealed class WorkerHost
 
     private async Task CleanupAsync(Job job, CancellationToken ct)
     {
+        if (!WorkspaceCleanupPolicy.CanDelete(job))
+            throw new InvalidOperationException("Destructive workspace cleanup is allowed only for completed jobs with pending cleanup.");
         var forceAllowed = WorkspaceCleanupPolicy.IsProvenOwned(job, config.Current.WorktreeRoot);
         foreach (var workspace in job.Workspaces)
         {

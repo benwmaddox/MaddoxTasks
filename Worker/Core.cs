@@ -273,7 +273,8 @@ public static class WorkspaceCleanupPolicy
         return true;
     }
 
-    public static IReadOnlyList<Job> Pending(IEnumerable<Job> jobs) => jobs.Where(job => job.Phase == JobPhases.Done && job.CleanupPending).ToArray();
+    public static bool CanDelete(Job job) => job.Phase == JobPhases.Done && job.CleanupPending;
+    public static IReadOnlyList<Job> Pending(IEnumerable<Job> jobs) => jobs.Where(CanDelete).ToArray();
 }
 
 public sealed class PublicationProgress
