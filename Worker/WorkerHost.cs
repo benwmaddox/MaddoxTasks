@@ -75,7 +75,8 @@ public sealed class WorkerHost
         await ReconcileAsync(ct);
         DrainFollowups(ct);
         if (paused) return;
-        while (capacity.TryReserve())
+        var freshClaim = new FreshClaimAllowance();
+        if (freshClaim.TryReserve(capacity))
         {
             if (!ClaimAdmission.TrySnapshot(config.Current, configPath, out var claimSnapshot, out var promptError))
             {
@@ -83,23 +84,30 @@ public sealed class WorkerHost
                 log.Write("error", "claim.prompt.rejected", new { error = promptError });
                 capacity.Release();
                 await RenderAsync();
-                break;
+                return;
             }
             ExecResult claim;
             try { claim = await RunMaddoxAsync("claim", ct); }
             catch { capacity.Release(); throw; }
-            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output) || claim.Output.Trim() == "null") { capacity.Release(); break; }
+            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output) || claim.Output.Trim() == "null") { capacity.Release(); return; }
             Job job;
             try
             {
                 var task = JsonSerializer.Deserialize<TaskDto>(claim.Output, JsonOptions) ?? throw new InvalidDataException("Claim response was empty.");
                 var snapshot = claimSnapshot!;
-                job = new Job { Task = task, Prompt = snapshot.Prompt, Model = snapshot.Config.Model, Effort = snapshot.Config.ReasoningEffort, StartedUtc = clock.UtcNow };
-                lock (journalGate) { journal.Jobs.Add(job); journal.Save(journalPath); }
+                var adopted = false;
+                lock (journalGate)
+                {
+                    var owned = BlockedWorkspaceAdoption.TryAdopt(journal, task, snapshot.Config.WorktreeRoot, clock.UtcNow);
+                    adopted = owned is not null;
+                    job = owned ?? new Job { Task = task, Prompt = snapshot.Prompt, Model = snapshot.Config.Model, Effort = snapshot.Config.ReasoningEffort, StartedUtc = clock.UtcNow, PhaseChangedUtc = clock.UtcNow };
+                    if (!journal.Jobs.Contains(job)) journal.Jobs.Add(job);
+                    journal.Save(journalPath);
+                }
                 await AddCommentAsync(job, ReservationAttribution.Pending, ct);
                 job.ReservationOwnerRecorded = true;
                 Save(job);
-                log.Write("info", "job.claimed", new { task.Sequence, task.Title, task.Repositories });
+                log.Write("info", "job.claimed", new { task.Sequence, task.Title, task.Repositories, adoptedBlockedWorkspace = adopted });
             }
             catch { capacity.Release(); throw; }
             _ = RunReservedJobAsync(job, RecoveryMode.Initial, ct);
@@ -524,7 +532,7 @@ public sealed class WorkerHost
 
         if (job.PendingCheckFailures.Count > 0 || job.PendingFeedback.Count > 0)
         {
-            job.Latest = DashboardFormatter.LatestLines(string.Join('\n', job.PendingFeedback.Select(item => item.Body)));
+            DashboardSummary.Update(job, string.Join('\n', job.PendingFeedback.Select(item => item.Body)), clock.UtcNow);
             Save(job);
             Enqueue(job, RecoveryMode.ResumeRepair);
         }
@@ -644,7 +652,7 @@ public sealed class WorkerHost
             var (threadId, text) = CodexEventParser.Parse(line);
             var changed = false;
             if (!string.IsNullOrWhiteSpace(threadId) && job.ThreadId != threadId) { job.ThreadId = threadId; changed = true; }
-            if (!string.IsNullOrWhiteSpace(text)) { job.Latest = DashboardFormatter.LatestLines(text); changed = true; }
+            if (!string.IsNullOrWhiteSpace(text) && DashboardSummary.Update(job, text, clock.UtcNow)) changed = true;
             if (changed) Save(job);
         }
         catch (JsonException) { }
@@ -652,6 +660,7 @@ public sealed class WorkerHost
 
     private async Task BlockAsync(Job job, string reason, CancellationToken ct, string actor = "maddox-worker")
     {
+        job.BlockReason = reason;
         SetPhase(job, JobPhases.Blocked);
         await AddCommentAsync(job, "Worker blocked: " + reason, actor, ct);
         await ChangeStatusAsync(job, "Blocked", ct);
@@ -690,27 +699,52 @@ public sealed class WorkerHost
     private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct) { var result = await processes.RunAsync(executable, arguments, cwd, ct); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
     private static bool TryReadSuccess(string output) { try { using var document = JsonDocument.Parse(output); return document.RootElement.GetProperty("success").GetBoolean(); } catch { return false; } }
 
-    private void SetPhase(Job job, string phase) { job.Phase = phase; log.Write("info", "job.phase", new { job.Task.Sequence, phase }); Save(job); }
+    private void SetPhase(Job job, string phase)
+    {
+        if (job.Phase != phase) { job.Phase = phase; job.PhaseChangedUtc = clock.UtcNow; }
+        log.Write("info", "job.phase", new { job.Task.Sequence, phase });
+        Save(job);
+    }
     private void Save(Job job) { lock (journalGate) journal.Save(journalPath); _ = RenderAsync(); }
     private Job[] SnapshotJobs(string phase) { lock (journalGate) return journal.Jobs.Where(job => job.Phase == phase).ToArray(); }
     private async Task RenderAsync()
     {
         if (Console.IsOutputRedirected) return;
         await renderLock.WaitAsync();
+        var previousColor = Console.ForegroundColor;
         try
         {
             Console.Clear();
-            Console.WriteLine($"Maddox Worker | active {capacity.Active}/{config.Current.MaxConcurrentCodexProcesses} | queued {followups.Count} | {(paused ? "paused" : $"next {nextTickUtc.ToLocalTime():T}")}");
-            if (configError is not null) Console.WriteLine(DashboardFormatter.Truncate("Configuration error: " + configError, Math.Max(10, Console.WindowWidth - 1)));
-            foreach (var job in journal.Jobs.Where(job => job.Phase != JobPhases.Done))
+            var scheduleStatus = config.Current.MaxConcurrentCodexProcesses == 0
+                ? "paused by concurrency cap"
+                : paused ? "claims paused by keyboard" : $"next {nextTickUtc.ToLocalTime():T}";
+            ConsoleSegmentWriter.WriteLine([new ConsoleSegment($"Maddox Worker | active {capacity.Active}/{config.Current.MaxConcurrentCodexProcesses} | queued {followups.Count} | {scheduleStatus}", DashboardSegments.Structural)]);
+            if (configError is not null) ConsoleSegmentWriter.WriteLine([new ConsoleSegment(DashboardFormatter.Truncate("Configuration error: " + configError, Math.Max(10, Console.WindowWidth - 1)), DashboardSegments.Detail)]);
+            foreach (var job in DashboardPolicy.VisibleJobs(journal.Jobs, clock.UtcNow, config.Current.EffectiveBlockedDisplayDuration))
             {
                 var width = Math.Max(10, Console.WindowWidth - 1);
-                Console.WriteLine(DashboardFormatter.Truncate($"#{job.Task.Sequence} {job.Task.Title} [{job.Phase}] {clock.UtcNow - job.StartedUtc:g}", width));
-                Console.WriteLine(DashboardFormatter.Truncate("  " + (job.Workspaces.Count == 0 ? string.Join(", ", job.Task.Repositories) : string.Join(", ", job.Workspaces.Select(workspace => workspace.Repository))) + (job.PullRequests.Count == 0 ? string.Empty : " | " + string.Join(", ", job.PullRequests.Select(pr => pr.Url))), width));
-                foreach (var line in job.Latest.TakeLast(3)) Console.WriteLine(DashboardFormatter.Truncate("  " + line, width));
+                var phase = job.Phase == JobPhases.Blocked ? "Recently blocked" : job.Phase;
+                ConsoleSegmentWriter.WriteLine(DashboardSegments.Truncate(DashboardSegments.JobHeader(job, phase, clock.UtcNow - job.StartedUtc), width));
+                var repositories = job.Workspaces.Count == 0 ? string.Join(", ", job.Task.Repositories) : string.Join(", ", job.Workspaces.Select(workspace => workspace.Repository));
+                var pullRequests = job.PullRequests.Count == 0 ? null : string.Join(", ", job.PullRequests.Select(pr => pr.Url));
+                ConsoleSegmentWriter.WriteLine(DashboardSegments.Truncate(DashboardSegments.RepositoryLine(repositories, pullRequests), width));
+                var details = job.Phase == JobPhases.Blocked && !string.IsNullOrWhiteSpace(job.BlockReason)
+                    ? new[] { "Reason: " + DashboardFormatter.LatestLines(job.BlockReason).LastOrDefault() }
+                    : job.Latest;
+                var detailLimit = job.Phase == JobPhases.Blocked ? 1 : 3;
+                var latestChangedLocal = job.Phase == JobPhases.Blocked ? null : job.LatestChangedUtc?.ToLocalTime();
+                var updatePrefixWidth = latestChangedLocal is null ? 0 : ("  Update · " + DashboardSegments.FormatUpdateTimestamp(latestChangedLocal.Value) + " ").Length - 2;
+                var wrapped = DashboardFormatter.WrapLines(details, Math.Max(3, width - updatePrefixWidth), maxLines: detailLimit);
+                for (var index = 0; index < wrapped.Length; index++)
+                {
+                    var segments = index == 0 && latestChangedLocal is not null
+                        ? DashboardSegments.UpdateLine(wrapped[index], latestChangedLocal.Value)
+                        : [new ConsoleSegment(wrapped[index], DashboardSegments.Detail)];
+                    ConsoleSegmentWriter.WriteLine(segments);
+                }
             }
         }
-        finally { renderLock.Release(); }
+        finally { Console.ForegroundColor = previousColor; renderLock.Release(); }
     }
 
     public static string ExtractResult(string jsonLines)

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Globalization;
 
 namespace MaddoxTasks.Worker;
 
@@ -34,9 +35,11 @@ public sealed record WorkerConfig(
     string CodexExe,
     string GhExe,
     string RepoRoot,
-    string WorktreeRoot)
+    string WorktreeRoot,
+    TimeSpan? BlockedDisplayDuration = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
+    public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
 
     public static WorkerConfig Load(string path)
     {
@@ -52,9 +55,10 @@ public sealed record WorkerConfig(
         if (ClaimInterval <= TimeSpan.Zero) throw new InvalidDataException("claimInterval must be positive.");
         if (PrPollInterval <= TimeSpan.Zero) throw new InvalidDataException("prPollInterval must be positive.");
         if (ClarificationTimeout <= TimeSpan.Zero) throw new InvalidDataException("clarificationTimeout must be positive.");
-        if (MaxConcurrentCodexProcesses < 1) throw new InvalidDataException("maxConcurrentCodexProcesses must be at least 1.");
+        if (MaxConcurrentCodexProcesses < 0) throw new InvalidDataException("maxConcurrentCodexProcesses cannot be negative.");
         if (RepairMaxAttempts < 1 || RepairMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("Repair bounds must be positive.");
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
+        if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");
@@ -101,8 +105,11 @@ public sealed class Job
 {
     public required TaskDto Task { get; set; }
     public string Phase { get; set; } = JobPhases.Claimed;
+    public DateTime PhaseChangedUtc { get; set; }
+    public string? BlockReason { get; set; }
     public DateTime StartedUtc { get; set; }
     public string[] Latest { get; set; } = [];
+    public DateTime? LatestChangedUtc { get; set; }
     public string? ThreadId { get; set; }
     public bool ReservationOwnerRecorded { get; set; }
     public bool ExactReservationOwnerRecorded { get; set; }
@@ -275,12 +282,13 @@ public static class DashboardFormatter
     private static readonly Regex EscapeSequence = new("\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\))", RegexOptions.Compiled);
     private static readonly Regex Controls = new("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]", RegexOptions.Compiled);
 
-    public static string[] LatestLines(string? text) => string.IsNullOrWhiteSpace(text)
-        ? []
-        : Controls.Replace(EscapeSequence.Replace(text.Replace("\r", string.Empty), string.Empty), string.Empty)
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .TakeLast(3)
-            .ToArray();
+    public static string[] LatestLines(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return [];
+        var sanitized = Sanitize(text);
+        if (TryHumanizeStructured(sanitized, out var humanized)) return humanized;
+        return sanitized.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).TakeLast(3).ToArray();
+    }
 
     public static string Truncate(string text, int width)
     {
@@ -288,6 +296,237 @@ public static class DashboardFormatter
         if (text.Length <= width) return text;
         if (width <= 3) return "..."[..width];
         return text[..(width - 3)] + "...";
+    }
+
+    public static string[] WrapLines(IEnumerable<string> sourceLines, int width, string indent = "  ", int maxLines = 3)
+    {
+        if (maxLines <= 0) return [];
+        var available = Math.Max(1, width - indent.Length);
+        var result = new List<string>(maxLines);
+        foreach (var source in sourceLines)
+        {
+            var words = Sanitize(source).Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var current = string.Empty;
+            foreach (var rawWord in words)
+            {
+                var word = rawWord.Length <= available ? rawWord : Truncate(rawWord, available);
+                if (current.Length == 0) current = word;
+                else if (current.Length + 1 + word.Length <= available) current += " " + word;
+                else
+                {
+                    result.Add(indent + current);
+                    if (result.Count == maxLines) return result.ToArray();
+                    current = word;
+                }
+            }
+            if (current.Length > 0)
+            {
+                result.Add(indent + current);
+                if (result.Count == maxLines) return result.ToArray();
+            }
+        }
+        return result.ToArray();
+    }
+
+    private static string Sanitize(string text) => Controls.Replace(EscapeSequence.Replace(text.Replace("\r", string.Empty), string.Empty), string.Empty);
+
+    private static bool TryHumanizeStructured(string text, out string[] lines)
+    {
+        lines = [];
+        try
+        {
+            using var document = JsonDocument.Parse(text);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            if (root.TryGetProperty("status", out var status) && root.TryGetProperty("summary", out var summary))
+            {
+                _ = status;
+                var result = new List<string> { "Summary: " + Sanitize(summary.GetString() ?? string.Empty) };
+                AddRepositories(root, result, includeChangeState: true);
+                lines = result.Take(3).ToArray();
+                return true;
+            }
+            if (root.TryGetProperty("ambiguous", out var ambiguous) && root.TryGetProperty("rationale", out var rationale))
+            {
+                var result = new List<string> { ambiguous.GetBoolean() ? "Repository clarification: ambiguous" : "Repository clarification: identified" };
+                AddRepositories(root, result, includeChangeState: false);
+                result.Add("Rationale: " + Sanitize(rationale.GetString() ?? string.Empty));
+                lines = result.Take(3).ToArray();
+                return true;
+            }
+            return false;
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException) { return false; }
+    }
+
+    private static void AddRepositories(JsonElement root, List<string> lines, bool includeChangeState)
+    {
+        if (!root.TryGetProperty("repositories", out var repositories) || repositories.ValueKind != JsonValueKind.Array) return;
+        var values = new List<string>();
+        foreach (var repository in repositories.EnumerateArray())
+        {
+            if (repository.ValueKind == JsonValueKind.String) values.Add(Sanitize(repository.GetString() ?? string.Empty));
+            else if (repository.ValueKind == JsonValueKind.Object && repository.TryGetProperty("repository", out var name))
+            {
+                var value = Sanitize(name.GetString() ?? string.Empty);
+                if (includeChangeState && repository.TryGetProperty("changed", out var changed)) value += changed.GetBoolean() ? " (changed)" : " (unchanged)";
+                values.Add(value);
+            }
+        }
+        if (values.Count > 0) lines.Add("Repositories: " + string.Join(", ", values));
+    }
+}
+
+public static class DashboardSummary
+{
+    public static bool Update(Job job, string? text, DateTime changedUtc)
+    {
+        var normalized = DashboardFormatter.LatestLines(text);
+        if (job.Latest.SequenceEqual(normalized, StringComparer.Ordinal)) return false;
+        job.Latest = normalized;
+        job.LatestChangedUtc = changedUtc;
+        return true;
+    }
+}
+
+public sealed class FreshClaimAllowance
+{
+    private bool used;
+    public bool TryReserve(ConcurrencyGate capacity)
+    {
+        if (used || !capacity.TryReserve()) return false;
+        used = true;
+        return true;
+    }
+}
+
+public static class DashboardPolicy
+{
+    public static IReadOnlyList<Job> VisibleJobs(IEnumerable<Job> jobs, DateTime now, TimeSpan blockedDisplayDuration) => jobs
+        .GroupBy(job => job.Task.IssueId, StringComparer.OrdinalIgnoreCase)
+        .Select(group => group.OrderByDescending(ChangedAt).ThenByDescending(job => job.StartedUtc).First())
+        .Where(job => job.Phase != JobPhases.Done)
+        .Where(job => job.Phase != JobPhases.Blocked || now - ChangedAt(job) < blockedDisplayDuration)
+        .ToArray();
+
+    private static DateTime ChangedAt(Job job) => job.PhaseChangedUtc > DateTime.MinValue ? job.PhaseChangedUtc : job.StartedUtc;
+}
+
+public sealed record ConsoleSegment(string Text, ConsoleColor Color);
+
+public static class DashboardSegments
+{
+    public const ConsoleColor Structural = ConsoleColor.Gray;
+    public const ConsoleColor Tag = ConsoleColor.Cyan;
+    public const ConsoleColor Title = ConsoleColor.Magenta;
+    public const ConsoleColor Detail = ConsoleColor.White;
+
+    public static string FormatUpdateTimestamp(DateTimeOffset localTime) => localTime.ToString("h:mm tt", CultureInfo.InvariantCulture);
+
+    public static ConsoleSegment[] JobHeader(Job job, string phase, TimeSpan elapsed) =>
+    [
+        new($"#{job.Task.Sequence}", Tag),
+        new(" ", Structural),
+        new(job.Task.Title, Title),
+        new(" [", Structural),
+        new(phase, Tag),
+        new($"] {elapsed:g}", Structural)
+    ];
+
+    public static ConsoleSegment[] RepositoryLine(string repositories, string? pullRequests) =>
+    [
+        new("  ", Structural),
+        new(repositories, Tag),
+        new(string.IsNullOrWhiteSpace(pullRequests) ? string.Empty : " | " + pullRequests, Structural)
+    ];
+
+    public static ConsoleSegment[] UpdateLine(string wrappedText, DateTimeOffset localTime)
+    {
+        var text = wrappedText.StartsWith("  ", StringComparison.Ordinal) ? wrappedText[2..] : wrappedText;
+        return
+        [
+            new("  Update · " + FormatUpdateTimestamp(localTime) + " ", Tag),
+            new(text, Detail)
+        ];
+    }
+
+    public static ConsoleSegment[] Truncate(IEnumerable<ConsoleSegment> segments, int width)
+    {
+        var remaining = Math.Max(1, width);
+        var result = new List<ConsoleSegment>();
+        foreach (var segment in segments)
+        {
+            if (segment.Text.Length <= remaining) { result.Add(segment); remaining -= segment.Text.Length; if (remaining == 0) break; continue; }
+            result.Add(segment with { Text = DashboardFormatter.Truncate(segment.Text, remaining) });
+            break;
+        }
+        return result.Where(segment => segment.Text.Length > 0).ToArray();
+    }
+}
+
+public static class ConsoleSegmentWriter
+{
+    public static void WriteLine(IEnumerable<ConsoleSegment> segments)
+    {
+        var previous = Console.ForegroundColor;
+        try
+        {
+            foreach (var segment in segments) { Console.ForegroundColor = segment.Color; Console.Write(segment.Text); }
+            Console.WriteLine();
+        }
+        finally { Console.ForegroundColor = previous; }
+    }
+}
+
+public static class BlockedWorkspaceAdoption
+{
+    public static Job? TryAdopt(Journal journal, TaskDto claimedTask, string worktreeRoot, DateTime startedUtc)
+    {
+        var repositories = claimedTask.Repositories.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var root = Path.GetFullPath(worktreeRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var candidate = journal.Jobs
+            .Where(job => job.Phase == JobPhases.Blocked && job.Task.IssueId.Equals(claimedTask.IssueId, StringComparison.OrdinalIgnoreCase))
+            .Where(job => IsEligible(job, repositories, root))
+            .OrderByDescending(job => job.StartedUtc)
+            .FirstOrDefault();
+        if (candidate is null) return null;
+
+        candidate.Task = claimedTask;
+        candidate.Phase = JobPhases.Claimed;
+        candidate.StartedUtc = startedUtc;
+        candidate.PhaseChangedUtc = startedUtc;
+        candidate.BlockReason = null;
+        candidate.Latest = [];
+        candidate.LatestChangedUtc = null;
+        candidate.ThreadId = null;
+        candidate.ReservationOwnerRecorded = false;
+        candidate.ExactReservationOwnerRecorded = false;
+        candidate.PendingResultJson = null;
+        candidate.PendingResultIsRepair = false;
+        candidate.Publication.Clear();
+        candidate.ExecutionStartHeads.Clear();
+        candidate.RepairAttempts = 0;
+        candidate.RepairStartedUtc = null;
+        candidate.RepairAttemptsByPullRequest.Clear();
+        candidate.RepairStartedUtcByPullRequest.Clear();
+        return candidate;
+    }
+
+    private static bool IsEligible(Job job, HashSet<string> repositories, string worktreeRoot)
+    {
+        if (job.Workspaces.Count == 0 || string.IsNullOrWhiteSpace(job.Prompt) || string.IsNullOrWhiteSpace(job.Model) || string.IsNullOrWhiteSpace(job.Effort)) return false;
+        if (!repositories.SetEquals(job.Task.Repositories) || !repositories.SetEquals(job.Workspaces.Select(workspace => workspace.Repository))) return false;
+        if (job.Workspaces.Select(workspace => workspace.Repository).Distinct(StringComparer.OrdinalIgnoreCase).Count() != job.Workspaces.Count) return false;
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var branches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var workspace in job.Workspaces)
+        {
+            if (string.IsNullOrWhiteSpace(workspace.Repository) || string.IsNullOrWhiteSpace(workspace.Directory) || string.IsNullOrWhiteSpace(workspace.Branch) || string.IsNullOrWhiteSpace(workspace.Remote)) return false;
+            string directory;
+            try { directory = Path.GetFullPath(workspace.Directory); } catch { return false; }
+            if (!directory.StartsWith(worktreeRoot, StringComparison.OrdinalIgnoreCase) || !directories.Add(directory) || !branches.Add(workspace.Branch)) return false;
+        }
+        return true;
     }
 }
 

@@ -249,6 +249,14 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 .\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
+The worker claims at most one fresh task per scheduling tick. Set
+`maxConcurrentCodexProcesses` to `0` to pause new Codex work while keeping PR
+monitoring and reconciliation active; running Codex processes drain naturally.
+Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly
+local shutdown. The visible dashboard keeps recently blocked work for
+`blockedDisplayDuration` (10 minutes by default), then rolls it off while the
+durable journal and JSONL logs retain the full record.
+
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
 
 ```powershell
