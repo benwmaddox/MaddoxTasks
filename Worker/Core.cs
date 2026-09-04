@@ -37,11 +37,13 @@ public sealed record WorkerConfig(
     string RepoRoot,
     string WorktreeRoot,
     TimeSpan? BlockedDisplayDuration = null,
-    TimeSpan? CapacityFillInterval = null)
+    TimeSpan? CapacityFillInterval = null,
+    TimeSpan? ResearchCooldown = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
     public TimeSpan EffectiveCapacityFillInterval => CapacityFillInterval ?? TimeSpan.FromMinutes(1);
+    public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(14);
 
     public static WorkerConfig Load(string path)
     {
@@ -62,6 +64,7 @@ public sealed record WorkerConfig(
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
         if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
         if (CapacityFillInterval is { } capacityFillInterval && capacityFillInterval <= TimeSpan.Zero) throw new InvalidDataException("capacityFillInterval must be positive.");
+        if (ResearchCooldown is { } researchCooldown && researchCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchCooldown must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");
@@ -88,6 +91,247 @@ public sealed record TaskDto(int Sequence, string IssueId, string Title, string 
     public TaskCommentDto[] Comments { get; init; } = [];
     public DateTime UpdatedAt { get; init; }
 }
+
+/// <summary>
+/// A deliberately closed set of task-ledger mutations that the blocked-task
+/// researcher may return. It has no command, process, filesystem, Git, or
+/// GitHub escape hatch.
+/// </summary>
+public sealed record ResearchMutation(
+    string Type,
+    string? IssueId = null,
+    string? Title = null,
+    string? Description = null,
+    int? NewPriority = null,
+    string? Label = null,
+    string? NewStatus = null,
+    string[]? Repositories = null,
+    string? ParentId = null,
+    int? Priority = null,
+    string? Status = null,
+    string? Comment = null);
+
+public sealed record ResearchPlan(
+    string Outcome,
+    string Summary,
+    string[] Findings,
+    ResearchMutation[] Mutations);
+
+public static class ResearchPlanPolicy
+{
+    public const string Actor = "maddox-research-worker";
+    public const string Unblocked = "unblocked";
+    public const string StillBlocked = "stillBlocked";
+
+    private static readonly HashSet<string> ExistingMutationTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "AddComment",
+        "UpdateDescription",
+        "ChangePriority",
+        "AddLabel",
+        "RemoveLabel",
+        "SetRepositoryLabels",
+        "ChangeStatus"
+    };
+
+    public static ResearchPlan Parse(string json, TaskDto sourceTask)
+    {
+        if (sourceTask is null) throw new ArgumentNullException(nameof(sourceTask));
+        return Parse(json, sourceTask.IssueId, sourceTask.Sequence);
+    }
+
+    public static ResearchPlan Parse(string json, string sourceIssueId, int? sourceSequence = null)
+    {
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+        if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Research result must be a JSON object.");
+
+        var outcome = RequiredString(root, "outcome");
+        if (outcome.Equals(Unblocked, StringComparison.OrdinalIgnoreCase)) outcome = Unblocked;
+        else if (outcome.Equals(StillBlocked, StringComparison.OrdinalIgnoreCase)) outcome = StillBlocked;
+        else throw new InvalidDataException("Research outcome must be 'unblocked' or 'stillBlocked'.");
+
+        var summary = RequiredString(root, "summary");
+        var findings = RequiredStringArray(root, "findings", allowEmpty: true);
+        var mutationsElement = RequiredProperty(root, "mutations");
+        if (mutationsElement.ValueKind != JsonValueKind.Array) throw new InvalidDataException("Research mutations must be an array.");
+        if (mutationsElement.GetArrayLength() > 100) throw new InvalidDataException("Research result contains too many mutations.");
+
+        var mutations = mutationsElement.EnumerateArray()
+            .Select(element => ParseMutation(element, sourceIssueId, sourceSequence))
+            .ToArray();
+
+        return new ResearchPlan(outcome, summary, findings, mutations);
+    }
+
+    public static bool IsSourceStatusMutation(ResearchMutation mutation, string sourceIssueId, int? sourceSequence = null)
+        => mutation.Type.Equals("ChangeStatus", StringComparison.OrdinalIgnoreCase)
+            && IsSourceIssueToken(mutation.IssueId, sourceIssueId, sourceSequence);
+
+    public static string FindingsComment(ResearchPlan plan)
+    {
+        var lines = new List<string> { "Research findings: " + plan.Summary };
+        lines.AddRange(plan.Findings.Select(finding => "- " + finding));
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static ResearchMutation ParseMutation(JsonElement element, string sourceIssueId, int? sourceSequence)
+    {
+        if (element.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Each research mutation must be an object.");
+        var type = RequiredString(element, "type");
+        var canonicalType = ExistingMutationTypes.FirstOrDefault(value => value.Equals(type, StringComparison.OrdinalIgnoreCase)) ??
+            (type.Equals("CreateIssue", StringComparison.OrdinalIgnoreCase) ? "CreateIssue" : null);
+        if (canonicalType is null) throw new InvalidDataException($"Research mutation type '{type}' is not allowed.");
+
+        if (canonicalType == "CreateIssue")
+        {
+            var title = RequiredString(element, "title");
+            var description = RequiredString(element, "description", allowEmpty: true);
+            var priority = OptionalInt(element, "priority") ?? 3;
+            if (priority is < 1 or > 5) throw new InvalidDataException("CreateIssue priority must be between 1 and 5.");
+            var status = OptionalString(element, "status") ?? "Next";
+            if (!status.Equals("Next", StringComparison.OrdinalIgnoreCase) && !status.Equals("Backlog", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("CreateIssue status must be 'Next' or 'Backlog'.");
+            var parentId = OptionalString(element, "parentId");
+            if (parentId is not null && !Guid.TryParse(parentId, out _)) throw new InvalidDataException("CreateIssue parentId must be a valid issue id GUID.");
+            var repositories = OptionalStringArray(element, "repositories", allowEmpty: true);
+            ValidateRepositories(repositories);
+            return new ResearchMutation(canonicalType, Title: title, Description: description, Priority: priority, Status: status, ParentId: parentId, Repositories: repositories);
+        }
+
+        var issueId = RequiredString(element, "issueId");
+        if (canonicalType == "AddComment")
+            return new ResearchMutation(canonicalType, IssueId: issueId, Comment: RequiredString(element, "comment"));
+        if (canonicalType == "UpdateDescription")
+            return new ResearchMutation(canonicalType, IssueId: issueId, Description: RequiredString(element, "description", allowEmpty: true));
+        if (canonicalType == "ChangePriority")
+        {
+            var priority = RequiredInt(element, "newPriority");
+            if (priority is < 1 or > 5) throw new InvalidDataException("newPriority must be between 1 and 5.");
+            return new ResearchMutation(canonicalType, IssueId: issueId, NewPriority: priority);
+        }
+        if (canonicalType is "AddLabel" or "RemoveLabel")
+            return new ResearchMutation(canonicalType, IssueId: issueId, Label: RequiredString(element, "label"));
+        if (canonicalType == "SetRepositoryLabels")
+        {
+            var repositories = RequiredStringArray(element, "repositories", allowEmpty: false);
+            ValidateRepositories(repositories);
+            return new ResearchMutation(canonicalType, IssueId: issueId, Repositories: repositories);
+        }
+
+        var newStatus = RequiredString(element, "newStatus");
+        if (!Enum.TryParse<ResearchStatus>(newStatus, true, out var parsedStatus))
+            throw new InvalidDataException($"Invalid status '{newStatus}' in research mutation.");
+        if (IsSourceStatusMutation(new ResearchMutation(canonicalType, IssueId: issueId), sourceIssueId, sourceSequence))
+            throw new InvalidDataException("Research mutations may not directly change the source task status.");
+        return new ResearchMutation(canonicalType, IssueId: issueId, NewStatus: parsedStatus.ToString());
+    }
+
+    private static void ValidateRepositories(string[]? repositories)
+    {
+        if (repositories is null) return;
+        if (repositories.Any(repository => string.IsNullOrWhiteSpace(repository) || repository.Trim().StartsWith("repo:", StringComparison.OrdinalIgnoreCase)))
+            throw new InvalidDataException("Repositories must be non-empty names without the 'repo:' prefix.");
+        if (repositories.Distinct(StringComparer.OrdinalIgnoreCase).Count() != repositories.Length)
+            throw new InvalidDataException("Repositories must not contain duplicates.");
+    }
+
+    private static string RequiredString(JsonElement root, string name, bool allowEmpty = false)
+    {
+        var value = OptionalString(root, name);
+        if (value is null || (!allowEmpty && string.IsNullOrWhiteSpace(value)))
+            throw new InvalidDataException($"Research result requires a non-empty '{name}' string.");
+        return value.Trim();
+    }
+
+    private static string? OptionalString(JsonElement root, string name)
+    {
+        var property = RequiredProperty(root, name, required: false);
+        if (property.ValueKind == JsonValueKind.Undefined || property.ValueKind == JsonValueKind.Null) return null;
+        if (property.ValueKind != JsonValueKind.String) throw new InvalidDataException($"Research field '{name}' must be a string.");
+        return property.GetString();
+    }
+
+    private static JsonElement RequiredProperty(JsonElement root, string name, bool required = true)
+    {
+        foreach (var property in root.EnumerateObject())
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return property.Value;
+        if (required) throw new InvalidDataException($"Research result is missing '{name}'.");
+        return default;
+    }
+
+    private static int RequiredInt(JsonElement root, string name)
+    {
+        var property = RequiredProperty(root, name);
+        if (property.ValueKind != JsonValueKind.Number || !property.TryGetInt32(out var value)) throw new InvalidDataException($"Research field '{name}' must be an integer.");
+        return value;
+    }
+
+    private static int? OptionalInt(JsonElement root, string name)
+    {
+        var property = RequiredProperty(root, name, required: false);
+        if (property.ValueKind == JsonValueKind.Undefined || property.ValueKind == JsonValueKind.Null) return null;
+        return RequiredInt(root, name);
+    }
+
+    private static string[] RequiredStringArray(JsonElement root, string name, bool allowEmpty)
+    {
+        var property = RequiredProperty(root, name);
+        return ParseStringArray(property, name, allowEmpty);
+    }
+
+    private static string[]? OptionalStringArray(JsonElement root, string name, bool allowEmpty)
+    {
+        var property = RequiredProperty(root, name, required: false);
+        return property.ValueKind == JsonValueKind.Undefined || property.ValueKind == JsonValueKind.Null
+            ? null
+            : ParseStringArray(property, name, allowEmpty);
+    }
+
+    private static string[] ParseStringArray(JsonElement property, string name, bool allowEmpty)
+    {
+        if (property.ValueKind != JsonValueKind.Array) throw new InvalidDataException($"Research field '{name}' must be an array of strings.");
+        var values = property.EnumerateArray().Select(item =>
+        {
+            if (item.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(item.GetString())) throw new InvalidDataException($"Research field '{name}' must contain non-empty strings.");
+            return item.GetString()!.Trim();
+        }).ToArray();
+        if (!allowEmpty && values.Length == 0) throw new InvalidDataException($"Research field '{name}' must not be empty.");
+        return values;
+    }
+
+    private static bool IsSourceIssueToken(string? token, string sourceIssueId, int? sourceSequence)
+    {
+        if (string.IsNullOrWhiteSpace(token)) return false;
+        var normalized = token.Trim();
+        if (string.Equals(normalized, sourceIssueId, StringComparison.OrdinalIgnoreCase)) return true;
+
+        // Agent issue tokens also accept an unambiguous GUID prefix. A
+        // researcher must not use that shorthand to bypass the source-task
+        // status guard, in either hyphenated (D) or compact (N) form.
+        if (Guid.TryParse(sourceIssueId, out var sourceGuid) &&
+            (sourceGuid.ToString("D").StartsWith(normalized, StringComparison.OrdinalIgnoreCase) ||
+             sourceGuid.ToString("N").StartsWith(normalized, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+
+        if (normalized.StartsWith("#", StringComparison.Ordinal)) normalized = normalized[1..];
+        return sourceSequence.HasValue && int.TryParse(normalized, out var sequence) && sequence == sourceSequence.Value;
+    }
+
+    private enum ResearchStatus
+    {
+        Backlog,
+        Next,
+        Active,
+        Blocked,
+        ReadyForReview,
+        Done,
+        Rejected
+    }
+}
+
 public sealed record PendingTaskUpdateBatch(string? Description, TaskCommentDto[] Comments);
 public sealed record ClarificationChild(string Title, string Description, string Repository, string Rationale);
 public sealed record ClarificationDecision(string Action, string[] Repositories, ClarificationChild[] Children, string Rationale, double Confidence, bool Ambiguous);
@@ -386,6 +630,26 @@ public sealed class ConcurrencyGate
     public void Release()
     {
         if (Interlocked.Decrement(ref active) < 0) throw new InvalidOperationException("Concurrency reservation underflow.");
+    }
+}
+
+/// <summary>
+/// Separate admission guard for the singleton research role. The total
+/// process limit is still enforced by <see cref="ConcurrencyGate"/>; this
+/// guard only prevents two scheduler paths from launching researchers.
+/// </summary>
+public sealed class ResearchAdmission
+{
+    private int active;
+
+    public bool IsActive => Volatile.Read(ref active) != 0;
+
+    public bool TryReserve() => Interlocked.CompareExchange(ref active, 1, 0) == 0;
+
+    public void Release()
+    {
+        if (Interlocked.Exchange(ref active, 0) == 0)
+            throw new InvalidOperationException("Research admission underflow.");
     }
 }
 

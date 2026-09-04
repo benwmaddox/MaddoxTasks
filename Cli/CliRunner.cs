@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Globalization;
 using CliCommand = System.CommandLine.Command;
 using DomainCommand = MaddoxTasks.Application.Command;
 using IssueStatus = MaddoxTasks.Domain.Status;
@@ -397,6 +398,7 @@ public static class CliRunner
         command.AddCommand(BuildAgentIssuesCommand(dbOption));
         command.AddCommand(BuildAgentNextCommand(dbOption));
         command.AddCommand(BuildAgentClaimCommand(dbOption));
+        command.AddCommand(BuildAgentResearchClaimCommand(dbOption));
         command.AddCommand(BuildAgentReconcileReviewsCommand(dbOption));
         command.AddCommand(BuildAgentCommandCommand(dbOption));
         return command;
@@ -447,6 +449,27 @@ public static class CliRunner
             var engine = CreateEngine(dbPath);
             Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun));
         }, dbOption, dryRunOption);
+        return command;
+    }
+
+    private static CliCommand BuildAgentResearchClaimCommand(Option<string> dbOption)
+    {
+        var dryRunOption = new Option<bool>("--dry-run", "Select without recording a research-attempt marker.");
+        var cooldownOption = new Option<string>("--cooldown", () => "14.00:00:00", "Research cooldown as a TimeSpan (default: 14 days).");
+        var command = new CliCommand("research-claim", "Atomically claim one eligible Blocked task for read-only research.");
+        command.AddOption(dryRunOption);
+        command.AddOption(cooldownOption);
+        command.SetHandler((string dbPath, bool dryRun, string cooldownText) =>
+        {
+            if (!TimeSpan.TryParse(cooldownText, CultureInfo.InvariantCulture, out var cooldown) || cooldown <= TimeSpan.Zero)
+            {
+                Console.Error.WriteLine("--cooldown must be a positive TimeSpan such as 14.00:00:00.");
+                return;
+            }
+
+            var engine = CreateEngine(dbPath);
+            Console.WriteLine(AgentRunner.GetResearchClaimJson(engine, dryRun, cooldown));
+        }, dbOption, dryRunOption, cooldownOption);
         return command;
     }
 
