@@ -101,6 +101,8 @@ public sealed class WorkerHost
                     var owned = BlockedWorkspaceAdoption.TryAdopt(journal, task, snapshot.Config.WorktreeRoot, clock.UtcNow);
                     adopted = owned is not null;
                     job = owned ?? new Job { Task = task, Prompt = snapshot.Prompt, Model = snapshot.Config.Model, Effort = snapshot.Config.ReasoningEffort, StartedUtc = clock.UtcNow, PhaseChangedUtc = clock.UtcNow };
+                    job.BlockedReassessmentAttempted = false;
+                    TaskUpdatePolicy.Seed(job, task);
                     if (!journal.Jobs.Contains(job)) journal.Jobs.Add(job);
                     journal.Save(journalPath);
                 }
@@ -175,6 +177,7 @@ public sealed class WorkerHost
         }
         else await ValidateOwnedWorkspacesAsync(job, ct);
 
+        job.TaskUpdateWindowClosed = false;
         SetPhase(job, repair ? JobPhases.Repairing : JobPhases.Implementing);
         if (repair)
         {
@@ -199,12 +202,27 @@ public sealed class WorkerHost
                 job.ExecutionStartHeads[workspace.Repository] = (await RequireAsync("git", ["rev-parse", "HEAD"], workspace.Directory, ct)).Output.Trim();
             Save(job);
         }
+        PendingTaskUpdateBatch? resumeBatch = null;
+        if (resume)
+        {
+            await RefreshTaskUpdatesAsync(job, ct);
+            lock (journalGate) if (TaskUpdatePolicy.HasPending(job)) resumeBatch = TaskUpdatePolicy.Capture(job);
+        }
         var envelope = BuildEnvelope(job, repair);
+        if (resumeBatch is not null) envelope += "\n" + BuildTaskUpdatePrompt(resumeBatch);
         var arguments = resume && job.ThreadId is not null
             ? new List<string> { "exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", envelope }
             : BuildInitialCodexArguments(job, schema, envelope);
         var run = await RunCodexAsync(job, arguments, ct);
         if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + run.Error.Trim());
+        if (resumeBatch is not null)
+        {
+            lock (journalGate)
+            {
+                TaskUpdatePolicy.MarkDelivered(job, resumeBatch);
+                journal.Save(journalPath);
+            }
+        }
         if (!job.ExactReservationOwnerRecorded && job.ThreadId is not null)
         {
             await AddCommentAsync(job, ReservationAttribution.Exact(job.ThreadId), ct);
@@ -212,6 +230,8 @@ public sealed class WorkerHost
             Save(job);
         }
         var resultJson = ExtractResult(run.Output);
+        resultJson = await DeliverPendingTaskUpdatesAsync(job, resultJson, schema, ct);
+        await CleanIgnoredGeneratedOutputsAsync(job, ct);
         job.PendingResultJson = resultJson;
         job.PendingResultIsRepair = repair;
         SetPhase(job, JobPhases.Publishing);
@@ -230,6 +250,29 @@ public sealed class WorkerHost
     private async Task CompleteResultAsync(Job job, JsonElement result, bool repair, CancellationToken ct)
     {
         var status = result.GetProperty("status").GetString();
+        if (BlockedReassessmentPolicy.ShouldReassess(job, status))
+        {
+            job.BlockedReassessmentAttempted = true;
+            Save(job);
+            await CleanIgnoredGeneratedOutputsAsync(job, ct);
+            await RefreshTaskUpdatesAsync(job, ct);
+            var schema = WriteSchema("result", ResultSchema);
+            var batch = TaskUpdatePolicy.Capture(job);
+            var update = BuildTaskUpdatePrompt(batch);
+            var prompt = "Reassess the blocked result after worker-owned best-effort ignored-output cleanup. Cleanup failures or ignored generated residue are warnings, not blockers. Return completed or noChanges unless another substantive implementation blocker remains."
+                + (string.IsNullOrWhiteSpace(update) ? string.Empty : "\n\nInclude this newly queued human clarification in the reassessment:\n" + update)
+                + "\nReturn the normal required structured result schema.";
+            var run = await RunContinuationAsync(job, schema, prompt, ct);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + run.Error.Trim());
+            var reassessedJson = ExtractResult(run.Output);
+            TaskUpdatePolicy.MarkDelivered(job, batch);
+            job.PendingResultJson = reassessedJson;
+            Save(job);
+            await CleanIgnoredGeneratedOutputsAsync(job, ct);
+            using var reassessed = JsonDocument.Parse(reassessedJson);
+            await CompleteResultAsync(job, reassessed.RootElement, repair, ct);
+            return;
+        }
         if (status == "blocked") { await BlockAsync(job, result.GetProperty("summary").GetString() ?? "Codex reported blocked.", ct, $"{job.Model} {job.Effort}"); return; }
         await ValidateResultAsync(job, result, ct);
         ValidateRepairDispositions(job, result, repair);
@@ -273,6 +316,45 @@ public sealed class WorkerHost
         var restrictions = "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews.";
         var repairContext = repair ? $"\nFAILING CHECKS:\n{JsonSerializer.Serialize(job.PendingCheckFailures)}\nACTIONABLE REVIEW THREADS:\n{JsonSerializer.Serialize(job.PendingFeedback)}\nReturn one checkDispositions item for every failing check ID and one threadDispositions item for every review thread ID. Mark review feedback addressed only when the requested change is complete and include the reply to post." : string.Empty;
         return $"{job.Prompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}\nRESTRICTIONS:\n{restrictions}{repairContext}";
+    }
+
+    private async Task<string> DeliverPendingTaskUpdatesAsync(Job job, string resultJson, string schema, CancellationToken ct)
+    {
+        while (true)
+        {
+            PendingTaskUpdateBatch batch;
+            lock (journalGate)
+            {
+                if (!TaskUpdatePolicy.HasPending(job))
+                {
+                    job.TaskUpdateWindowClosed = true;
+                    journal.Save(journalPath);
+                    return resultJson;
+                }
+                batch = TaskUpdatePolicy.Capture(job);
+            }
+            var prompt = BuildTaskUpdatePrompt(batch) + "\nContinue the same task with these updates and return the normal required structured result schema.";
+            var run = await RunContinuationAsync(job, schema, prompt, ct);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + run.Error.Trim());
+            resultJson = ExtractResult(run.Output);
+            lock (journalGate)
+            {
+                TaskUpdatePolicy.MarkDelivered(job, batch);
+                journal.Save(journalPath);
+            }
+        }
+    }
+
+    private Task<ExecResult> RunContinuationAsync(Job job, string schema, string prompt, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(job.ThreadId)) throw new InvalidOperationException("Cannot deliver a task update without the existing Codex thread ID.");
+        return RunCodexAsync(job, ["exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", prompt], ct);
+    }
+
+    public static string BuildTaskUpdatePrompt(PendingTaskUpdateBatch batch)
+    {
+        if (batch.Description is null && batch.Comments.Length == 0) return string.Empty;
+        return "HUMAN TASK UPDATES (ordered, authoritative delta):\n" + JsonSerializer.Serialize(new { descriptionReplacement = batch.Description, userComments = batch.Comments });
     }
 
     private async Task ClarifyAsync(Job job, CancellationToken ct)
@@ -494,6 +576,9 @@ public sealed class WorkerHost
     {
         while (!ct.IsCancellationRequested)
         {
+            try { await PollTaskUpdatesAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception exception) { log.Write("warning", "task-updates.poll.failed", new { error = exception.Message }); }
             foreach (var job in SnapshotCleanupPending())
             {
                 try { await CleanupAsync(job, ct); }
@@ -507,6 +592,51 @@ public sealed class WorkerHost
                 catch (Exception exception) { log.Write("error", "monitor.failed", new { job.Task.Sequence, error = exception.Message }); }
             }
             await clock.Delay(config.Current.PrPollInterval, ct);
+        }
+    }
+
+    private async Task PollTaskUpdatesAsync(CancellationToken ct)
+    {
+        var active = SnapshotJobs(TaskUpdatePolicy.AcceptsUpdates);
+        if (active.Length == 0) return;
+        var result = await RunMaddoxAsync("issues", ct);
+        if (result.ExitCode != 0)
+        {
+            log.Write("warning", "task-updates.poll.failed", new { error = result.Error.Trim() });
+            return;
+        }
+        TaskDto[] tasks;
+        try { tasks = JsonSerializer.Deserialize<TaskDto[]>(result.Output, JsonOptions) ?? []; }
+        catch (JsonException exception) { log.Write("warning", "task-updates.poll.invalid", new { error = exception.Message }); return; }
+        var byId = tasks.ToDictionary(task => task.IssueId, StringComparer.OrdinalIgnoreCase);
+        lock (journalGate)
+        {
+            var changed = false;
+            foreach (var job in active)
+            {
+                if (!TaskUpdatePolicy.AcceptsUpdates(job) || !byId.TryGetValue(job.Task.IssueId, out var task)) continue;
+                if (TaskUpdatePolicy.Ingest(job, task))
+                {
+                    changed = true;
+                    if (TaskUpdatePolicy.HasPending(job)) log.Write("info", "task-updates.queued", new { job.Task.Sequence, description = job.PendingDescription is not null, comments = job.PendingHumanComments.Count });
+                }
+            }
+            if (changed) journal.Save(journalPath);
+        }
+        await RenderAsync();
+    }
+
+    private async Task RefreshTaskUpdatesAsync(Job job, CancellationToken ct)
+    {
+        var result = await RunMaddoxAsync("issues", ct);
+        if (result.ExitCode != 0) throw new InvalidOperationException("Could not refresh task updates before resuming Codex: " + result.Error.Trim());
+        var tasks = JsonSerializer.Deserialize<TaskDto[]>(result.Output, JsonOptions) ?? [];
+        var task = tasks.FirstOrDefault(candidate => candidate.IssueId.Equals(job.Task.IssueId, StringComparison.OrdinalIgnoreCase));
+        if (task is null) throw new InvalidOperationException("Could not find the active Maddox task before resuming Codex.");
+        lock (journalGate)
+        {
+            TaskUpdatePolicy.Ingest(job, task);
+            journal.Save(journalPath);
         }
     }
 
@@ -600,6 +730,25 @@ public sealed class WorkerHost
         log.Write("info", "job.cleaned", new { job.Task.Sequence });
     }
 
+    private async Task CleanIgnoredGeneratedOutputsAsync(Job job, CancellationToken ct)
+    {
+        if (!WorkspaceCleanupPolicy.IsProvenOwned(job, config.Current.WorktreeRoot))
+        {
+            log.Write("warning", "job.generated-clean.skipped", new { job.Task.Sequence, reason = "workspace ownership not proven" });
+            return;
+        }
+        foreach (var workspace in job.Workspaces)
+        {
+            try
+            {
+                var result = await processes.RunAsync("git", ["clean", "-fdX"], workspace.Directory, ct);
+                if (result.ExitCode != 0) log.Write("warning", "job.generated-clean.failed", new { job.Task.Sequence, workspace.Repository, error = result.Error.Trim() });
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception exception) { log.Write("warning", "job.generated-clean.failed", new { job.Task.Sequence, workspace.Repository, error = exception.Message }); }
+        }
+    }
+
     private void Enqueue(Job job, RecoveryMode mode)
     {
         lock (queueGate)
@@ -664,18 +813,22 @@ public sealed class WorkerHost
         }
     }
 
-    private async Task<ExecResult> RunCodexAsync(Job job, IEnumerable<string> arguments, CancellationToken ct) => await processes.RunAsync(config.Current.CodexExe, arguments, config.Current.RepoRoot, ct, line =>
+    private async Task<ExecResult> RunCodexAsync(Job job, IEnumerable<string> arguments, CancellationToken ct)
     {
-        try
+        var terminal = new CodexTerminalEventTracker();
+        return await processes.RunAsync(config.Current.CodexExe, arguments, config.Current.RepoRoot, ct, line =>
         {
-            var (threadId, text) = CodexEventParser.Parse(line);
-            var changed = false;
-            if (!string.IsNullOrWhiteSpace(threadId) && job.ThreadId != threadId) { job.ThreadId = threadId; changed = true; }
-            if (!string.IsNullOrWhiteSpace(text) && DashboardSummary.Update(job, text, clock.UtcNow)) changed = true;
-            if (changed) Save(job);
-        }
-        catch (JsonException) { }
-    });
+            try
+            {
+                var (threadId, text) = CodexEventParser.Parse(line);
+                var changed = false;
+                if (!string.IsNullOrWhiteSpace(threadId) && job.ThreadId != threadId) { job.ThreadId = threadId; changed = true; }
+                if (!string.IsNullOrWhiteSpace(text) && DashboardSummary.Update(job, text, clock.UtcNow)) changed = true;
+                if (changed) Save(job);
+            }
+            catch (JsonException) { }
+        }, new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)));
+    }
 
     private async Task BlockAsync(Job job, string reason, CancellationToken ct, string actor = "maddox-worker")
     {
@@ -726,6 +879,7 @@ public sealed class WorkerHost
     }
     private void Save(Job job) { lock (journalGate) journal.Save(journalPath); _ = RenderAsync(); }
     private Job[] SnapshotJobs(string phase) { lock (journalGate) return journal.Jobs.Where(job => job.Phase == phase).ToArray(); }
+    private Job[] SnapshotJobs(Func<Job, bool> predicate) { lock (journalGate) return journal.Jobs.Where(predicate).ToArray(); }
     private Job[] SnapshotCleanupPending() { lock (journalGate) return WorkspaceCleanupPolicy.Pending(journal.Jobs).ToArray(); }
     private async Task RenderAsync()
     {
@@ -749,6 +903,7 @@ public sealed class WorkerHost
                     JobPhases.Monitoring => MonitoringDisplay.Describe(job, clock.UtcNow, config.Current.ReviewQuietPeriod, IsAutoMergeAllowed(job)),
                     _ => job.Phase
                 };
+                phase = TaskUpdatePolicy.DashboardPhase(job, phase);
                 ConsoleSegmentWriter.WriteLine(DashboardSegments.Truncate(DashboardSegments.JobHeader(job, phase, clock.UtcNow - job.StartedUtc), width));
                 var repositories = job.Workspaces.Count == 0 ? string.Join(", ", job.Task.Repositories) : string.Join(", ", job.Workspaces.Select(workspace => workspace.Repository));
                 var pullRequests = job.PullRequests.Count == 0 ? null : string.Join(", ", job.PullRequests.Select(pr => pr.Url));
@@ -781,6 +936,16 @@ public sealed class WorkerHost
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
                 if (root.TryGetProperty("result", out var result)) return result.ValueKind == JsonValueKind.String ? result.GetString()! : result.GetRawText();
+                if (root.TryGetProperty("status", out _) && root.TryGetProperty("summary", out _)) return root.GetRawText();
+                if (root.TryGetProperty("type", out var eventType) && eventType.GetString() == "event_msg"
+                    && root.TryGetProperty("payload", out var payload) && payload.ValueKind == JsonValueKind.Object
+                    && payload.TryGetProperty("type", out var payloadType) && payloadType.GetString() == "task_complete"
+                    && payload.TryGetProperty("last_agent_message", out var lastMessage) && lastMessage.ValueKind == JsonValueKind.String)
+                {
+                    var candidate = lastMessage.GetString()!;
+                    using var structured = JsonDocument.Parse(candidate);
+                    if (structured.RootElement.ValueKind == JsonValueKind.Object) return candidate;
+                }
                 if (root.TryGetProperty("item", out var item)
                     && item.ValueKind == JsonValueKind.Object
                     && item.TryGetProperty("type", out var type)
