@@ -24,6 +24,8 @@
 
   <ItemGroup>
     <Compile Remove="tests\**\*.cs" />
+    <Compile Remove="Worker\**\*.cs" />
+    <Compile Remove="Worker.Tests\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -41,7 +41,7 @@ Read `references/commands.md` for concrete command patterns.
 
 1. Use `agent issues` to read current state as JSON.
 For "list tasks", use `agent issues` by default.
-2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `UpdateDescription`, `AddComment`, `RequeueBlocked`). Repository reservations are labels in the canonical form `repo:<name>`; repository identity is case-insensitive.
+2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `SetRepositoryLabels`, `UpdateDescription`, `AddComment`, `RequeueBlocked`). Repository reservations are labels in the canonical form `repo:<name>`; repository identity is case-insensitive. Use `SetRepositoryLabels` to atomically replace repository scope while preserving unrelated labels.
 For `CreateIssue`, omit `status` to store `Next` (the default), or set `status` explicitly to `Backlog`; other initial statuses are rejected. Successful command responses include the final stored `status`.
 For `RequeueBlocked`, set optional boolean `dryRun` to `true` to preview the atomic move of every currently `Blocked` issue to `Next`. The response reports sequence-ordered changed and skipped GUIDs; preview writes nothing.
 For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.3-codex high"` or `"claude-sonnet"`), or pass `--actor <model-id>` on `agent command`. If actor is omitted, auto-detection uses env vars first, then Claude settings, then Codex config.

@@ -235,6 +235,11 @@ public sealed class Issue
                 _labels.Remove(labelRemoved.Label);
                 UpdatedAt = labelRemoved.Timestamp;
                 break;
+            case RepositoryLabelsSet labelsSet:
+                _labels.RemoveWhere(static label => label.StartsWith(RepositoryLabels.Prefix, StringComparison.OrdinalIgnoreCase));
+                foreach (var repository in labelsSet.Repositories) _labels.Add(RepositoryLabels.ToLabel(repository));
+                UpdatedAt = labelsSet.Timestamp;
+                break;
             case DescriptionUpdated descriptionUpdated:
                 Description = descriptionUpdated.Description;
                 UpdatedAt = descriptionUpdated.Timestamp;

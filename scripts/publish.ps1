@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $projectFile = Join-Path $projectRoot "MaddoxTasks.csproj"
+$workerProject = Join-Path $projectRoot "Worker\MaddoxTasks.Worker.csproj"
 $validatorScript = Join-Path $PSScriptRoot "validate-published-agent.ps1"
 
 if (-not (Test-Path $projectFile)) {
@@ -78,6 +79,13 @@ foreach ($rid in $Runtime) {
     }
     catch {
         throw "Published agent validation failed for runtime '$rid': $($_.Exception.Message)"
+    }
+    if ($rid -like "win-*") {
+        dotnet publish $workerProject -c $Configuration -r $rid --self-contained $selfContained /p:PublishSingleFile=true -o $outDir
+        if ($LASTEXITCODE -ne 0) { throw "Worker publish failed for runtime '$rid'." }
+        Copy-Item (Join-Path $projectRoot "Worker\worker.json") $outDir -Force
+        Copy-Item (Join-Path $projectRoot "Worker\worker-prompt.md") $outDir -Force
+        Copy-Item (Join-Path $projectRoot "scripts\install-worker-task.ps1") $outDir -Force
     }
 }
 

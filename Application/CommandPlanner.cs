@@ -15,10 +15,27 @@ public static class CommandPlanner
             ChangePriority changePriority => PlanPriorityChange(changePriority, state, timestamp),
             AddLabel addLabel => PlanLabelAdd(addLabel, state, timestamp),
             RemoveLabel removeLabel => PlanLabelRemove(removeLabel, state, timestamp),
+            SetRepositoryLabels setRepositoryLabels => PlanRepositoryLabelsSet(setRepositoryLabels, state, timestamp),
             UpdateDescription updateDescription => PlanDescriptionUpdate(updateDescription, state, timestamp),
             AddComment addComment => PlanCommentAdd(addComment, state, timestamp),
             _ => throw new CommandValidationException($"Unsupported command '{command.GetType().Name}'.")
         };
+    }
+
+    private static IssueEvent PlanRepositoryLabelsSet(SetRepositoryLabels command, IssueState state, DateTime timestamp)
+    {
+        var issue = RequireIssue(command.IssueId, state);
+        var repositories = command.Repositories
+            .Select(static value => value?.Trim() ?? string.Empty)
+            .Where(static value => value.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static value => value, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (repositories.Length == 0) throw new CommandValidationException("At least one repository is required.");
+        if (repositories.Any(static value => value.StartsWith(RepositoryLabels.Prefix, StringComparison.OrdinalIgnoreCase) || value.Any(char.IsControl)))
+            throw new CommandValidationException("Repositories must be names without the 'repo:' prefix.");
+        if (issue.Status.HoldsRepositoryReservation()) ValidateActiveReservation(issue, repositories, state);
+        return new RepositoryLabelsSet(Guid.NewGuid(), command.IssueId, timestamp, repositories);
     }
 
     private static IssueEvent PlanCreate(CreateIssue command, IssueState state, DateTime timestamp)

@@ -15,6 +15,7 @@ public static class EventSerializer
             PriorityChanged value => JsonSerializer.Serialize(value, JsonDefaults.Context.PriorityChanged),
             LabelAdded value => JsonSerializer.Serialize(value, JsonDefaults.Context.LabelAdded),
             LabelRemoved value => JsonSerializer.Serialize(value, JsonDefaults.Context.LabelRemoved),
+            RepositoryLabelsSet value => JsonSerializer.Serialize(value, JsonDefaults.Context.RepositoryLabelsSet),
             DescriptionUpdated value => JsonSerializer.Serialize(value, JsonDefaults.Context.DescriptionUpdated),
             CommentAdded value => JsonSerializer.Serialize(value, JsonDefaults.Context.CommentAdded),
             _ => throw new InvalidOperationException($"Unknown event type '{issueEvent.GetType().Name}'.")
@@ -30,6 +31,7 @@ public static class EventSerializer
             nameof(PriorityChanged) => DeserializeTyped(payload, JsonDefaults.Context.PriorityChanged),
             nameof(LabelAdded) => DeserializeTyped(payload, JsonDefaults.Context.LabelAdded),
             nameof(LabelRemoved) => DeserializeTyped(payload, JsonDefaults.Context.LabelRemoved),
+            nameof(RepositoryLabelsSet) => DeserializeTyped(payload, JsonDefaults.Context.RepositoryLabelsSet),
             nameof(DescriptionUpdated) => DeserializeTyped(payload, JsonDefaults.Context.DescriptionUpdated),
             nameof(CommentAdded) => DeserializeTyped(payload, JsonDefaults.Context.CommentAdded),
             _ => throw new InvalidOperationException($"Unknown event type '{eventType}'.")

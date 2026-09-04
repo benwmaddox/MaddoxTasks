@@ -96,6 +96,7 @@ Supported `type` values (all available agent commands):
 - `ChangePriority`
 - `AddLabel`
 - `RemoveLabel`
+- `SetRepositoryLabels`
 - `UpdateDescription`
 - `AddComment`
 - `RequeueBlocked`
@@ -170,6 +171,18 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
   "label": "infra"
 }
 ```
+
+`SetRepositoryLabels`:
+
+```json
+{
+  "type": "SetRepositoryLabels",
+  "issueId": "1",
+  "repositories": ["StasisLang", "MaddoxTasks"]
+}
+```
+
+The nonempty repository list replaces only `repo:` labels. Values are normalized and deduplicated case-insensitively. Reservation conflicts are checked in the same event-store transaction, so failure leaves all labels unchanged. The success response includes the canonical `repositories` array.
 
 `UpdateDescription`:
 

@@ -19,13 +19,33 @@ jobs:
           dotnet-version: 9.0.x
 
       - name: Restore
-        run: dotnet restore MaddoxTasks.csproj
+        run: dotnet restore tests/MaddoxTasks.Tests/MaddoxTasks.Tests.csproj
 
       - name: Build
-        run: dotnet build MaddoxTasks.csproj -c Release --no-restore
+        run: dotnet build tests/MaddoxTasks.Tests/MaddoxTasks.Tests.csproj -c Release --no-restore
 
       - name: Test
-        run: dotnet test tests/MaddoxTasks.Tests/MaddoxTasks.Tests.csproj -c Release --no-build
+        run: dotnet test tests/MaddoxTasks.Tests/MaddoxTasks.Tests.csproj -c Release --no-build --no-restore
+
+  worker-build-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Restore worker tests
+        run: dotnet restore Worker.Tests/MaddoxTasks.Worker.Tests.csproj
+
+      - name: Build worker tests
+        run: dotnet build Worker.Tests/MaddoxTasks.Worker.Tests.csproj -c Release --no-restore
+
+      - name: Test worker
+        run: dotnet test Worker.Tests/MaddoxTasks.Worker.Tests.csproj -c Release --no-build --no-restore
 
   publish-and-smoke:
     strategy:
@@ -68,3 +88,23 @@ jobs:
         run: >-
           ./scripts/validate-published-agent.ps1
           -Binary out/${{ matrix.runtime }}/${{ matrix.binary }}
+
+      - name: Publish Windows worker
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: >-
+          dotnet publish Worker/MaddoxTasks.Worker.csproj
+          -c Release
+          -r ${{ matrix.runtime }}
+          --self-contained true
+          -p:PublishSingleFile=true
+          -o out/${{ matrix.runtime }}
+
+      - name: Verify Windows worker payload
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Copy-Item Worker/worker.json out/${{ matrix.runtime }}/worker.json
+          Copy-Item Worker/worker-prompt.md out/${{ matrix.runtime }}/worker-prompt.md
+          Copy-Item scripts/install-worker-task.ps1 out/${{ matrix.runtime }}/install-worker-task.ps1
+          ./scripts/install-worker-task.ps1 -BinaryDir out/${{ matrix.runtime }} -DryRun

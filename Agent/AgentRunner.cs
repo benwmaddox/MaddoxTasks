@@ -24,6 +24,15 @@ public static partial class AgentRunner
         }
 
         var result = engine.Execute(command!);
+        if (command is SetRepositoryLabels && result.Success && result.IssueId is { } repositoryIssueId)
+        {
+            var state = engine.GetState();
+            if (state.TryGetIssue(repositoryIssueId, out var repositoryIssue))
+            {
+                var updatedIssue = ToAgentIssueDto(new IssueView(state.GetSequence(repositoryIssueId), repositoryIssue));
+                return JsonSerializer.Serialize(new SetRepositoryLabelsResponse(true, result.Message, repositoryIssueId.ToString(), updatedIssue.Repositories, updatedIssue), PrettyJsonContext.SetRepositoryLabelsResponse);
+            }
+        }
         Status? finalStatus = null;
         if (result.Success && result.IssueId is { } issueId && engine.GetState().TryGetIssue(issueId, out var issue))
         {
@@ -207,6 +216,8 @@ public static partial class AgentRunner
                     return TryBuildLabelAdd(root, engine, out command, out error);
                 case "removelabel":
                     return TryBuildLabelRemove(root, engine, out command, out error);
+                case "setrepositorylabels":
+                    return TryBuildRepositoryLabelsSet(root, engine, out command, out error);
                 case "updatedescription":
                     return TryBuildDescriptionUpdate(root, engine, defaultActor, out command, out error);
                 case "addcomment":
@@ -216,6 +227,20 @@ public static partial class AgentRunner
                     return false;
             }
         }
+    }
+
+    private static bool TryBuildRepositoryLabelsSet(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    {
+        command = null;
+        if (!TryResolveIssue(root, engine, out var issueId, out error)) return false;
+        if (!TryGetProperty(root, "repositories", out var element) || element.ValueKind != JsonValueKind.Array)
+        { error = "repositories must be a non-empty array of strings."; return false; }
+        var values = new List<string>();
+        foreach (var item in element.EnumerateArray())
+        { if (item.ValueKind != JsonValueKind.String) { error = "repositories must contain only strings."; return false; } values.Add(item.GetString() ?? ""); }
+        if (values.Count == 0) { error = "repositories must be a non-empty array of strings."; return false; }
+        command = new SetRepositoryLabels(issueId, values);
+        return true;
     }
 
     private static bool TryBuildCreateIssue(JsonElement root, out Command? command, out string error)
@@ -731,6 +756,7 @@ public static partial class AgentRunner
         bool DryRun,
         string[] ChangedIssueIds,
         string[] SkippedIssueIds);
+    private sealed record SetRepositoryLabelsResponse(bool Success, string Message, string IssueId, string[] Repositories, AgentIssueDto Issue);
 
     private sealed record AgentIssueDto(
         int Sequence,
@@ -758,6 +784,7 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(AgentIssueDto))]
     [JsonSerializable(typeof(AgentCommandResponse))]
     [JsonSerializable(typeof(RequeueBlockedResponse))]
+    [JsonSerializable(typeof(SetRepositoryLabelsResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]
     [JsonSerializable(typeof(ReviewReconciliationOutcome))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;
