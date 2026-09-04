@@ -345,7 +345,8 @@ internal static class WebAssets
     }
     function renderBoard() {
       board.textContent = '';
-      statuses.forEach(status => {
+      const boardStatuses = statuses.filter(status => status !== 'Done' || byId('include-done').checked);
+      boardStatuses.forEach(status => {
         const issues = state.issues.filter(issue => issue.status === status).sort(compareIssuePriority);
         const column = document.createElement('section');
         column.className = 'column';

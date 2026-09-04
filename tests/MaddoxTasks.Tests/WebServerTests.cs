@@ -205,6 +205,16 @@ public sealed class WebServerTests
         Assert.DoesNotContain("await refresh(true, false)", html, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void EmbeddedWebUiOnlyRendersDoneColumnWhenIncluded()
+    {
+        var html = WebAssets.IndexHtml;
+
+        Assert.Contains("const boardStatuses = statuses.filter(status => status !== 'Done' || byId('include-done').checked);",
+            html, StringComparison.Ordinal);
+        Assert.Contains("boardStatuses.forEach(status =>", html, StringComparison.Ordinal);
+    }
+
     private static async Task<string> CreateIssueAsync(HttpClient client, string title, int priority)
     {
         using var response = await client.PostAsync("api/issues",
