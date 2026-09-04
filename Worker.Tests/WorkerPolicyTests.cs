@@ -161,11 +161,12 @@ public sealed class WorkerPolicyTests
     public void DashboardSegments_UseDarkTerminalPaletteBySemanticRole()
     {
         var job = CreateJob(JobPhases.Implementing);
-        var header = DashboardSegments.JobHeader(job, "Implementing", TimeSpan.FromMinutes(2));
+        var header = DashboardSegments.JobHeader(job, "Implementing", TimeSpan.FromMinutes(2) + TimeSpan.FromMilliseconds(345));
         Assert.Equal(ConsoleColor.Cyan, header[0].Color);
         Assert.Equal(ConsoleColor.Magenta, header[2].Color);
         Assert.Equal(ConsoleColor.Cyan, header[4].Color);
         Assert.Equal(ConsoleColor.Gray, header[5].Color);
+        Assert.Equal("] 0:02:00", header[5].Text);
         var repository = DashboardSegments.RepositoryLine("MaddoxTasks", null);
         Assert.Equal(ConsoleColor.Cyan, repository[1].Color);
         Assert.Equal(ConsoleColor.White, DashboardSegments.Detail);
