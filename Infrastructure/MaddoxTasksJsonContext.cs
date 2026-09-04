@@ -13,6 +13,7 @@ namespace MaddoxTasks.Infrastructure;
 [JsonSerializable(typeof(PriorityChanged))]
 [JsonSerializable(typeof(LabelAdded))]
 [JsonSerializable(typeof(LabelRemoved))]
+[JsonSerializable(typeof(RepositoryLabelsSet))]
 [JsonSerializable(typeof(DescriptionUpdated))]
 [JsonSerializable(typeof(CommentAdded))]
 internal sealed partial class MaddoxTasksJsonContext : JsonSerializerContext;

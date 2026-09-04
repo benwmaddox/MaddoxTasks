@@ -33,6 +33,8 @@ public sealed record RemoveLabel(
     string Label
 ) : Command;
 
+public sealed record SetRepositoryLabels(IssueId IssueId, IReadOnlyList<string> Repositories) : Command;
+
 public sealed record UpdateDescription(
     IssueId IssueId,
     string Description,

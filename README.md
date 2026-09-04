@@ -195,6 +195,18 @@ Comment example:
 }
 ```
 
+Atomically replace only an issue's repository labels while preserving every other label:
+
+```json
+{
+  "type": "SetRepositoryLabels",
+  "issueId": "1",
+  "repositories": ["StasisLang", "MaddoxTasks"]
+}
+```
+
+The repository list must be nonempty. Names are normalized and deduplicated case-insensitively, and the entire command is rejected without changes if any requested repository is reserved by another `Active` or `ReadyForReview` issue.
+
 Requeue every currently `Blocked` issue to `Next` in one atomic command:
 
 ```json
@@ -228,6 +240,13 @@ For hourly Windows automation, preview or install the versioned scripts (install
 ```powershell
 .\scripts\run-reserved-task.ps1 -MaddoxExe F:\MaddoxTasks\MaddoxTasks.exe -RepoRoot D:\code -Preview
 .\scripts\install-reserved-task.ps1 -MaddoxExe F:\MaddoxTasks\MaddoxTasks.exe -RepoRoot D:\code
+```
+
+The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `worker-prompt.md`. Register the interactive at-logon worker (or validate the registration without changing Task Scheduler) with:
+
+```powershell
+.\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks -DryRun
+.\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:

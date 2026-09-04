@@ -48,6 +48,10 @@ public sealed record LabelRemoved(
     string Label
 ) : IssueEvent(EventId, IssueId, Timestamp);
 
+public sealed record RepositoryLabelsSet(
+    Guid EventId, IssueId IssueId, DateTime Timestamp, string[] Repositories
+) : IssueEvent(EventId, IssueId, Timestamp);
+
 public sealed record DescriptionUpdated(
     Guid EventId,
     IssueId IssueId,

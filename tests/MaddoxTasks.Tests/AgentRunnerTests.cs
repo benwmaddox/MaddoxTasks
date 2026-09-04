@@ -9,6 +9,35 @@ namespace MaddoxTasks.Tests;
 public sealed class AgentRunnerTests
 {
     [Fact]
+    public void SetRepositoryLabels_RejectsConflictWithoutPartialChange()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var target = IssueId.New();
+        var blocker = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), target, now, "Target", null, Status.Active, Priority.From(3), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), target, now, "keep"));
+        store.Append(new LabelAdded(Guid.NewGuid(), target, now, "repo:old"));
+        store.Append(new IssueCreated(Guid.NewGuid(), blocker, now, "Blocker", null, Status.ReadyForReview, Priority.From(3), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), blocker, now, "repo:busy"));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(now.AddMinutes(1)));
+        using var failed = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SetRepositoryLabels","issueId":"{{target}}","repositories":["new","BUSY"]}"""));
+        Assert.False(failed.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(["old"], engine.GetState().Issues[target].Repositories);
+        Assert.Contains("keep", engine.GetState().Issues[target].Labels);
+
+        using var applied = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SetRepositoryLabels","issueId":"{{target}}","repositories":["New","new"]}"""));
+        Assert.True(applied.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(["new"], applied.RootElement.GetProperty("repositories").EnumerateArray().Select(x => x.GetString()!).ToArray());
+        var updatedIssue = applied.RootElement.GetProperty("issue");
+        Assert.Equal("Target", updatedIssue.GetProperty("title").GetString());
+        Assert.Equal(["new"], updatedIssue.GetProperty("repositories").EnumerateArray().Select(x => x.GetString()!).ToArray());
+        Assert.Contains("keep", updatedIssue.GetProperty("labels").EnumerateArray().Select(x => x.GetString()!));
+        Assert.Contains("keep", engine.GetState().Issues[target].Labels);
+    }
+    [Fact]
     public void ExecuteCommandJson_RequeueBlockedSerializesDedicatedStableResponse()
     {
         var timestamp = new DateTime(2026, 8, 30, 12, 0, 0, DateTimeKind.Utc);

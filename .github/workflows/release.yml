@@ -108,7 +108,13 @@ jobs:
         with:
           dotnet-version: 9.0.x
 
-      - name: Publish
+      - name: Publish Windows release payload
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: ./scripts/publish.ps1 -Runtime ${{ matrix.runtime }} -Configuration Release -OutputRoot "out/${{ matrix.runtime }}"
+
+      - name: Publish non-Windows release payload
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -122,6 +128,7 @@ jobs:
             -o "out/${{ matrix.runtime }}"
 
       - name: Smoke test published agent
+        if: matrix.os != 'windows-latest'
         shell: pwsh
         run: ./scripts/validate-published-agent.ps1 -Binary "out/${{ matrix.runtime }}/${{ matrix.binary }}"
 

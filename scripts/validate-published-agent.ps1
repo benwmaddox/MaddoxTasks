@@ -186,14 +186,20 @@ try {
         throw "CreateIssue Backlog returned status '$($backlogResult.status)' instead of 'Backlog'."
     }
 
-    $labelCommandPath = Join-Path $tempRoot "label-command.json"
+    $labelCommandPath = Join-Path $tempRoot "repository-labels-command.json"
     Write-CommandFile -Path $labelCommandPath -Command ([ordered]@{
-            type    = "AddLabel"
-            issueId = $issueId
-            label   = "repo:published-smoke"
+            type         = "SetRepositoryLabels"
+            issueId      = $issueId
+            repositories = @("Published-Smoke", "published-smoke")
         })
     $labelResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "command", "--file", $labelCommandPath) -WorkingDirectory $tempRoot
-    [void](Assert-CommandSucceeded -Response $labelResponse -Step "AddLabel repo:published-smoke")
+    $labelResult = Assert-CommandSucceeded -Response $labelResponse -Step "SetRepositoryLabels published-smoke"
+    if (@($labelResult.repositories).Count -ne 1 -or [string]$labelResult.repositories[0] -ine "published-smoke") {
+        throw "SetRepositoryLabels did not return one normalized repository."
+    }
+    if ($null -eq $labelResult.issue -or [string]$labelResult.issue.issueId -ne $issueId -or @($labelResult.issue.repositories).Count -ne 1) {
+        throw "SetRepositoryLabels did not return the updated issue DTO."
+    }
 
     $issuesResponse = Invoke-PublishedAgent -Executable $binaryPath -Arguments @("agent", "issues") -WorkingDirectory $tempRoot
     $issues = @(Convert-AgentJson -Json $issuesResponse.StdOut -Step "agent issues after create")
