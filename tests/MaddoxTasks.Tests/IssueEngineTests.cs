@@ -1,6 +1,7 @@
 using MaddoxTasks.Application;
 using MaddoxTasks.Domain;
 using MaddoxTasks.Infrastructure;
+using Microsoft.Data.Sqlite;
 
 namespace MaddoxTasks.Tests;
 
@@ -785,6 +786,136 @@ public sealed class IssueEngineTests
         Assert.Equal(Status.Next, engine.GetState().Issues[staleId].Status);
         Assert.Equal(Status.ReadyForReview, engine.GetState().Issues[reviewId].Status);
         Assert.Equal(6, store.LoadAll().Count(eventItem => eventItem.IssueId == staleId));
+    }
+
+    [Fact]
+    public void ResearchClaim_SelectsOneBlockedIssueInDeterministicHierarchyOrder()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStore();
+        var root = IssueId.New();
+        var child = IssueId.New();
+        var laterRoot = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), root, now, "Root", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), child, now.AddMinutes(1), "Child", null, Status.Blocked, Priority.From(5), root, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), laterRoot, now.AddMinutes(2), "Later root", null, Status.Blocked, Priority.From(2), null, null));
+        var engine = new IssueEngine(store, new FrozenClock(now.AddHours(1)));
+
+        var first = engine.ResearchClaimBlocked();
+        var second = engine.ResearchClaimBlocked();
+        var third = engine.ResearchClaimBlocked();
+
+        Assert.Equal(child, first.Task!.Issue.Id);
+        Assert.Equal(root, second.Task!.Issue.Id);
+        Assert.Equal(laterRoot, third.Task!.Issue.Id);
+        Assert.All(engine.GetState().OrderedIssues, issue => Assert.Equal(Status.Blocked, issue.Status));
+        Assert.Equal(3, engine.GetEventLog().OfType<CommentAdded>().Count(comment => ResearchClaimPolicy.IsAttempt(new IssueComment(comment.Timestamp, comment.Comment, comment.Actor))));
+    }
+
+    [Fact]
+    public void ResearchClaim_CooldownBoundaryIsInclusiveAndDryRunDoesNotWrite()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var cutoff = now.AddDays(-14);
+        var eligible = IssueId.New();
+        var tooRecent = IssueId.New();
+        var store = new InMemoryEventStore();
+        store.Append(new IssueCreated(Guid.NewGuid(), eligible, now, "At boundary", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), eligible, cutoff, ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, now.AddMinutes(1), "Too recent", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, cutoff.AddTicks(1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        var before = store.LoadAll().Count;
+
+        var preview = engine.ResearchClaimBlocked(dryRun: true);
+
+        Assert.True(preview.Success);
+        Assert.True(preview.DryRun);
+        Assert.Equal(eligible, preview.Task!.Issue.Id);
+        Assert.Equal(before, store.LoadAll().Count);
+        Assert.Equal(2, engine.GetState().OrderedIssues.Count(issue => ResearchClaimPolicy.HasAttempt(issue)));
+
+        var applied = engine.ResearchClaimBlocked();
+        Assert.Equal(eligible, applied.Task!.Issue.Id);
+        Assert.Null(engine.ResearchClaimBlocked().Task);
+    }
+
+    [Fact]
+    public async Task ResearchClaim_ConcurrentSqliteClaimsCannotDuplicateTheMarker()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "maddox-research-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var databasePath = Path.Combine(directory, "tasks.db");
+        try
+        {
+            var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+            var setup = new SqliteEventStore(databasePath);
+            var issueId = IssueId.New();
+            setup.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+            var firstEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
+            var secondEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
+
+            var results = await Task.WhenAll(
+                Task.Run(() => firstEngine.ResearchClaimBlocked()),
+                Task.Run(() => secondEngine.ResearchClaimBlocked()));
+
+            Assert.Single(results, result => result.Task is not null);
+            Assert.Single(results, result => result.Task is null);
+            var finalEvents = new SqliteEventStore(databasePath).LoadAll();
+            Assert.Single(finalEvents.OfType<CommentAdded>(), comment => comment.Actor == ResearchClaimPolicy.Actor);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            for (var attempt = 0; Directory.Exists(directory) && attempt < 20; attempt++)
+            {
+                try { Directory.Delete(directory, recursive: true); }
+                catch (IOException) { Thread.Sleep(25); }
+            }
+        }
+    }
+
+    [Fact]
+    public void CompleteResearch_OnlyAdvancesTheStillBlockedClaimedSource()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStore();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        Assert.True(engine.ResearchClaimBlocked().Success);
+
+        Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Done)).Success);
+        var before = engine.GetEventLog().Count;
+        var result = engine.CompleteResearch(issueId);
+
+        Assert.False(result.Success);
+        Assert.Equal(ResearchCompletionStatus.NotBlocked, result.Status);
+        Assert.Equal(Status.Done, engine.GetState().Issues[issueId].Status);
+        Assert.Equal(before, engine.GetEventLog().Count);
+    }
+
+    [Fact]
+    public void CompleteResearch_RejectsUnclaimedSourceAndSupportsDryRun()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var unclaimed = IssueId.New();
+        var claimed = IssueId.New();
+        var store = new InMemoryEventStore();
+        store.Append(new IssueCreated(Guid.NewGuid(), claimed, now, "Claimed", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), unclaimed, now.AddMinutes(1), "Unclaimed", null, Status.Blocked, Priority.From(3), null, null));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        var rejected = engine.CompleteResearch(unclaimed);
+        Assert.False(rejected.Success);
+        Assert.Equal(ResearchCompletionStatus.NotResearchClaimed, rejected.Status);
+
+        Assert.True(engine.ResearchClaimBlocked().Success);
+        var before = engine.GetEventLog().Count;
+        var preview = engine.CompleteResearch(claimed, dryRun: true);
+        Assert.True(preview.Success);
+        Assert.Equal(ResearchCompletionStatus.WouldAdvance, preview.Status);
+        Assert.Equal(before, engine.GetEventLog().Count);
+        Assert.Equal(Status.Blocked, engine.GetState().Issues[claimed].Status);
     }
 
     private static IssueId AppendNextIssue(IEventStore store, string title, string repository, int priority = 3)

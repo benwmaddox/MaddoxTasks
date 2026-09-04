@@ -45,6 +45,29 @@ Real claim:
 
 `agent claim` first resets stale Codex reservations and then atomically selects the first eligible `Next` issue using hierarchy order. A reset applies only to an `Active` issue with `UpdatedAt` at least 24 hours before the single normalized claim time (24 hours with no activity) and a current-period comment beginning exactly `Reservation owner: codexThreadId=` with a nonempty value, including `unavailable`. The current period begins at the latest `StatusChanged` to `Active`; older reservation comments do not qualify. Reset events and audit comments are ordered by issue sequence and persist even when no claim is available. Task families are ordered by top-level root priority and sequence. Each family is traversed child-first, with siblings ordered by priority and sequence; parents are considered after all descendants. For `agent next`, `Active` is only a tiebreaker among otherwise equal-priority siblings or roots; it never overrides descendant-before-ancestor traversal. A child uses only its own reservation keys, so a reserved parent does not block a disjoint child. A reserved child is skipped so a later claimable sibling can be selected. A family is exhausted before selection moves to the next family. The selected issue must not overlap an `Active` or `ReadyForReview` issue. A repository-less issue is eligible and uses the synthetic `missing` reservation key while its returned `repositories` array stays empty. It changes exactly that issue to `Active` and returns its issue JSON. It returns `null` when no claim is available. A scheduled runner should stop cleanly on `null`. `agent next` is read-only and selects the first `Active` or `Next` issue using the same hierarchy order. Missing and cyclic parent links are handled deterministically. `--dry-run` simulates stale cleanup and claim selection without appending events; the preview issue reports `Next`.
 
+## Blocked-task research claim
+
+Preview one eligible blocked task without recording an attempt:
+
+```powershell
+.\MaddoxTasks.exe agent research-claim --dry-run
+```
+
+Record the durable research-attempt marker on one task:
+
+```powershell
+.\MaddoxTasks.exe agent research-claim
+.\MaddoxTasks.exe agent research-claim --cooldown 14.00:00:00
+```
+
+The command selects at most one `Blocked` task in hierarchy priority/sequence order. A task whose latest exact
+`maddox-research-worker` marker is newer than the positive cooldown is skipped; the marker is written atomically so
+concurrent workers cannot claim the same task. Preview writes no events. The worker's research Codex receives a
+read-only all-task snapshot and may perform read-only web research, but all file, Git/GitHub, and external mutations
+are forbidden. A validated result may change only Maddox task entries (including creating tasks). After mutations and
+findings are recorded, the worker uses its internal `CompleteResearch` command, which requires the marker and moves
+the source from `Blocked` to `Next` only if it is still `Blocked`.
+
 Repository labels are canonicalized as lowercase `repo:<name>` identities and compared case-insensitively. With no repository labels, Active and `ReadyForReview` tasks reserve the synthetic `missing` identity; an explicit `repo:missing` collides with it. Status and label changes are rejected when their resulting reservation keys conflict. The scheduled runner starts a repository-less claim from normalized `RepoRoot`, passes no `--add-dir`, and warns that no repository was specified and the impact scope is unknown.
 
 The scheduled runner checks `ReadyForReview` tasks after work. Only canonical `https://github.com/<owner>/<repo>/pull/<number>` URLs in descriptions/comments are associated. It closes a task only when all associated PRs have non-null `mergedAt`; no-PR, open, closed-unmerged, and lookup-error tasks remain unchanged.
@@ -101,6 +124,7 @@ Supported `type` values (all available agent commands):
 - `UpdateDescription`
 - `AddComment`
 - `RequeueBlocked`
+- `CompleteResearch` (worker-only conditional source transition)
 
 Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels.
 
