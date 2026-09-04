@@ -735,10 +735,10 @@ public sealed class WorkerHost
                 ConsoleSegmentWriter.WriteLine(DashboardSegments.Truncate(DashboardSegments.RepositoryLine(repositories, pullRequests), width));
                 var details = job.Phase == JobPhases.Blocked && !string.IsNullOrWhiteSpace(job.BlockReason)
                     ? new[] { "Reason: " + DashboardFormatter.LatestLines(job.BlockReason).LastOrDefault() }
-                    : job.Latest;
+                    : DashboardFormatter.NormalizePersistedLatest(job.Latest);
                 var detailLimit = job.Phase == JobPhases.Blocked ? 1 : 3;
                 var latestChangedLocal = job.Phase == JobPhases.Blocked ? null : job.LatestChangedUtc?.ToLocalTime();
-                var updatePrefixWidth = latestChangedLocal is null ? 0 : ("  Update · " + DashboardSegments.FormatUpdateTimestamp(latestChangedLocal.Value) + " ").Length - 2;
+                var updatePrefixWidth = latestChangedLocal is null ? 0 : ("  " + DashboardSegments.FormatUpdateTimestamp(latestChangedLocal.Value) + " ").Length - 2;
                 var wrapped = DashboardFormatter.WrapLines(details, Math.Max(3, width - updatePrefixWidth), maxLines: detailLimit);
                 for (var index = 0; index < wrapped.Length; index++)
                 {

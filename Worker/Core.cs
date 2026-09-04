@@ -341,15 +341,12 @@ public static class DashboardFormatter
             if (root.TryGetProperty("status", out var status) && root.TryGetProperty("summary", out var summary))
             {
                 _ = status;
-                var result = new List<string> { "Summary: " + Sanitize(summary.GetString() ?? string.Empty) };
-                AddRepositories(root, result, includeChangeState: true);
-                lines = result.Take(3).ToArray();
+                lines = ["Summary: " + Sanitize(summary.GetString() ?? string.Empty)];
                 return true;
             }
             if (root.TryGetProperty("ambiguous", out var ambiguous) && root.TryGetProperty("rationale", out var rationale))
             {
                 var result = new List<string> { ambiguous.GetBoolean() ? "Repository clarification: ambiguous" : "Repository clarification: identified" };
-                AddRepositories(root, result, includeChangeState: false);
                 result.Add("Rationale: " + Sanitize(rationale.GetString() ?? string.Empty));
                 lines = result.Take(3).ToArray();
                 return true;
@@ -359,22 +356,8 @@ public static class DashboardFormatter
         catch (Exception exception) when (exception is JsonException or InvalidOperationException) { return false; }
     }
 
-    private static void AddRepositories(JsonElement root, List<string> lines, bool includeChangeState)
-    {
-        if (!root.TryGetProperty("repositories", out var repositories) || repositories.ValueKind != JsonValueKind.Array) return;
-        var values = new List<string>();
-        foreach (var repository in repositories.EnumerateArray())
-        {
-            if (repository.ValueKind == JsonValueKind.String) values.Add(Sanitize(repository.GetString() ?? string.Empty));
-            else if (repository.ValueKind == JsonValueKind.Object && repository.TryGetProperty("repository", out var name))
-            {
-                var value = Sanitize(name.GetString() ?? string.Empty);
-                if (includeChangeState && repository.TryGetProperty("changed", out var changed)) value += changed.GetBoolean() ? " (changed)" : " (unchanged)";
-                values.Add(value);
-            }
-        }
-        if (values.Count > 0) lines.Add("Repositories: " + string.Join(", ", values));
-    }
+    public static string[] NormalizePersistedLatest(IEnumerable<string> latest) => LatestLines(string.Join('\n', latest));
+
 }
 
 public static class DashboardSummary
@@ -462,7 +445,7 @@ public static class DashboardSegments
         var text = wrappedText.StartsWith("  ", StringComparison.Ordinal) ? wrappedText[2..] : wrappedText;
         return
         [
-            new("  Update · " + FormatUpdateTimestamp(localTime) + " ", Tag),
+            new("  " + FormatUpdateTimestamp(localTime) + " ", Tag),
             new(text, Detail)
         ];
     }
