@@ -1,6 +1,6 @@
 ---
 name: maddox-tasks
-description: Operate and automate Maddox Tasks via agent JSON commands. Use when users ask to list/create/update tasks in machine-readable workflows, execute agent command payloads, diagnose database path behavior (MaddoxTasks.db defaults and MaddoxTasks.json overrides), or validate CI/release behavior for MaddoxTasks.
+description: Operate and automate Maddox Tasks via agent JSON commands. Use when users ask to list, create, update, bulk-requeue, claim, or research tasks; diagnose database path behavior; or validate MaddoxTasks CI and releases.
 ---
 
 # Maddox Tasks Skill
@@ -40,12 +40,11 @@ Read `references/commands.md` for concrete command patterns.
 ## Agent Command Workflow
 
 1. Use `agent issues` to read current state as JSON.
-For "list tasks", use `agent issues` by default.
-2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `SetRepositoryLabels`, `UpdateDescription`, `AddComment`, `RequeueBlocked`). Repository reservations are labels in the canonical form `repo:<name>`; repository identity is case-insensitive. Use `SetRepositoryLabels` to atomically replace repository scope while preserving unrelated labels.
-For `CreateIssue`, omit `status` to store `Next` (the default), or set `status` explicitly to `Backlog`; other initial statuses are rejected. Successful command responses include the final stored `status`.
-For `RequeueBlocked`, set optional boolean `dryRun` to `true` to preview the atomic move of every currently `Blocked` issue to `Next`. The response reports sequence-ordered changed and skipped GUIDs; preview writes nothing.
-For blocked-task research, use `agent research-claim` (or `agent research-claim --dry-run`) to atomically select one eligible `Blocked` task. Its exact `maddox-research-worker` comment marker is the durable attempt record; the configured `researchCooldown` defaults to 14 days and prevents another claim for that task during the cooldown. The worker gives the research Codex a read-only snapshot, permits read-only web research, and validates a closed set of Maddox task-entry mutations before applying them. The internal `CompleteResearch` command can move the source to `Next` only when its research marker exists and the source is still `Blocked`; it cannot overwrite a human status change.
-For `UpdateDescription` and `AddComment`, set `"actor"` to the exact model identifier (for example `"gpt-5.3-codex high"` or `"claude-sonnet"`), or pass `--actor <model-id>` on `agent command`. If actor is omitted, auto-detection uses env vars first, then Claude settings, then Codex config.
+2. Build structured command JSON (`CreateIssue`, `ChangeStatus`, `ChangePriority`, `AddLabel`, `RemoveLabel`, `SetRepositoryLabels`, `SplitIssue`, `UpdateDescription`, `AddComment`, `RequeueBlocked`). Repository reservations are labels in the canonical form `repo:<name>`; repository identity is case-insensitive. Use `SetRepositoryLabels` to atomically replace repository scope while preserving unrelated labels.
+   - For `CreateIssue`, omit `status` to store `Next` (the default), or set `status` explicitly to `Backlog`; other initial statuses are rejected. Successful command responses include the final stored `status`.
+   - For `RequeueBlocked`, set optional boolean `dryRun` to `true` to preview the atomic move of every currently `Blocked` issue to `Next`. Prefer this single transactional command over issuing one `ChangeStatus` command per task. The response reports sequence-ordered changed and skipped GUIDs; preview writes nothing.
+   - For blocked-task research, use `agent research-claim` (or `agent research-claim --dry-run`) to atomically select one eligible `Blocked` task. Its exact `maddox-research-worker` comment marker is the durable attempt record; the configured `researchCooldown` defaults to 14 days and prevents another claim for that task during the cooldown. The worker gives the research Codex a read-only snapshot of only the selected task, permits read-only web research, and validates a closed set of Maddox task-entry mutations before applying them. The internal `CompleteResearch` command can move the source to `Next` only when its research marker exists and the source is still `Blocked`; it cannot overwrite a human status change.
+   - For `UpdateDescription` and `AddComment`, set `"actor"` to the exact runtime model identifier, or pass `--actor <model-id>` on `agent command`. If actor is omitted, auto-detection uses environment variables first, then Claude settings, then Codex config.
 3. Execute with `agent command --file <json-file>` or stdin. Treat inline `--json` as last-resort on PowerShell.
 4. Re-read with `agent issues` and verify deterministic output.
 
@@ -74,7 +73,7 @@ The command emits one JSON result containing per-task outcomes (`closed`, `noPul
 
 ## Task Lifecycle Expectations
 
-1. When beginning work on a task, use `agent claim`; do not select or activate a task separately.
+1. A scheduled worker beginning its next task uses `agent claim`; it does not select or activate a task separately. When a user names a task, operate on that task and do not claim an unrelated one.
 2. While working, record decision points as comments using `AddComment`.
 3. When implementation is complete, change the task status to `Ready for Review`.
 

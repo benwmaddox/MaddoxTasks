@@ -27,8 +27,6 @@ Optional filters on `agent issues`:
 - `--due-before <yyyy-MM-dd or date-time>`
 - `--include-done <true|false>` (default is `true`; legacy option name that includes terminal `Done` and `Rejected` tasks)
 
-## Execute Commands
-
 ## Atomic Repository Claim
 
 Read-only preview:
@@ -63,7 +61,7 @@ Record the durable research-attempt marker on one task:
 The command selects at most one `Blocked` task in hierarchy priority/sequence order. A task whose latest exact
 `maddox-research-worker` marker is newer than the positive cooldown is skipped; the marker is written atomically so
 concurrent workers cannot claim the same task. Preview writes no events. The worker's research Codex receives a
-read-only all-task snapshot and may perform read-only web research, but all file, Git/GitHub, and external mutations
+read-only snapshot containing only the selected task and may perform read-only web research, but all file, Git/GitHub, and external mutations
 are forbidden. A validated result may change only Maddox task entries (including creating tasks). After mutations and
 findings are recorded, the worker uses its internal `CompleteResearch` command, which requires the marker and moves
 the source from `Blocked` to `Next` only if it is still `Blocked`.
@@ -82,6 +80,8 @@ To run this deterministic step directly:
 
 The JSON response includes `dryRun` and an `outcomes` array. Each outcome includes the task id, title, canonical deduplicated PR URLs, and one of `closed`, `noPullRequests`, `unmerged`, `lookupError`, `concurrentStateChange`, `notFound`, or `dryRun`. A dry run does not invoke GitHub CLI or mutate tasks.
 
+## Execute Commands
+
 Run with inline JSON:
 
 ```powershell
@@ -94,10 +94,10 @@ Run with file JSON:
 .\MaddoxTasks.exe agent command --file cmd.json
 ```
 
-Set default actor once (used when payload omits `actor` for `UpdateDescription` / `AddComment`):
+Set the exact runtime model identifier once when the payload omits `actor` for `UpdateDescription` or `AddComment`:
 
 ```powershell
-.\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
+.\MaddoxTasks.exe agent command --actor "gpt-6-astra low" --file cmd.json
 ```
 
 PowerShell stdin pattern (avoids quote escaping):
@@ -231,7 +231,7 @@ At least two children are required. Each child must have a nonempty title and de
   "type": "UpdateDescription",
   "issueId": "1",
   "description": "Updated description text",
-  "actor": "gpt-5.2"
+  "actor": "gpt-6-astra low"
 }
 ```
 
