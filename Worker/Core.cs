@@ -37,7 +37,8 @@ public sealed record WorkerConfig(
     string RepoRoot,
     string WorktreeRoot,
     TimeSpan? BlockedDisplayDuration = null,
-    TimeSpan? ResearchCooldown = null)
+    TimeSpan? ResearchCooldown = null,
+    string? PrivateRepositoryOwner = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
