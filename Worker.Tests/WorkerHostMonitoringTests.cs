@@ -101,6 +101,20 @@ public sealed class WorkerHostMonitoringTests
         Assert.False(fixture.Job.ReviewWindow.Closed);
     }
 
+    [Fact]
+    public async Task Continuation_RunsCodexFromRetainedPrimaryWorkspace()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.ThreadId = "thread-1";
+
+        await fixture.ContinueAsync();
+
+        var command = Assert.Single(fixture.Processes.Commands, command => command.Executable == "codex");
+        Assert.Equal(fixture.Job.Workspaces[0].Directory, command.WorkingDirectory);
+        Assert.Equal(["exec", "resume", "thread-1"], command.Arguments[..3]);
+        Assert.Equal("-", command.Arguments[^1]);
+    }
+
     private static PullRequestSnapshot Snapshot(bool merged, IReadOnlyList<CheckState>? checks = null, IReadOnlyList<ReviewFeedback>? feedback = null)
         => new(merged, checks ?? [new CheckState("build", "SUCCESS", "pass", "")], feedback ?? []);
 
@@ -178,6 +192,12 @@ public sealed class WorkerHostMonitoringTests
             await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
         }
 
+        public async Task ContinueAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("RunContinuationAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task<ExecResult>)method.Invoke(Host, [Job, "schema.json", "continue", CancellationToken.None])!;
+        }
+
         public void Dispose() => directory.Dispose();
     }
 
@@ -207,7 +227,7 @@ public sealed class WorkerHostMonitoringTests
 
         public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null)
         {
-            var call = new CommandCall(executable, arguments.ToArray());
+            var call = new CommandCall(executable, arguments.ToArray(), workingDirectory);
             Commands.Add(call);
             return Task.FromResult(call.Arguments.Contains("command", StringComparer.Ordinal)
                 ? new ExecResult(0, "{\"success\":true}", string.Empty)
@@ -215,7 +235,7 @@ public sealed class WorkerHostMonitoringTests
         }
     }
 
-    private sealed record CommandCall(string Executable, string[] Arguments)
+    private sealed record CommandCall(string Executable, string[] Arguments, string WorkingDirectory)
     {
         public bool IsStatus(string status) => Arguments.Contains("command", StringComparer.Ordinal) && Arguments.Any(argument => argument.Contains($"\"newStatus\":\"{status}\"", StringComparison.Ordinal));
     }

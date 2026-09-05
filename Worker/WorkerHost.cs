@@ -1165,7 +1165,8 @@ public sealed class WorkerHost
     {
         var terminal = new CodexTerminalEventTracker();
         var input = ProcessArguments.WithPromptOnStandardInput(arguments);
-        return await processes.RunAsync(config.Current.CodexExe, input.Arguments, config.Current.RepoRoot, ct, line =>
+        var workingDirectory = job.Workspaces.FirstOrDefault()?.Directory ?? config.Current.RepoRoot;
+        return await processes.RunAsync(config.Current.CodexExe, input.Arguments, workingDirectory, ct, line =>
         {
             try
             {
