@@ -82,6 +82,21 @@ public sealed class WebServerTests
                 $"api/issues/{issueId}/status") { Content = Json("""{"status":"Done"}""") });
             Assert.Equal(HttpStatusCode.OK, status.StatusCode);
 
+            using var openList = await client.GetAsync("api/issues");
+            Assert.Equal(HttpStatusCode.OK, openList.StatusCode);
+            using var openListJson = JsonDocument.Parse(await openList.Content.ReadAsStringAsync());
+            Assert.Equal(0, openListJson.RootElement.GetProperty("count").GetInt32());
+
+            using var doneList = await client.GetAsync("api/issues?status=Done&includeDone=true");
+            Assert.Equal(HttpStatusCode.OK, doneList.StatusCode);
+            using var doneListJson = JsonDocument.Parse(await doneList.Content.ReadAsStringAsync());
+            var summary = Assert.Single(doneListJson.RootElement.GetProperty("issues").EnumerateArray());
+            Assert.Equal(issueId, summary.GetProperty("id").GetString());
+            Assert.Equal("Done", summary.GetProperty("status").GetString());
+            Assert.False(summary.TryGetProperty("description", out _));
+            Assert.False(summary.TryGetProperty("comments", out _));
+            Assert.False(summary.TryGetProperty("history", out _));
+
             using var detail = await client.GetAsync($"api/issues/{issueId}");
             Assert.Equal(HttpStatusCode.OK, detail.StatusCode);
             using var detailJson = JsonDocument.Parse(await detail.Content.ReadAsStringAsync());
@@ -202,6 +217,10 @@ public sealed class WebServerTests
         Assert.Contains("async function refresh(silent = false, preserveDetailDraft = true)", html,
             StringComparison.Ordinal);
         Assert.Contains("setInterval(() => refresh(true), 10000)", html, StringComparison.Ordinal);
+        Assert.Contains("status === 'Done' || status === 'Rejected'", html, StringComparison.Ordinal);
+        Assert.Contains("Unable to load issue", html, StringComparison.Ordinal);
+        Assert.Contains("issue.parentId", html, StringComparison.Ordinal);
+        Assert.Contains("issue.dueDate", html, StringComparison.Ordinal);
         Assert.DoesNotContain("await refresh(true, false)", html, StringComparison.Ordinal);
     }
 
@@ -210,7 +229,9 @@ public sealed class WebServerTests
     {
         var html = WebAssets.IndexHtml;
 
-        Assert.Contains("const boardStatuses = statuses.filter(status => status !== 'Done' || byId('include-done').checked);",
+        Assert.Contains("const showTerminal = byId('include-done').checked || selectedStatus === 'Done' || selectedStatus === 'Rejected';",
+            html, StringComparison.Ordinal);
+        Assert.Contains("const boardStatuses = statuses.filter(status => showTerminal || (status !== 'Done' && status !== 'Rejected'));",
             html, StringComparison.Ordinal);
         Assert.Contains("boardStatuses.forEach(status =>", html, StringComparison.Ordinal);
     }

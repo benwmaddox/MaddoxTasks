@@ -177,7 +177,7 @@ internal static class WebAssets
       <label>Search <input id="search" type="search" placeholder="Title, description, or label" autocomplete="off"></label>
       <label>Status <select id="status-filter"><option value="">All statuses</option></select></label>
       <label>Priority at most <select id="priority-filter"><option value="">Any priority</option><option value="1">1 - urgent</option><option value="2">2 - high</option><option value="3">3 - normal</option><option value="4">4 - low</option><option value="5">5 - someday</option></select></label>
-      <div class="filter-actions"><button id="clear-filters" class="subtle" type="button">Clear</button><label class="check"><input id="include-done" type="checkbox"> Include done</label></div>
+      <div class="filter-actions"><button id="clear-filters" class="subtle" type="button">Clear</button><label class="check"><input id="include-done" type="checkbox"> Include done/rejected</label></div>
     </section>
     <div id="load-error" class="alert hidden" role="alert"></div>
     <section id="board" class="board" aria-live="polite"></section>
@@ -283,7 +283,7 @@ internal static class WebAssets
       if (search) params.set('search', search);
       if (status) params.set('status', status);
       if (priority) params.set('maxPriority', priority);
-      if (byId('include-done').checked) params.set('includeDone', 'true');
+      if (byId('include-done').checked || status === 'Done' || status === 'Rejected') params.set('includeDone', 'true');
       return params.toString();
     }
     function captureDetailDraft() {
@@ -350,7 +350,9 @@ internal static class WebAssets
     }
     function renderBoard() {
       board.textContent = '';
-      const boardStatuses = statuses.filter(status => status !== 'Done' || byId('include-done').checked);
+      const selectedStatus = byId('status-filter').value;
+      const showTerminal = byId('include-done').checked || selectedStatus === 'Done' || selectedStatus === 'Rejected';
+      const boardStatuses = statuses.filter(status => showTerminal || (status !== 'Done' && status !== 'Rejected'));
       boardStatuses.forEach(status => {
         const issues = state.issues.filter(issue => issue.status === status).sort(compareIssuePriority);
         const column = document.createElement('section');
@@ -417,6 +419,11 @@ internal static class WebAssets
         renderDetail();
         restoreDetailDraft(currentDraft);
       } catch (error) {
+        if (state.detail && state.detail.id === id && !silent) {
+          byId('detail-heading').textContent = 'Unable to load issue';
+          byId('detail-body').innerHTML = `<div class="alert" role="alert">${escapeHtml(error.message)}</div><div class="button-row"><button type="button" id="close-detail">Close</button></div>`;
+          byId('close-detail').onclick = () => closeOverlay('detail-overlay');
+        }
         if (!silent) showToast(error.message, 'error');
       }
     }
@@ -434,7 +441,9 @@ internal static class WebAssets
       const labelTags = (issue.labels || []).map(label => labelTag(label, true)).join('');
       const comments = (issue.comments || []).slice().reverse().map(comment => `<article class="comment-item"><div class="meta">${escapeHtml(comment.actor)} · ${escapeHtml(new Date(comment.timestamp).toLocaleString())}</div><div>${escapeHtml(comment.comment)}</div></article>`).join('') || '<div class="muted">No comments yet.</div>';
       const history = (issue.history || []).slice().reverse().map(item => `<article class="history-item"><div class="meta">${escapeHtml(new Date(item.timestamp).toLocaleString())} · ${escapeHtml(item.eventType)}</div><div>${historyText(item)}</div></article>`).join('') || '<div class="muted">No history.</div>';
-      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><button type="button" id="close-detail">Close</button></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><div class="section">${comments}</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
+      const parent = issue.parentId ? ` · parent ${escapeHtml(issue.parentId)}` : '';
+      const due = issue.dueDate ? ` · due ${escapeHtml(new Date(issue.dueDate).toLocaleString())}` : '';
+      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><button type="button" id="close-detail">Close</button></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)}${parent}${due} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><div class="section">${comments}</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
       byId('close-detail').onclick = () => closeOverlay('detail-overlay');
       byId('edit-status').onchange = event => mutateStatus(event.target.value);
       byId('edit-priority').onchange = event => mutatePriority(Number(event.target.value));

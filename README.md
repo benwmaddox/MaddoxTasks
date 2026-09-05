@@ -138,7 +138,11 @@ shortcuts are:
 - `/`: search; `r`: refresh; `?`: help; `Esc`: close the current panel
 
 Shortcuts are ignored while typing in a form. The JSON API is available under
-`/api/issues` for clients that need the same browser operations. The 10-second
+`/api/issues` for clients that need the same browser operations. Board requests
+send the active search, status, priority, and terminal-task filters and return
+summary fields only; descriptions, comments, and history are fetched from
+`/api/issues/{id}` when a detail panel opens. Done and Rejected tasks stay out of
+the board response unless they are explicitly included or selected. The 10-second
 automatic and manual refresh preserve unsaved description, label, and comment
 drafts along with focus, selection, and scroll position. A successful mutation
 reloads server state while clearing only the submitted field. Current reservation
