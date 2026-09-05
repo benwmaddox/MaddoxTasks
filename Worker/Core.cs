@@ -117,6 +117,7 @@ public sealed record ResearchPlan(
 public static class ResearchPlanPolicy
 {
     public const string Actor = "maddox-research-worker";
+    public const string Completed = "completed";
     public const string Unblocked = "unblocked";
     public const string StillBlocked = "stillBlocked";
 
@@ -144,9 +145,10 @@ public static class ResearchPlanPolicy
         if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Research result must be a JSON object.");
 
         var outcome = RequiredString(root, "outcome");
-        if (outcome.Equals(Unblocked, StringComparison.OrdinalIgnoreCase)) outcome = Unblocked;
+        if (outcome.Equals(Completed, StringComparison.OrdinalIgnoreCase)) outcome = Completed;
+        else if (outcome.Equals(Unblocked, StringComparison.OrdinalIgnoreCase)) outcome = Unblocked;
         else if (outcome.Equals(StillBlocked, StringComparison.OrdinalIgnoreCase)) outcome = StillBlocked;
-        else throw new InvalidDataException("Research outcome must be 'unblocked' or 'stillBlocked'.");
+        else throw new InvalidDataException("Research outcome must be 'completed', 'unblocked', or 'stillBlocked'.");
 
         var summary = RequiredString(root, "summary");
         var findings = RequiredStringArray(root, "findings", allowEmpty: true);

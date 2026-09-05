@@ -259,26 +259,28 @@ Requeue every currently `Blocked` issue to `Next` in one atomic command:
 `--dry-run` to preview without recording the marker, or `--cooldown 14.00:00:00` to override the positive cooldown.
 The selection uses hierarchy priority/sequence order and skips a task whose latest marker is newer than the cooldown.
 The worker's internal `CompleteResearch` command is conditional: it requires the research marker and changes the
-source from `Blocked` to `Next` only if the source is still `Blocked`, so a human status change cannot be overwritten.
+source from `Blocked` to `Next`, or to `Done` for completed ledger-only work, only if the source is still `Blocked`, so a human status change cannot be overwritten.
 
 PowerShell tip: prefer `--file` or stdin here-string over inline `--json` to avoid escaping problems.
 If actor is omitted for `UpdateDescription`/`AddComment`, default resolution order is `--actor`, then env vars (`MADDOX_TASKS_AGENT_ACTOR`, `MADDOX_TASKS_ACTOR`, `CODEX_MODEL`, `OPENAI_MODEL`, `ANTHROPIC_MODEL`, `CLAUDE_MODEL`, `MODEL`), then Claude settings (`.claude/settings.local.json`, `.claude/settings.json`, `~/.claude/settings.json` model), then Codex config (`~/.codex/config.toml` model + reasoning effort), then `agent`.
 
 `agent issues` includes a deterministic `repositories` array derived from `repo:` labels. `agent claim` and `agent next` order work hierarchically: task families are ordered by their top-level root priority and sequence, then each family is traversed child-first with siblings ordered by priority and sequence. For `agent next`, `Active` is only a tiebreaker among otherwise equal-priority siblings or roots; it never overrides descendant-before-ancestor traversal. A child is considered using only its own reservation keys, so a reserved parent does not block a disjoint child, and a reserved child does not block a later claimable sibling. Before selecting, `agent claim` automatically resets any `Active` task whose latest mutation is at least 24 hours old (24 hours with no activity) and which has a current-period comment beginning `Reservation owner: codexThreadId=` with a nonempty value (including `unavailable`). The reset writes a `Next` status event and an audit comment, in issue-sequence order, then atomically selects the first eligible `Next` issue whose reservation keys are not held by `Active` or `ReadyForReview` work. A repository-less task is eligible and uses the synthetic `missing` reservation while still returning `repositories: []`. Historical reservation comments from earlier Active periods, non-Codex reservations, young tasks, and `ReadyForReview` tasks are not reset. Cleanup is persisted even when no claim is available. `agent next` reports the first `Active` or `Next` issue in the same hierarchy order. Both commands handle missing or cyclic parent links deterministically. Claim prints `null` when no issue is available; scheduled runners should stop for that hour. `--dry-run` simulates stale cleanup and selection, reports the preview issue as `Next`, and writes no events. For a repository-less claim, `scripts/run-reserved-task.ps1` starts Codex in the normalized `RepoRoot`, passes no `--add-dir`, and warns that the impact scope is unknown.
 
+The long-running worker follows the same repository-less rule: it starts Codex in `RepoRoot` and attempts the stated objective instead of treating a missing `repo:` label as repository ambiguity. For task-management objectives, Codex may use only the published executable's agent JSON commands and may not change the claimed source status. The worker owns the source lifecycle. A processing failure before any worktree exists returns the task to `Next` with a retry comment; only a substantive blocked result from the task run moves it to `Blocked`.
+
 The worker also reserves at most one shared Codex slot for blocked-task research. `agent research-claim` atomically
 selects one eligible `Blocked` task in the same hierarchy order and records a durable
 `maddox-research-worker` comment marker. A task with a marker newer than the configured
 `researchCooldown` (14 days by default) is skipped, so concurrent or recurring runs do not
-research the same task too often. Each run receives only the selected task's description and
-comments in a temporary JSON file, without fetching the full task database. Live web search
+research the same task too often. Each run receives the selected task plus current blocked-task
+context in a temporary JSON file, without direct database access. Live web search
 is enabled so the researcher can investigate that task's blocker, open relevant sources,
 and cite evidence for a concrete resolution. The research Codex process runs read-only;
 it cannot mutate files, Git/GitHub, or external services. Its
 validated result may only change Maddox task entries (including creating tasks). Findings are
 recorded as a task comment; only after all task-entry mutations succeed does the worker use an
-atomic `CompleteResearch` transition that changes the original task from `Blocked` to `Next`
-if it is still `Blocked`. If it is still blocked, the findings remain on the task and its
+atomic `CompleteResearch` transition that changes the original task from `Blocked` to `Next`,
+or to `Done` when ledger-only research completed the objective, if it is still `Blocked`. If it is still blocked, the findings remain on the task and its
 status remains unchanged.
 
 After its claim/work loop, the hourly runner checks `ReadyForReview` tasks using only PR URLs found in their descriptions and comments. A review task with no PR URL stays open. A task closes automatically only when every associated PR reports a non-null `mergedAt` from `gh pr view`; open, closed-unmerged, lookup-error, and ambiguous cases remain `ReadyForReview` with a warning. Preview mode reports intended checks without calling `gh` or mutating tasks.

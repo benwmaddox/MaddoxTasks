@@ -187,6 +187,25 @@ public sealed class AgentRunnerTests
         Assert.Equal(Status.Done, engine.GetState().Issues[issueId].Status);
     }
 
+    [Fact]
+    public void ExecuteCommandJson_CompleteResearchSupportsDoneForLedgerOnlyWork()
+    {
+        var timestamp = new DateTime(2026, 9, 5, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Task operations", null, Status.Blocked, Priority.From(1), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(timestamp));
+        Assert.True(engine.ResearchClaimBlocked().Success);
+
+        using var completion = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"CompleteResearch","issueId":"{{issueId}}","completionStatus":"Done"}"""));
+
+        Assert.True(completion.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Done", completion.RootElement.GetProperty("task").GetProperty("status").GetString());
+        Assert.Equal(Status.Done, engine.GetState().Issues[issueId].Status);
+    }
+
     [Theory]
     [InlineData("null")]
     [InlineData("\"true\"")]

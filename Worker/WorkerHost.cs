@@ -213,7 +213,10 @@ public sealed class WorkerHost
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(settings.ClarificationTimeout);
-            await File.WriteAllTextAsync(snapshotPath, JsonSerializer.Serialize(task), ct);
+            var blockedTasks = await RunMaddoxCommandAsync(["issues", "--status", "Blocked"], ct);
+            if (blockedTasks.ExitCode != 0)
+                throw new InvalidOperationException("Could not load blocked-task research context: " + blockedTasks.Error.Trim());
+            await File.WriteAllTextAsync(snapshotPath, BuildResearchSnapshot(task, blockedTasks.Output), ct);
             var prompt = BuildResearchPrompt(task, snapshotPath);
             var arguments = BuildResearchCodexArguments(settings, schema, prompt);
 
@@ -281,17 +284,22 @@ public sealed class WorkerHost
             }
         }
 
-        // Findings are written after task mutations. For an unblocked outcome
+        // Findings are written after task mutations. For a terminal outcome
         // the source transition below is intentionally the final command.
         await RunRequiredCommandAsync(
             new { type = "AddComment", issueId = sourceTask.IssueId, comment = ResearchPlanPolicy.FindingsComment(plan) },
             ResearchPlanPolicy.Actor,
             ct);
 
-        if (plan.Outcome == ResearchPlanPolicy.Unblocked)
+        if (plan.Outcome is ResearchPlanPolicy.Unblocked or ResearchPlanPolicy.Completed)
         {
             await RunRequiredCommandAsync(
-                new { type = "CompleteResearch", issueId = sourceTask.IssueId },
+                new
+                {
+                    type = "CompleteResearch",
+                    issueId = sourceTask.IssueId,
+                    completionStatus = plan.Outcome == ResearchPlanPolicy.Completed ? "Done" : "Next"
+                },
                 null,
                 ct);
         }
@@ -389,14 +397,22 @@ public sealed class WorkerHost
             "-m", settings.Model, "-c", $"model_reasoning_effort={settings.ReasoningEffort}",
             "--sandbox", "read-only", "--skip-git-repo-check", "-C", settings.RepoRoot, prompt];
 
+    public static string BuildResearchSnapshot(TaskDto sourceTask, string blockedTasksJson)
+    {
+        using var blockedTasks = JsonDocument.Parse(blockedTasksJson);
+        if (blockedTasks.RootElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Blocked-task research context must be a JSON array.");
+        return JsonSerializer.Serialize(new { selectedTask = sourceTask, blockedTasks = blockedTasks.RootElement });
+    }
+
     public static string BuildResearchPrompt(TaskDto sourceTask, string snapshotPath)
-        => "You are the Maddox blocked-task research worker. Investigate only the single selected blocked task identified below. Parse the file locally to read its description and comments and identify the current blocker. The file contains only this task, not the task database. Read selected fields or recent comments in bounded chunks if its history is long. Do not enumerate or load the whole Maddox task database.\n\n"
+        => "You are the Maddox blocked-task research worker. Investigate the selected source task identified below. Parse the worker-supplied snapshot locally to read its description and comments and identify the current blocker. The snapshot also contains the current Blocked task records so cross-task triage objectives can inspect and update relevant tasks. It is bounded task context, not direct database access. Read selected fields or recent comments in bounded chunks if histories are long; do not load the entire file into the prompt.\n\n"
             + "Use the available live web search tools to investigate the blocker and find a concrete way to resolve it. Start with focused queries based on this task; open relevant results, prefer primary sources and current documentation, and cite source URLs in your findings. Distinguish verified facts from suggested next steps. If search cannot resolve the blocker or the search tools are unavailable, explain what is missing and leave the task blocked.\n\n"
             + "This is a read-only investigation. You may perform read-only web or other external research when useful. Do not edit files, run commands that mutate state, use Git or GitHub for mutations, create branches, commit, push, open or merge pull requests, send messages, or perform any external mutation or other side effect. The worker process alone will apply the returned task-entry mutations through MaddoxTasks after validating them.\n\n"
-            + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to unblocked only when the proposed task-entry changes genuinely remove the blocker; otherwise set stillBlocked. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
+            + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to completed only when the source objective is fully satisfied by the proposed task-entry mutations and requires no repository implementation. Set outcome to unblocked when the proposed changes remove the blocker but the source still needs normal implementation. Otherwise set stillBlocked. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
             + "SOURCE TASK:\n"
             + JsonSerializer.Serialize(new { sourceTask.Sequence, sourceTask.IssueId })
-            + "\n\nSELECTED TASK JSON FILE (authoritative for this research run; read-only):\n"
+            + "\n\nRESEARCH SNAPSHOT JSON FILE (authoritative for this research run; read-only):\n"
             + JsonSerializer.Serialize(snapshotPath);
 
     private async Task RunReservedJobAsync(Job job, RecoveryMode mode, CancellationToken ct)
@@ -412,7 +428,17 @@ public sealed class WorkerHost
         catch (Exception exception)
         {
             log.Write("error", "job.failed", new { job.Task.Sequence, error = exception.Message });
-            try { await BlockAsync(job, exception.Message, ct); }
+            try
+            {
+                if (job.Workspaces.Count == 0)
+                {
+                    await AddCommentAsync(job, "Worker retry scheduled after processing failure: " + exception.Message, ct);
+                    await ChangeStatusAsync(job, "Next", ct);
+                    job.BlockReason = null;
+                    SetPhase(job, JobPhases.Done);
+                }
+                else await BlockAsync(job, exception.Message, ct);
+            }
             catch (Exception blockException) { log.Write("error", "job.block.failed", new { job.Task.Sequence, error = blockException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
         }
         finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); await RenderAsync(); }
@@ -438,8 +464,7 @@ public sealed class WorkerHost
     {
         var repair = mode == RecoveryMode.ResumeRepair;
         var resume = mode is RecoveryMode.ResumeInitial or RecoveryMode.ResumeRepair;
-        if (job.Task.Repositories.Length == 0 && !await ClarifyAsync(job, ct)) return;
-        if (job.Task.Repositories.Length == 0 || job.Phase == JobPhases.Blocked) return;
+        if (job.Phase == JobPhases.Blocked) return;
         var normalizedRepositories = job.Task.Repositories.Select(repository => RepositoryPathPolicy.Normalize(config.Current.RepoRoot, repository)).ToArray();
         if (!normalizedRepositories.SequenceEqual(job.Task.Repositories, StringComparer.OrdinalIgnoreCase))
         {
@@ -449,7 +474,7 @@ public sealed class WorkerHost
             job.Task = job.Task with { Repositories = normalizedRepositories };
             Save(job);
         }
-        if (job.Workspaces.Count == 0)
+        if (job.Task.Repositories.Length > 0 && job.Workspaces.Count == 0)
         {
             foreach (var repository in job.Task.Repositories)
             {
@@ -494,7 +519,7 @@ public sealed class WorkerHost
         if (resumeBatch is not null) envelope += "\n" + BuildTaskUpdatePrompt(resumeBatch);
         var arguments = resume && job.ThreadId is not null
             ? BuildContinuationCodexArguments(job, schema, envelope)
-            : BuildInitialCodexArguments(job, schema, envelope);
+            : BuildInitialCodexArguments(job, schema, envelope, config.Current.RepoRoot);
         ExecResult run;
         string resultJson;
         if (resumeBatch is not null) TaskUpdatePolicy.BeginApplying(job);
@@ -619,9 +644,16 @@ public sealed class WorkerHost
 
     private string BuildEnvelope(Job job, bool repair)
     {
-        var restrictions = "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews.";
+        var repositoryless = job.Task.Repositories.Length == 0;
+        var basePrompt = repositoryless
+            ? "You are implementing one already-claimed Maddox task from the configured repository root. No repository was specified, so the impact scope is unknown: start from RepoRoot, inspect what the task requires, and make only changes required by the issue. If the objective is task management, use only the published MaddoxTasks executable and its agent JSON commands; never read or write the database directly. Do not change the source task status because the worker owns its lifecycle. Return blocked only when a substantive requirement in the task cannot be completed with the available context or environment. For a successfully completed task-management objective with no repository file changes, return noChanges."
+            : job.Prompt;
+        var restrictions = repositoryless
+            ? "Do not claim another task, change the source task status, edit the Maddox database directly, create branches, commit, push, create/merge PRs, or reconcile reviews."
+            : "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews.";
         var repairContext = repair ? $"\nFAILING CHECKS:\n{JsonSerializer.Serialize(job.PendingCheckFailures)}\nACTIONABLE REVIEW THREADS:\n{JsonSerializer.Serialize(job.PendingFeedback)}\nReturn one checkDispositions item for every failing check ID and one threadDispositions item for every review thread ID. Mark review feedback addressed only when the requested change is complete and include the reply to post." : string.Empty;
-        return $"{job.Prompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}\nRESTRICTIONS:\n{restrictions}{repairContext}";
+        var executionRoot = repositoryless ? $"\nREPO ROOT:\n{config.Current.RepoRoot}" : string.Empty;
+        return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}\nRESTRICTIONS:\n{restrictions}{repairContext}";
     }
 
     private async Task<string> DeliverPendingTaskUpdatesAsync(Job job, string resultJson, string schema, CancellationToken ct)
@@ -716,9 +748,12 @@ public sealed class WorkerHost
         if (inside.ExitCode != 0 || inside.Output.Trim() != "true" || remote.ExitCode != 0 || string.IsNullOrWhiteSpace(remote.Output)) throw new InvalidOperationException("Repository has no usable Git origin: " + repository);
     }
 
-    public static List<string> BuildInitialCodexArguments(Job job, string schema, string envelope)
+    public static List<string> BuildInitialCodexArguments(Job job, string schema, string envelope, string? fallbackDirectory = null)
     {
-        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--approve-for-me", "--skip-git-repo-check", "-C", job.Workspaces[0].Directory };
+        var workingDirectory = job.Workspaces.FirstOrDefault()?.Directory ?? fallbackDirectory;
+        if (string.IsNullOrWhiteSpace(workingDirectory))
+            throw new InvalidDataException("A repository-less task requires a fallback working directory.");
+        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--approve-for-me", "--skip-git-repo-check", "-C", workingDirectory };
         foreach (var workspace in job.Workspaces.Skip(1)) { arguments.Add("--add-dir"); arguments.Add(workspace.Directory); }
         arguments.Add(envelope);
         return arguments;
@@ -1348,5 +1383,5 @@ public sealed class WorkerHost
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private const string ClarifySchema = """{"type":"object","properties":{"action":{"enum":["assign","split"]},"repositories":{"type":"array","items":{"type":"string"}},"children":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"repository":{"type":"string"},"rationale":{"type":"string"}},"required":["title","description","repository","rationale"],"additionalProperties":false}},"rationale":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"ambiguous":{"type":"boolean"}},"required":["action","repositories","children","rationale","confidence","ambiguous"],"additionalProperties":false}""";
     private const string ResultSchema = """{"type":"object","properties":{"status":{"enum":["completed","noChanges","blocked"]},"summary":{"type":"string"},"validationEvidence":{"type":"array","items":{"type":"string"}},"repositories":{"type":"array","items":{"type":"object","properties":{"repository":{"type":"string"},"changed":{"type":"boolean"}},"required":["repository","changed"],"additionalProperties":false}},"commitMessage":{"type":"string"},"prTitle":{"type":"string"},"prBody":{"type":"string"},"checkDispositions":{"type":"array","items":{"type":"object","properties":{"checkId":{"type":"string"},"addressed":{"type":"boolean"},"summary":{"type":"string"}},"required":["checkId","addressed","summary"],"additionalProperties":false}},"threadDispositions":{"type":"array","items":{"type":"object","properties":{"threadId":{"type":"string"},"addressed":{"type":"boolean"},"replyBody":{"type":"string"}},"required":["threadId","addressed","replyBody"],"additionalProperties":false}}},"required":["status","summary","validationEvidence","repositories","commitMessage","prTitle","prBody","checkDispositions","threadDispositions"],"additionalProperties":false}""";
-    private const string ResearchResultSchema = """{"type":"object","properties":{"outcome":{"enum":["unblocked","stillBlocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"mutations":{"type":"array","items":{"type":"object","properties":{"type":{"enum":["AddComment","UpdateDescription","ChangePriority","AddLabel","RemoveLabel","SetRepositoryLabels","ChangeStatus","CreateIssue"]},"issueId":{"type":"string"},"comment":{"type":"string"},"description":{"type":"string"},"newPriority":{"type":"integer","minimum":1,"maximum":5},"label":{"type":"string"},"newStatus":{"enum":["Backlog","Next","Active","Blocked","ReadyForReview","Done","Rejected"]},"repositories":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":5},"status":{"enum":["Next","Backlog"]},"parentId":{"type":"string"}},"required":["type"],"additionalProperties":false}}},"required":["outcome","summary","findings","mutations"],"additionalProperties":false}""";
+    private const string ResearchResultSchema = """{"type":"object","properties":{"outcome":{"enum":["completed","unblocked","stillBlocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"mutations":{"type":"array","items":{"type":"object","properties":{"type":{"enum":["AddComment","UpdateDescription","ChangePriority","AddLabel","RemoveLabel","SetRepositoryLabels","ChangeStatus","CreateIssue"]},"issueId":{"type":"string"},"comment":{"type":"string"},"description":{"type":"string"},"newPriority":{"type":"integer","minimum":1,"maximum":5},"label":{"type":"string"},"newStatus":{"enum":["Backlog","Next","Active","Blocked","ReadyForReview","Done","Rejected"]},"repositories":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":5},"status":{"enum":["Next","Backlog"]},"parentId":{"type":"string"}},"required":["type"],"additionalProperties":false}}},"required":["outcome","summary","findings","mutations"],"additionalProperties":false}""";
 }

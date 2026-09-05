@@ -70,8 +70,8 @@ public static partial class AgentRunner
         return SerializeResponse(ToResearchClaimResponse(result));
     }
 
-    public static string GetResearchCompletionJson(IssueEngine engine, IssueId issueId, bool dryRun = false)
-        => SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun)));
+    public static string GetResearchCompletionJson(IssueEngine engine, IssueId issueId, bool dryRun = false, Status completionStatus = Status.Next)
+        => SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun, completionStatus)));
 
     private static ResearchClaimResponse ToResearchClaimResponse(ResearchClaimResult result)
         => new(
@@ -123,6 +123,19 @@ public static partial class AgentRunner
                 dryRun = dryRunElement.GetBoolean();
             }
 
+            var completionStatus = Status.Next;
+            if (TryGetProperty(root, "completionStatus", out var completionStatusElement))
+            {
+                var completionStatusText = completionStatusElement.ValueKind == JsonValueKind.String
+                    ? completionStatusElement.GetString()
+                    : null;
+                if (!Enum.TryParse(completionStatusText, true, out completionStatus) || completionStatus is not (Status.Next or Status.Done))
+                {
+                    response = SerializeResponse(new ResearchCompletionResponse(false, "Field 'completionStatus' must be 'Next' or 'Done'.", dryRun, ResearchCompletionStatus.NotFound.ToString(), null));
+                    return true;
+                }
+            }
+
             if (!TryResolveIssue(root, engine, out var issueId, out var error))
             {
                 response = SerializeResponse(new ResearchCompletionResponse(false, error, dryRun, ResearchCompletionStatus.NotFound.ToString(), null));
@@ -131,7 +144,7 @@ public static partial class AgentRunner
 
             try
             {
-                response = SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun)));
+                response = SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun, completionStatus)));
             }
             catch (Exception exception)
             {
