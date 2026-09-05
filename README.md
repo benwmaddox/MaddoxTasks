@@ -303,6 +303,8 @@ and non-ignored untracked files, for diagnosis or later recovery. Destructive
 worktree and branch cleanup is eligible only after the job reaches `Done`;
 best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 
+When all pull-request checks pass and no actionable review feedback remains, the worker moves the task to `ReadyForReview` immediately. `reviewQuietPeriod` delays only automatic merging for configured auto-merge repositories; other repositories remain ready for your PR decision.
+
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
 
 ```powershell

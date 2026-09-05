@@ -324,6 +324,10 @@ public sealed class WorkerPolicyTests
         Assert.Equal("Waiting on CI/review window", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
 
         job.ReadyForReviewRecorded = true;
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-12);
+        job.ReviewWindow.Closed = false;
+        Assert.Equal("Ready for review · auto-merge in 18m", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-30);
         Assert.Equal("Waiting for your PR decision", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), false));
         Assert.Equal("Ready to auto-merge", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
     }

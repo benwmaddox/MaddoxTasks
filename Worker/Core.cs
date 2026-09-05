@@ -392,9 +392,20 @@ public sealed class ReviewWindow
 
     public bool Update(bool green, bool newActionableFeedback, DateTime now, TimeSpan quietPeriod)
     {
+        if (!green)
+        {
+            GreenSinceUtc = null;
+            Closed = false;
+            return false;
+        }
+
+        if (GreenSinceUtc is null || newActionableFeedback)
+        {
+            GreenSinceUtc = now;
+            Closed = false;
+        }
+
         if (Closed) return true;
-        if (!green) { GreenSinceUtc = null; return false; }
-        if (GreenSinceUtc is null || newActionableFeedback) GreenSinceUtc = now;
         if (now - GreenSinceUtc.Value >= quietPeriod) Closed = true;
         return Closed;
     }
@@ -871,7 +882,17 @@ public static class MonitoringDisplay
     public static string Describe(Job job, DateTime nowUtc, TimeSpan quietPeriod, bool autoMergeAllowed)
     {
         if (job.ReadyForReviewRecorded)
-            return autoMergeAllowed ? "Ready to auto-merge" : "Waiting for your PR decision";
+        {
+            if (!autoMergeAllowed) return "Waiting for your PR decision";
+            if (job.ReviewWindow.GreenSinceUtc is not { } readyGreenSince)
+                return "Ready for review · auto-merge waiting on CI/review window";
+
+            var readyRemaining = quietPeriod - (nowUtc - readyGreenSince);
+            if (readyRemaining <= TimeSpan.Zero || job.ReviewWindow.Closed)
+                return "Ready to auto-merge";
+            var readyMinutes = Math.Max(1, (int)Math.Ceiling(readyRemaining.TotalMinutes));
+            return $"Ready for review · auto-merge in {readyMinutes}m";
+        }
         if (job.ReviewWindow.GreenSinceUtc is not { } greenSince)
             return "Waiting on CI/review window";
 

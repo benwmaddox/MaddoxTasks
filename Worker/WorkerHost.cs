@@ -969,7 +969,7 @@ public sealed class WorkerHost
         var snapshots = new List<PullRequestSnapshot>();
         foreach (var pullRequest in job.PullRequests)
         {
-            var snapshot = await github.InspectAsync(pullRequest.Url, !job.ReviewWindow.Closed, ct);
+            var snapshot = await github.InspectAsync(pullRequest.Url, includeFeedback: true, ct);
             snapshots.Add(snapshot);
             if (snapshot.Merged) continue;
             var failures = snapshot.Failures(config.Current.IgnoredChecks);
@@ -996,9 +996,10 @@ public sealed class WorkerHost
             Save(job);
             Enqueue(job, RecoveryMode.ResumeRepair);
         }
-        if (!allGreen) job.ReviewWindow.Update(false, false, clock.UtcNow, config.Current.ReviewQuietPeriod);
-        else if (job.ReviewWindow.Update(true, newFeedback, clock.UtcNow, config.Current.ReviewQuietPeriod)
-                 && job.PendingFeedback.Count == 0 && job.PendingCheckFailures.Count == 0)
+
+        var quietPeriodElapsed = job.ReviewWindow.Update(allGreen, newFeedback, clock.UtcNow, config.Current.ReviewQuietPeriod);
+        var clearToReview = allGreen && job.PendingFeedback.Count == 0 && job.PendingCheckFailures.Count == 0;
+        if (clearToReview)
         {
             if (!job.ReadyForReviewRecorded)
             {
@@ -1006,7 +1007,7 @@ public sealed class WorkerHost
                 job.ReadyForReviewRecorded = true;
                 Save(job);
             }
-            if (IsAutoMergeAllowed(job))
+            if (IsAutoMergeAllowed(job) && quietPeriodElapsed)
             {
                 foreach (var pullRequest in job.PullRequests) await github.MergeAsync(pullRequest.Url, ct);
                 await ReconcileAsync(ct);
