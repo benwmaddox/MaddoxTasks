@@ -252,8 +252,11 @@ The worker also reserves at most one shared Codex slot for blocked-task research
 selects one eligible `Blocked` task in the same hierarchy order and records a durable
 `maddox-research-worker` comment marker. A task with a marker newer than the configured
 `researchCooldown` (14 days by default) is skipped, so concurrent or recurring runs do not
-research the same task too often. The research Codex process runs read-only and may perform
-read-only web research, but it cannot mutate files, Git/GitHub, or external services. Its
+research the same task too often. Each run receives only the selected task's description and
+comments in a temporary JSON file, without fetching the full task database. Live web search
+is enabled so the researcher can investigate that task's blocker, open relevant sources,
+and cite evidence for a concrete resolution. The research Codex process runs read-only;
+it cannot mutate files, Git/GitHub, or external services. Its
 validated result may only change Maddox task entries (including creating tasks). Findings are
 recorded as a task comment; only after all task-entry mutations succeed does the worker use an
 atomic `CompleteResearch` transition that changes the original task from `Blocked` to `Next`
@@ -286,12 +289,12 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 .\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
-On startup, the worker claims at most one fresh task immediately, then attempts
-one additional fresh claim per `capacityFillInterval` (one minute by default)
-while capacity remains. Reaching the concurrency cap or receiving an empty or
-failed claim ends this startup ramp; subsequent capacity openings do not restart
-it. Afterward, fresh claims return to the normal `claimInterval` cadence, still
-at most one per tick. Follow-up work remains immediate and takes priority. Set
+The worker immediately claims fresh tasks one at a time until every available
+Codex slot is occupied or no eligible task can be claimed. Whenever a running
+job releases a slot, the scheduler immediately tries to fill it again. The
+`claimInterval` (15 minutes by default) is the retry cadence after a claim is
+empty or fails, and it continues to drive reconciliation while the worker is at
+capacity. Follow-up work remains immediate and takes priority. Set
 `maxConcurrentCodexProcesses` to `0` to pause new Codex work while keeping PR
 monitoring and reconciliation active; running Codex processes drain naturally.
 Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly

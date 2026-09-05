@@ -118,7 +118,6 @@ public sealed class WorkerHostMonitoringTests
             {
                 schemaVersion = 1,
                 claimInterval = "00:15:00",
-                capacityFillInterval = "00:01:00",
                 researchCooldown = "14.00:00:00",
                 maxConcurrentCodexProcesses = 1,
                 prPollInterval = "00:01:00",
@@ -206,7 +205,7 @@ public sealed class WorkerHostMonitoringTests
     {
         public List<CommandCall> Commands { get; } = [];
 
-        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null)
+        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null)
         {
             var call = new CommandCall(executable, arguments.ToArray());
             Commands.Add(call);

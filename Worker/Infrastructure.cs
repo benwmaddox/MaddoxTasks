@@ -11,7 +11,7 @@ public sealed record TerminalOutputDirective(Func<string, bool> IsTerminal, Time
 
 public interface IProcessRunner
 {
-    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null);
+    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null);
 }
 
 public interface IChildProcessContainment : IDisposable { void Add(Process process); }
@@ -28,11 +28,13 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     private readonly IRollingLog log;
     public ProcessRunner(IChildProcessContainment containment, IRollingLog log) { this.containment = containment; this.log = log; }
 
-    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null)
+    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null)
     {
         var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
-        log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, workingDirectory });
+        log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, standardInputLength = standardInput?.Length ?? 0, workingDirectory });
         using var process = new Process { StartInfo = CreateStartInfo(executable, workingDirectory) };
+        process.StartInfo.RedirectStandardInput = standardInput is not null;
+        if (standardInput is not null) process.StartInfo.StandardInputEncoding = new UTF8Encoding(false);
         foreach (var argument in argumentList) process.StartInfo.ArgumentList.Add(argument);
         process.Start();
         containment.Add(process);
@@ -51,6 +53,7 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
             }
         });
         var errorTask = ReadAsync(process.StandardError, error, null);
+        var inputTask = WriteInputAsync(process, standardInput, cancellationToken);
         var exitTask = process.WaitForExitAsync(cancellationToken);
         if (terminalOutput is null) await exitTask;
         else if (await Task.WhenAny(exitTask, terminal.Task) == terminal.Task)
@@ -66,9 +69,18 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
         }
         else await exitTask;
         await Task.WhenAll(outputTask, errorTask);
+        try { await inputTask; }
+        catch (IOException) when (process.ExitCode != 0 || terminalObserved) { /* Preserve the child failure when it closes stdin early. */ }
         var result = new ExecResult(terminalObserved ? 0 : process.ExitCode, output.ToString(), error.ToString());
         log.Write(result.ExitCode == 0 ? "info" : "error", "process.exit", new { executable = Path.GetFileName(executable), exitCode = result.ExitCode, outputLength = result.Output.Length, error = SafeError(result.Error) });
         return result;
+    }
+
+    private static async Task WriteInputAsync(Process process, string? input, CancellationToken cancellationToken)
+    {
+        if (input is null) return;
+        using var writer = process.StandardInput;
+        await writer.WriteAsync(input.AsMemory(), cancellationToken);
     }
 
     public void Dispose() => containment.Dispose();
@@ -89,6 +101,15 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
 
 public static class ProcessArguments
 {
+    // Worker Codex builders always put the prompt last, for both exec and exec resume.
+    public static (string[] Arguments, string StandardInput) WithPromptOnStandardInput(IEnumerable<string> arguments)
+    {
+        var values = arguments.ToArray();
+        var prompt = values[^1];
+        values[^1] = "-";
+        return (values, prompt);
+    }
+
     public static string[] Prepare(string executable, IEnumerable<string> arguments, string workingDirectory)
     {
         var values = arguments.ToArray();

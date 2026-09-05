@@ -60,22 +60,19 @@ public sealed class WorkerHost
             while (!ct.IsCancellationRequested)
             {
                 var now = clock.UtcNow;
-                cadence.EndStartupFillIfAtCapacity(now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                var refillRequested = wakeReasons.HasFlag(SchedulerWakeReason.Manual)
+                    || wakeReasons.HasFlag(SchedulerWakeReason.Followup)
+                    || wakeReasons.HasFlag(SchedulerWakeReason.CapacityChanged)
+                    || wakeReasons.HasFlag(SchedulerWakeReason.ConfigurationChanged);
+                if (refillRequested) cadence.RequestImmediateRefill(now);
                 var automaticDue = cadence.IsDue(now, config.Current);
-                var manual = wakeReasons.HasFlag(SchedulerWakeReason.Manual);
-                var capacityChanged = wakeReasons.HasFlag(SchedulerWakeReason.CapacityChanged);
                 var followup = !followups.IsEmpty;
-                if (automaticDue || manual || followup || capacityChanged)
+                if (automaticDue || followup)
                 {
-                    // Capacity wakeups are enough to start a blocked-task
-                    // researcher, but do not bypass the normal fresh-claim
-                    // cadence when there is no research candidate.
-                    var outcome = await TickAsync(ct, automaticDue || manual, allowResearch: true);
+                    var outcome = await TickAsync(ct, automaticDue, allowResearch: true);
                     now = clock.UtcNow;
-                    if (automaticDue) cadence.CompleteAutomaticTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
-                    else if (manual) cadence.CompleteManualTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
+                    if (automaticDue) cadence.CompleteTick(outcome, now);
                 }
-                cadence.EndStartupFillIfAtCapacity(clock.UtcNow, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
                 nextTickUtc = cadence.NextTickUtc(config.Current);
                 await RenderAsync();
                 wakeReasons = await WaitForTickAsync(nextTickUtc - clock.UtcNow, ct);
@@ -193,13 +190,9 @@ public sealed class WorkerHost
                 return;
             }
 
-            var snapshot = await RunMaddoxCommandAsync(["issues", "--include-done"], ct);
-            if (snapshot.ExitCode != 0 || string.IsNullOrWhiteSpace(snapshot.Output))
-                throw new InvalidOperationException("Could not read the all-task snapshot for research: " + snapshot.Error.Trim());
-
             var schema = WriteSchema("research", ResearchResultSchema);
             log.Write("info", "research.started", new { task.Sequence, task.Title });
-            _ = RunResearchJobAsync(task, snapshot.Output, settings, schema, ct);
+            _ = RunResearchJobAsync(task, settings, schema, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -213,23 +206,16 @@ public sealed class WorkerHost
         }
     }
 
-    private async Task RunResearchJobAsync(TaskDto task, string taskSnapshotJson, WorkerConfig settings, string schema, CancellationToken ct)
+    private async Task RunResearchJobAsync(TaskDto task, WorkerConfig settings, string schema, CancellationToken ct)
     {
+        var snapshotPath = Path.Combine(Path.GetTempPath(), $"maddox-research-{Guid.NewGuid():N}.json");
         try
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(settings.ClarificationTimeout);
-            var prompt = BuildResearchPrompt(task, taskSnapshotJson);
-            var arguments = new List<string>
-            {
-                "exec", "--json", "--output-schema", schema,
-                "-m", settings.Model,
-                "-c", $"model_reasoning_effort={settings.ReasoningEffort}",
-                "--sandbox", "read-only",
-                "--skip-git-repo-check",
-                "-C", settings.RepoRoot,
-                prompt
-            };
+            await File.WriteAllTextAsync(snapshotPath, JsonSerializer.Serialize(task), ct);
+            var prompt = BuildResearchPrompt(task, snapshotPath);
+            var arguments = BuildResearchCodexArguments(settings, schema, prompt);
 
             var run = await RunResearchCodexAsync(settings, arguments, timeout.Token);
             if (run.ExitCode != 0) throw new InvalidOperationException("Research Codex failed: " + run.Error.Trim());
@@ -253,6 +239,9 @@ public sealed class WorkerHost
         }
         finally
         {
+            try { File.Delete(snapshotPath); }
+            catch (IOException exception) { log.Write("warning", "research.snapshot.cleanup.failed", new { error = exception.Message }); }
+            catch (UnauthorizedAccessException exception) { log.Write("warning", "research.snapshot.cleanup.failed", new { error = exception.Message }); }
             ReleaseResearchAdmission(signalScheduler: true);
         }
     }
@@ -361,7 +350,8 @@ public sealed class WorkerHost
     private async Task<ExecResult> RunResearchCodexAsync(WorkerConfig settings, IEnumerable<string> arguments, CancellationToken ct)
     {
         var terminal = new CodexTerminalEventTracker();
-        return await processes.RunAsync(settings.CodexExe, arguments, settings.RepoRoot, ct, terminalOutput: new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)));
+        var input = ProcessArguments.WithPromptOnStandardInput(arguments);
+        return await processes.RunAsync(settings.CodexExe, input.Arguments, settings.RepoRoot, ct, terminalOutput: new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput);
     }
 
     private Task<ExecResult> RunMaddoxCommandAsync(IEnumerable<string> command, CancellationToken ct)
@@ -394,14 +384,20 @@ public sealed class WorkerHost
         throw new InvalidDataException("CreateIssue command returned no issue id.");
     }
 
-    public static string BuildResearchPrompt(TaskDto sourceTask, string allTaskSnapshotJson)
-        => "You are the Maddox blocked-task research worker. Read the source task and the current all-task JSON snapshot below and determine whether the source task can be unblocked using only changes to Maddox task entries.\n\n"
+    public static List<string> BuildResearchCodexArguments(WorkerConfig settings, string schema, string prompt)
+        => ["--search", "exec", "--json", "--output-schema", schema,
+            "-m", settings.Model, "-c", $"model_reasoning_effort={settings.ReasoningEffort}",
+            "--sandbox", "read-only", "--skip-git-repo-check", "-C", settings.RepoRoot, prompt];
+
+    public static string BuildResearchPrompt(TaskDto sourceTask, string snapshotPath)
+        => "You are the Maddox blocked-task research worker. Investigate only the single selected blocked task identified below. Parse the file locally to read its description and comments and identify the current blocker. The file contains only this task, not the task database. Read selected fields or recent comments in bounded chunks if its history is long. Do not enumerate or load the whole Maddox task database.\n\n"
+            + "Use the available live web search tools to investigate the blocker and find a concrete way to resolve it. Start with focused queries based on this task; open relevant results, prefer primary sources and current documentation, and cite source URLs in your findings. Distinguish verified facts from suggested next steps. If search cannot resolve the blocker or the search tools are unavailable, explain what is missing and leave the task blocked.\n\n"
             + "This is a read-only investigation. You may perform read-only web or other external research when useful. Do not edit files, run commands that mutate state, use Git or GitHub for mutations, create branches, commit, push, open or merge pull requests, send messages, or perform any external mutation or other side effect. The worker process alone will apply the returned task-entry mutations through MaddoxTasks after validating them.\n\n"
             + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to unblocked only when the proposed task-entry changes genuinely remove the blocker; otherwise set stillBlocked. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
             + "SOURCE TASK:\n"
-            + JsonSerializer.Serialize(sourceTask)
-            + "\n\nALL TASKS SNAPSHOT (authoritative for this research run):\n"
-            + allTaskSnapshotJson;
+            + JsonSerializer.Serialize(new { sourceTask.Sequence, sourceTask.IssueId })
+            + "\n\nSELECTED TASK JSON FILE (authoritative for this research run; read-only):\n"
+            + JsonSerializer.Serialize(snapshotPath);
 
     private async Task RunReservedJobAsync(Job job, RecoveryMode mode, CancellationToken ct)
     {
@@ -1168,7 +1164,8 @@ public sealed class WorkerHost
     private async Task<ExecResult> RunCodexAsync(Job job, IEnumerable<string> arguments, CancellationToken ct)
     {
         var terminal = new CodexTerminalEventTracker();
-        return await processes.RunAsync(config.Current.CodexExe, arguments, config.Current.RepoRoot, ct, line =>
+        var input = ProcessArguments.WithPromptOnStandardInput(arguments);
+        return await processes.RunAsync(config.Current.CodexExe, input.Arguments, config.Current.RepoRoot, ct, line =>
         {
             try
             {
@@ -1179,7 +1176,7 @@ public sealed class WorkerHost
                 if (changed) Save(job);
             }
             catch (JsonException) { }
-        }, new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)));
+        }, new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput);
     }
 
     private async Task BlockAsync(Job job, string reason, CancellationToken ct, string actor = "maddox-worker")
