@@ -380,6 +380,44 @@ public static class ClarificationPolicy
     }
 }
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
+
+public sealed record WorkspaceBranchCandidate(string Branch, string Directory);
+
+public static class WorkspaceBranchPolicy
+{
+    public static WorkspaceBranchCandidate SelectAvailable(
+        string baseBranch,
+        string baseDirectory,
+        IReadOnlySet<string> localBranches,
+        IReadOnlySet<string> remoteBranches,
+        IReadOnlySet<string> directories)
+    {
+        for (var attempt = 1; attempt <= 10_000; attempt++)
+        {
+            var suffix = attempt == 1 ? string.Empty : $"-retry-{attempt}";
+            var candidate = new WorkspaceBranchCandidate(baseBranch + suffix, baseDirectory + suffix);
+            if (!localBranches.Contains(candidate.Branch)
+                && !remoteBranches.Contains(candidate.Branch)
+                && !directories.Contains(candidate.Directory)) return candidate;
+        }
+
+        throw new InvalidOperationException("No collision-free task branch is available.");
+    }
+
+    public static string SelectStartingRef(string pullRequestsJson, string defaultHead, string priorRemoteRef)
+    {
+        using var document = JsonDocument.Parse(pullRequestsJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Pull request lookup did not return an array.");
+        var prior = document.RootElement.EnumerateArray().FirstOrDefault();
+        if (prior.ValueKind != JsonValueKind.Object) return priorRemoteRef;
+        if (!prior.TryGetProperty("mergedAt", out var mergedAt)
+            || mergedAt.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return priorRemoteRef;
+        if (!prior.TryGetProperty("baseRefName", out var baseRefName)
+            || string.IsNullOrWhiteSpace(baseRefName.GetString())) return defaultHead;
+        return "origin/" + baseRefName.GetString();
+    }
+}
 public sealed record PullRequestState(string Url, string Repository);
 public sealed record ReviewFeedback(string ThreadId, string CommentNodeId, long CommentDatabaseId, string Body, string Url);
 public sealed record ReviewDisposition(string ThreadId, bool Addressed, string ReplyBody);

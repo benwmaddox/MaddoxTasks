@@ -754,18 +754,45 @@ public sealed class WorkerHost
         var branch = $"codex/task-{job.Task.Sequence}-{slug}";
         var repositorySlug = Regex.Replace(repository, "[^A-Za-z0-9._-]+", "-");
         var directory = Path.Combine(config.Current.WorktreeRoot, $"{repositorySlug}-{job.Task.Sequence}");
-        if (Directory.Exists(directory)) throw new InvalidOperationException("Foreign worktree collision: " + directory);
         await RequireAsync("git", ["fetch", "origin"], source, ct);
-        var branchExists = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{branch}"], source, ct);
-        if (branchExists.ExitCode == 0) throw new InvalidOperationException("Foreign branch collision: " + branch);
-        var remoteBranchExists = await processes.RunAsync("git", ["ls-remote", "--exit-code", "--heads", "origin", branch], source, ct);
-        if (remoteBranchExists.ExitCode == 0) throw new InvalidOperationException("Foreign remote branch collision: " + branch);
-        if (remoteBranchExists.ExitCode != 2) throw new InvalidOperationException("Could not verify remote branch ownership: " + remoteBranchExists.Error.Trim());
         var head = (await processes.RunAsync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], source, ct)).Output.Trim();
         if (string.IsNullOrWhiteSpace(head)) head = "origin/main";
-        await RequireAsync("git", ["worktree", "add", "-b", branch, directory, head], source, ct);
+        var localBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var remoteBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string? priorRemoteBranch = null;
+        WorkspaceBranchCandidate candidate;
+        while (true)
+        {
+            candidate = WorkspaceBranchPolicy.SelectAvailable(branch, directory, localBranches, remoteBranches, directories);
+            if (Directory.Exists(candidate.Directory))
+            {
+                directories.Add(candidate.Directory);
+            }
+            var local = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{candidate.Branch}"], source, ct);
+            if (local.ExitCode == 0) localBranches.Add(candidate.Branch);
+            else if (local.ExitCode != 1) throw new InvalidOperationException("Could not inspect local task branches: " + local.Error.Trim());
+            var remoteProbe = await processes.RunAsync("git", ["ls-remote", "--exit-code", "--heads", "origin", candidate.Branch], source, ct);
+            if (remoteProbe.ExitCode == 0)
+            {
+                remoteBranches.Add(candidate.Branch);
+                priorRemoteBranch = candidate.Branch;
+            }
+            else if (remoteProbe.ExitCode != 2) throw new InvalidOperationException("Could not verify remote branch ownership: " + remoteProbe.Error.Trim());
+            if (!localBranches.Contains(candidate.Branch)
+                && !remoteBranches.Contains(candidate.Branch)
+                && !directories.Contains(candidate.Directory)) break;
+        }
+
+        var startingRef = head;
+        if (priorRemoteBranch is not null)
+        {
+            var priorPullRequests = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", priorRemoteBranch, "--state", "all", "--limit", "1", "--json", "mergedAt,baseRefName"], source, ct);
+            startingRef = WorkspaceBranchPolicy.SelectStartingRef(priorPullRequests.Output, head, $"origin/{priorRemoteBranch}");
+        }
+        await RequireAsync("git", ["worktree", "add", "-b", candidate.Branch, candidate.Directory, startingRef], source, ct);
         var remote = (await RequireAsync("git", ["remote", "get-url", "origin"], source, ct)).Output.Trim();
-        return new Workspace(repository, directory, branch, remote, head);
+        return new Workspace(repository, candidate.Directory, candidate.Branch, remote, startingRef);
     }
 
     private async Task ValidateOwnedWorkspacesAsync(Job job, CancellationToken ct)
@@ -876,7 +903,7 @@ public sealed class WorkerHost
 
     private async Task<string?> FindPullRequestAsync(Workspace workspace, CancellationToken ct)
     {
-        var found = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", workspace.Branch, "--state", "all", "--limit", "1", "--json", "url"], workspace.Directory, ct);
+        var found = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", workspace.Branch, "--state", "open", "--limit", "1", "--json", "url"], workspace.Directory, ct);
         using var document = JsonDocument.Parse(found.Output);
         var first = document.RootElement.EnumerateArray().FirstOrDefault();
         return first.ValueKind == JsonValueKind.Object && first.TryGetProperty("url", out var url) ? url.GetString() : null;
