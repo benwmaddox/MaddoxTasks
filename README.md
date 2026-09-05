@@ -93,6 +93,20 @@ Comments and description history show `By` (`user`, `agent`, or a model id such 
 
 ## LAN Web UI (Desktop and Mobile)
 
+In **New issue**, open **Fill with AI**, describe the task in one text area, and
+select **Fill task details**. Review the generated title, description, initial
+status, priority, parent, due date, and labels before selecting **Create issue**.
+Repository references use `repo:<name>` labels. Drafting does not save a task;
+creation saves the task and its labels together.
+
+AI entry requires a signed-in Codex CLI on the server's PATH. It uses `codex exec`
+in a temporary directory with a read-only sandbox and a two-minute timeout.
+Set `MADDOX_TASKS_CODEX_EXE` to override the executable and
+`MADDOX_TASKS_AI_MODEL` to override the default `gpt-5.6-luna` model. The task
+description is sent to Codex; model access depends on the server's Codex account.
+The exec structured-output options follow the
+[official OpenAI documentation](https://developers.openai.com/codex/noninteractive).
+
 Run the server alongside the CLI or TUI when a browser is more convenient:
 
 Windows:

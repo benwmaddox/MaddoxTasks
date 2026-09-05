@@ -64,6 +64,12 @@ public sealed class IssueEngine
         => GetState().TryResolveIssueToken(token, out issueId, out error);
 
     public CommandExecutionResult Execute(Command command)
+        => ExecuteWithLabels(command, []);
+
+    public CommandExecutionResult Execute(CreateIssue command, IReadOnlyList<string> labels)
+        => ExecuteWithLabels(command, labels);
+
+    private CommandExecutionResult ExecuteWithLabels(Command command, IReadOnlyList<string> labels)
     {
         try
         {
@@ -71,8 +77,16 @@ public sealed class IssueEngine
             {
                 var before = IssueState.Replay(events);
                 var plannedEvent = CommandPlanner.Plan(command, before, _clock.UtcNow);
+                var plannedEvents = new List<IssueEvent> { plannedEvent };
+                foreach (var label in labels.Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var state = IssueState.Replay(events.Concat(plannedEvents).ToArray());
+                    var normalized = IssueFiltering.NormalizeLabel(label);
+                    if (state.Issues[plannedEvent.IssueId].HasLabel(normalized)) continue;
+                    plannedEvents.Add(CommandPlanner.Plan(new AddLabel(plannedEvent.IssueId, label), state, _clock.UtcNow));
+                }
                 return new EventStoreOperation<CommandExecutionResult>(
-                    [plannedEvent],
+                    plannedEvents,
                     CommandExecutionResult.Succeeded(
                         $"{command.GetType().Name} applied.",
                         plannedEvent.IssueId,

@@ -51,7 +51,8 @@ public static class WebServer
     public static WebApplication CreateApplication(
         string dbPath,
         string host = DefaultHost,
-        int port = DefaultPort)
+        int port = DefaultPort,
+        IAiTaskDraftGenerator? draftGenerator = null)
     {
         if (!TryValidateBinding(host, port, allowEphemeralPort: true, out var error))
         {
@@ -66,7 +67,7 @@ public static class WebServer
             new SystemClock());
 
         var app = builder.Build();
-        WebEndpoints.Map(app, engine);
+        WebEndpoints.Map(app, engine, draftGenerator ?? new CodexTaskDraftGenerator());
         return app;
     }
 

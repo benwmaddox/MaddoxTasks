@@ -8,6 +8,75 @@ namespace MaddoxTasks.Tests;
 public sealed class WebServerTests
 {
     [Fact]
+    public async Task AiDraftDoesNotSaveUntilSubmittedAndLabelsSaveAtomically()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"MaddoxTasks-draft-{Guid.NewGuid():N}.db");
+        var generator = new FakeDraftGenerator();
+        using var app = WebServer.CreateApplication(databasePath, "127.0.0.1", 0, generator);
+        using var client = new HttpClient();
+        try
+        {
+            await app.StartAsync();
+            client.BaseAddress = new Uri(app.Urls.Single());
+            using var empty = await client.PostAsync("api/issues/draft", Json("""{"prompt":" "}"""));
+            Assert.Equal(HttpStatusCode.BadRequest, empty.StatusCode);
+            Assert.Equal(0, generator.Calls);
+            using var response = await client.PostAsync("api/issues/draft", Json("""{"prompt":"Fix the task form"}"""));
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            Assert.Equal("Fix the task form", generator.Prompt);
+            using var draft = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            using var initial = JsonDocument.Parse(await client.GetStringAsync("api/issues"));
+            Assert.Equal(0, initial.RootElement.GetProperty("count").GetInt32());
+            using var invalid = await client.PostAsync("api/issues", Json("""{"title":"Invalid","labels":["ok","repo:"]}"""));
+            Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+            using var afterInvalid = JsonDocument.Parse(await client.GetStringAsync("api/issues"));
+            Assert.Equal(0, afterInvalid.RootElement.GetProperty("count").GetInt32());
+            using var created = await client.PostAsync("api/issues", Json(draft.RootElement.GetProperty("draft").GetRawText()));
+            Assert.Equal(HttpStatusCode.Created, created.StatusCode);
+            using var createdJson = JsonDocument.Parse(await created.Content.ReadAsStringAsync());
+            using var detail = JsonDocument.Parse(await client.GetStringAsync("api/issues/" + createdJson.RootElement.GetProperty("issueId").GetString()));
+            var issue = detail.RootElement.GetProperty("issue");
+            Assert.Equal("Fix form", issue.GetProperty("title").GetString());
+            Assert.Equal("Acceptance criteria", issue.GetProperty("description").GetString());
+            Assert.Equal("Backlog", issue.GetProperty("status").GetString());
+            Assert.Equal(2, issue.GetProperty("priority").GetInt32());
+            Assert.StartsWith("2026-12-31", issue.GetProperty("dueDate").GetString());
+            Assert.Equal("MaddoxTasks", Assert.Single(issue.GetProperty("repositories").EnumerateArray()).GetString(), ignoreCase: true);
+            generator.Fail = true;
+            using var failed = await client.PostAsync("api/issues/draft", Json("""{"prompt":"Another task"}"""));
+            Assert.Equal(HttpStatusCode.BadGateway, failed.StatusCode);
+            generator.Timeout = true;
+            using var timedOut = await client.PostAsync("api/issues/draft", Json("""{"prompt":"Another task"}"""));
+            Assert.Equal(HttpStatusCode.GatewayTimeout, timedOut.StatusCode);
+        }
+        finally
+        {
+            await app.StopAsync();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDelete(databasePath); TryDelete(databasePath + "-wal"); TryDelete(databasePath + "-shm");
+        }
+    }
+
+    private sealed class FakeDraftGenerator : IAiTaskDraftGenerator
+    {
+        public int Calls { get; private set; }
+        public string? Prompt { get; private set; }
+        public bool Fail { get; set; }
+        public bool Timeout { get; set; }
+        public Task<JsonElement> GenerateAsync(string prompt, CancellationToken cancellationToken)
+        {
+            Calls++;
+            Prompt = prompt;
+            if (Timeout) throw new OperationCanceledException();
+            if (Fail) throw new InvalidOperationException("Test failure");
+            using var document = JsonDocument.Parse("""
+                {"title":"Fix form","description":"Acceptance criteria","status":"Backlog","priority":2,"parentId":null,"dueDate":"2026-12-31","labels":["ui","repo:MaddoxTasks"]}
+                """);
+            return Task.FromResult(document.RootElement.Clone());
+        }
+    }
+
+    [Fact]
     public void BindingDefaultsAreLanFriendlyAndPortValidationIsUseful()
     {
         Assert.Equal("0.0.0.0", WebServer.DefaultHost);

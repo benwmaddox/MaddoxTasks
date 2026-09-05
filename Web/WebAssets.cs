@@ -189,6 +189,12 @@ internal static class WebAssets
       <div class="modal-header"><h2 id="create-heading">New issue</h2><button class="icon subtle" type="button" data-close="create-overlay" aria-label="Close">×</button></div>
       <div class="modal-body">
         <div id="create-error" class="alert hidden" role="alert"></div>
+        <details id="ai-entry">
+          <summary>Fill with AI</summary>
+          <label>Describe your task <textarea id="ai-prompt" rows="5" maxlength="16000" placeholder="What needs doing? Include any repository, priority, due date, or parent task."></textarea></label>
+          <div class="button-row"><button id="generate-draft" type="button">Fill task details</button><span id="ai-progress" role="status"></span></div>
+          <p class="muted">Review the filled fields below, then create the issue.</p>
+        </details>
         <div class="form-grid">
           <label class="full">Title <input id="create-title" name="title" required maxlength="500" autofocus></label>
           <label class="full">Description <textarea id="create-description" name="description" rows="4"></textarea></label>
@@ -196,6 +202,7 @@ internal static class WebAssets
           <label>Priority <select id="create-priority" name="priority"><option value="1">1 - urgent</option><option value="2">2 - high</option><option value="3" selected>3 - normal</option><option value="4">4 - low</option><option value="5">5 - someday</option></select></label>
           <label>Parent issue token <input id="create-parent" name="parent" placeholder="Optional sequence or id"></label>
           <label>Due date <input id="create-due" name="due" type="date"></label>
+          <label class="full">Labels (one per line; use repo:&lt;name&gt; for repositories) <textarea id="create-labels" rows="2"></textarea></label>
         </div>
         <div class="button-row"><button class="primary" type="submit">Create issue</button><button type="button" data-close="create-overlay">Cancel</button></div>
       </div>
@@ -385,9 +392,10 @@ internal static class WebAssets
       const selectedCard = board.querySelector(`[data-id="${CSS.escape(state.selectedId)}"]`);
       if (selectedCard) selectedCard.focus({ preventScroll: true });
     }
-    function closeOverlay(id) { byId(id).classList.add('hidden'); if (id === 'detail-overlay') state.detail = null; }
+    function closeOverlay(id) { byId(id).classList.add('hidden'); if (id === 'detail-overlay') state.detail = null; if (id === 'create-overlay') cancelDraft(); }
     function openOverlay(id) { byId(id).classList.remove('hidden'); }
     function openCreate() {
+      cancelDraft();
       byId('create-form').reset();
       byId('create-error').classList.add('hidden');
       openOverlay('create-overlay');
@@ -395,11 +403,13 @@ internal static class WebAssets
     }
     async function submitCreate(event) {
       event.preventDefault();
+      cancelDraft();
       const body = { title: byId('create-title').value, description: byId('create-description').value, status: byId('create-status').value, priority: Number(byId('create-priority').value) };
       const parent = byId('create-parent').value.trim();
       const due = byId('create-due').value;
       if (parent) body.parent = parent;
       if (due) body.due = due;
+      body.labels = byId('create-labels').value.split('\n').map(value => value.trim()).filter(Boolean);
       try {
         const result = await api('/api/issues', { method: 'POST', body: JSON.stringify(body) });
         closeOverlay('create-overlay');
@@ -408,6 +418,40 @@ internal static class WebAssets
         if (result.issueId) openDetail(result.issueId);
       } catch (error) {
         const box = byId('create-error'); box.textContent = error.message; box.classList.remove('hidden');
+      }
+    }
+    let draftController = null;
+    function cancelDraft() {
+      if (draftController) draftController.abort();
+      draftController = null;
+      byId('generate-draft').disabled = false;
+      byId('ai-progress').textContent = '';
+    }
+    async function generateDraft() {
+      const prompt = byId('ai-prompt').value.trim();
+      if (!prompt) { byId('ai-prompt').focus(); return; }
+      cancelDraft();
+      const controller = new AbortController();
+      draftController = controller;
+      byId('generate-draft').disabled = true;
+      byId('ai-progress').textContent = 'Filling task details…';
+      byId('create-error').classList.add('hidden');
+      try {
+        const result = await api('/api/issues/draft', { method: 'POST', body: JSON.stringify({ prompt }), signal: controller.signal });
+        if (draftController !== controller) return;
+        const draft = result.draft;
+        for (const field of ['title', 'description', 'status', 'priority']) byId('create-' + field).value = draft[field];
+        byId('create-parent').value = draft.parentId || '';
+        byId('create-due').value = draft.dueDate || '';
+        byId('create-labels').value = draft.labels.join('\n');
+        byId('ai-progress').textContent = 'Details filled. Review and create your issue.';
+        byId('create-title').focus();
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        const box = byId('create-error'); box.textContent = error.message; box.classList.remove('hidden');
+        byId('ai-progress').textContent = '';
+      } finally {
+        if (draftController === controller) { draftController = null; byId('generate-draft').disabled = false; }
       }
     }
     async function loadDetail(id, silent = false, draft = null) {
@@ -542,6 +586,7 @@ internal static class WebAssets
     byId('refresh-button').onclick = () => refresh();
     byId('help-button').onclick = () => openOverlay('help-overlay');
     byId('create-form').addEventListener('submit', submitCreate);
+    byId('generate-draft').addEventListener('click', generateDraft);
     ['search', 'status-filter', 'priority-filter', 'include-done'].forEach(id => byId(id).addEventListener('input', () => refresh(true)));
     byId('clear-filters').onclick = () => { byId('search').value = ''; byId('status-filter').value = ''; byId('priority-filter').value = ''; byId('include-done').checked = false; refresh(); };
     document.querySelectorAll('[data-close]').forEach(button => button.addEventListener('click', () => closeOverlay(button.dataset.close)));
