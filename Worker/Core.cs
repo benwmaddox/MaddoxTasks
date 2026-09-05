@@ -37,12 +37,10 @@ public sealed record WorkerConfig(
     string RepoRoot,
     string WorktreeRoot,
     TimeSpan? BlockedDisplayDuration = null,
-    TimeSpan? CapacityFillInterval = null,
     TimeSpan? ResearchCooldown = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
-    public TimeSpan EffectiveCapacityFillInterval => CapacityFillInterval ?? TimeSpan.FromMinutes(1);
     public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(14);
 
     public static WorkerConfig Load(string path)
@@ -63,7 +61,6 @@ public sealed record WorkerConfig(
         if (RepairMaxAttempts < 1 || RepairMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("Repair bounds must be positive.");
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
         if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
-        if (CapacityFillInterval is { } capacityFillInterval && capacityFillInterval <= TimeSpan.Zero) throw new InvalidDataException("capacityFillInterval must be positive.");
         if (ResearchCooldown is { } researchCooldown && researchCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchCooldown must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
@@ -392,9 +389,20 @@ public sealed class ReviewWindow
 
     public bool Update(bool green, bool newActionableFeedback, DateTime now, TimeSpan quietPeriod)
     {
+        if (!green)
+        {
+            GreenSinceUtc = null;
+            Closed = false;
+            return false;
+        }
+
+        if (GreenSinceUtc is null || newActionableFeedback)
+        {
+            GreenSinceUtc = now;
+            Closed = false;
+        }
+
         if (Closed) return true;
-        if (!green) { GreenSinceUtc = null; return false; }
-        if (GreenSinceUtc is null || newActionableFeedback) GreenSinceUtc = now;
         if (now - GreenSinceUtc.Value >= quietPeriod) Closed = true;
         return Closed;
     }
@@ -801,56 +809,31 @@ public enum FreshClaimOutcome
 
 public sealed class ClaimCadence
 {
-    private readonly DateTime startedUtc;
-    private DateTime? lastStartupClaimUtc;
-    private DateTime normalAnchorUtc;
+    private DateTime anchorUtc;
 
     public ClaimCadence(DateTime startedUtc)
     {
-        this.startedUtc = startedUtc;
-        normalAnchorUtc = startedUtc;
+        anchorUtc = startedUtc;
     }
 
-    public bool StartupFillActive { get; private set; } = true;
+    public bool ImmediateRefillPending { get; private set; } = true;
 
-    public DateTime NextTickUtc(WorkerConfig config) => StartupFillActive
-        ? lastStartupClaimUtc is { } claimedUtc ? claimedUtc + config.EffectiveCapacityFillInterval : startedUtc
-        : normalAnchorUtc + config.ClaimInterval;
+    public DateTime NextTickUtc(WorkerConfig config) => ImmediateRefillPending
+        ? anchorUtc
+        : anchorUtc + config.ClaimInterval;
 
     public bool IsDue(DateTime nowUtc, WorkerConfig config) => nowUtc >= NextTickUtc(config);
 
-    public void CompleteAutomaticTick(FreshClaimOutcome outcome, DateTime nowUtc, int active, int limit)
+    public void CompleteTick(FreshClaimOutcome outcome, DateTime nowUtc)
     {
-        if (StartupFillActive)
-        {
-            if (outcome == FreshClaimOutcome.ClaimedWithSpareCapacity && limit > 0 && active < limit)
-            {
-                lastStartupClaimUtc = nowUtc;
-                return;
-            }
-
-            StartupFillActive = false;
-        }
-
-        normalAnchorUtc = nowUtc;
+        anchorUtc = nowUtc;
+        ImmediateRefillPending = outcome == FreshClaimOutcome.ClaimedWithSpareCapacity;
     }
 
-    public void CompleteManualTick(FreshClaimOutcome outcome, DateTime nowUtc, int active, int limit)
+    public void RequestImmediateRefill(DateTime nowUtc)
     {
-        if (StartupFillActive)
-        {
-            if (outcome != FreshClaimOutcome.ClaimedAtCapacity && limit > 0 && active < limit) return;
-            StartupFillActive = false;
-        }
-
-        normalAnchorUtc = nowUtc;
-    }
-
-    public void EndStartupFillIfAtCapacity(DateTime nowUtc, int active, int limit)
-    {
-        if (!StartupFillActive || limit > 0 && active < limit) return;
-        StartupFillActive = false;
-        normalAnchorUtc = nowUtc;
+        anchorUtc = nowUtc;
+        ImmediateRefillPending = true;
     }
 }
 
@@ -871,7 +854,17 @@ public static class MonitoringDisplay
     public static string Describe(Job job, DateTime nowUtc, TimeSpan quietPeriod, bool autoMergeAllowed)
     {
         if (job.ReadyForReviewRecorded)
-            return autoMergeAllowed ? "Ready to auto-merge" : "Waiting for your PR decision";
+        {
+            if (!autoMergeAllowed) return "Waiting for your PR decision";
+            if (job.ReviewWindow.GreenSinceUtc is not { } readyGreenSince)
+                return "Ready for review · auto-merge waiting on CI/review window";
+
+            var readyRemaining = quietPeriod - (nowUtc - readyGreenSince);
+            if (readyRemaining <= TimeSpan.Zero || job.ReviewWindow.Closed)
+                return "Ready to auto-merge";
+            var readyMinutes = Math.Max(1, (int)Math.Ceiling(readyRemaining.TotalMinutes));
+            return $"Ready for review · auto-merge in {readyMinutes}m";
+        }
         if (job.ReviewWindow.GreenSinceUtc is not { } greenSince)
             return "Waiting on CI/review window";
 

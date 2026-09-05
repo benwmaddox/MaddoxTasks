@@ -324,6 +324,10 @@ public sealed class WorkerPolicyTests
         Assert.Equal("Waiting on CI/review window", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
 
         job.ReadyForReviewRecorded = true;
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-12);
+        job.ReviewWindow.Closed = false;
+        Assert.Equal("Ready for review · auto-merge in 18m", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
+        job.ReviewWindow.GreenSinceUtc = now.AddMinutes(-30);
         Assert.Equal("Waiting for your PR decision", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), false));
         Assert.Equal("Ready to auto-merge", MonitoringDisplay.Describe(job, now, TimeSpan.FromMinutes(30), true));
     }
@@ -579,6 +583,23 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void ResearchArguments_EnableLiveSearchAndSendPromptThroughStdin()
+    {
+        using var directory = new TemporaryDirectory();
+        var configPath = Path.Combine(directory.Path, "worker.json");
+        WriteConfig(configPath, directory.Path, 4, "model");
+        var arguments = WorkerHost.BuildResearchCodexArguments(WorkerConfig.Load(configPath), "schema.json", "research prompt");
+        var input = ProcessArguments.WithPromptOnStandardInput(arguments);
+
+        Assert.Equal("--search", input.Arguments[0]);
+        Assert.Equal("exec", input.Arguments[1]);
+        Assert.Contains("read-only", input.Arguments);
+        Assert.Equal("-", input.Arguments[^1]);
+        Assert.DoesNotContain("research prompt", input.Arguments);
+        Assert.Equal("research prompt", input.StandardInput);
+    }
+
+    [Fact]
     public void ResearchAdmission_AllowsOnlyOneActiveReservation()
     {
         var admission = new ResearchAdmission();
@@ -776,7 +797,7 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void ClaimCadence_StartsImmediatelyThenFillsOneSlotPerConfiguredInterval()
+    public void ClaimCadence_StartsImmediatelyAndKeepsFillingWhileCapacityRemains()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "worker.json");
@@ -786,17 +807,17 @@ public sealed class WorkerPolicyTests
         var cadence = new ClaimCadence(start);
 
         Assert.True(cadence.IsDue(start, settings));
-        cadence.CompleteAutomaticTick(FreshClaimOutcome.ClaimedWithSpareCapacity, start, active: 1, limit: 4);
-        Assert.Equal(start.AddMinutes(1), cadence.NextTickUtc(settings));
-        Assert.False(cadence.IsDue(start.AddSeconds(59), settings));
-        Assert.True(cadence.IsDue(start.AddMinutes(1), settings));
+        cadence.CompleteTick(FreshClaimOutcome.ClaimedWithSpareCapacity, start);
+        Assert.True(cadence.ImmediateRefillPending);
+        Assert.Equal(start, cadence.NextTickUtc(settings));
+        Assert.True(cadence.IsDue(start, settings));
 
-        cadence.CompleteAutomaticTick(FreshClaimOutcome.ClaimedWithSpareCapacity, start.AddMinutes(1), active: 2, limit: 4);
-        Assert.Equal(start.AddMinutes(2), cadence.NextTickUtc(settings));
+        cadence.CompleteTick(FreshClaimOutcome.ClaimedWithSpareCapacity, start);
+        Assert.Equal(start, cadence.NextTickUtc(settings));
     }
 
     [Fact]
-    public void ClaimCadence_ReachingCapacityEndsStartupFillPermanently()
+    public void ClaimCadence_FullOrUnavailableClaimUsesNormalRetryInterval()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "worker.json");
@@ -805,36 +826,17 @@ public sealed class WorkerPolicyTests
         var start = DateTime.UnixEpoch;
         var cadence = new ClaimCadence(start);
 
-        cadence.CompleteAutomaticTick(FreshClaimOutcome.ClaimedAtCapacity, start, active: 1, limit: 2);
-        Assert.False(cadence.StartupFillActive);
+        cadence.CompleteTick(FreshClaimOutcome.ClaimedAtCapacity, start);
+        Assert.False(cadence.ImmediateRefillPending);
         Assert.Equal(start.AddMinutes(15), cadence.NextTickUtc(settings));
 
-        cadence.EndStartupFillIfAtCapacity(start.AddMinutes(1), active: 1, limit: 2);
-        Assert.False(cadence.StartupFillActive);
-        Assert.Equal(start.AddMinutes(15), cadence.NextTickUtc(settings));
+        cadence.CompleteTick(FreshClaimOutcome.Unavailable, start.AddMinutes(15));
+        Assert.False(cadence.ImmediateRefillPending);
+        Assert.Equal(start.AddMinutes(30), cadence.NextTickUtc(settings));
     }
 
     [Fact]
-    public void ClaimCadence_StartupAtCapacityAndEmptyClaimFallBackToNormalCadence()
-    {
-        using var directory = new TemporaryDirectory();
-        var path = Path.Combine(directory.Path, "worker.json");
-        WriteConfig(path, directory.Path, 4, "model");
-        var settings = WorkerConfig.Load(path);
-        var start = DateTime.UnixEpoch;
-        var full = new ClaimCadence(start);
-        full.EndStartupFillIfAtCapacity(start, active: 4, limit: 4);
-        Assert.False(full.StartupFillActive);
-        Assert.Equal(start.AddMinutes(15), full.NextTickUtc(settings));
-
-        var empty = new ClaimCadence(start);
-        empty.CompleteAutomaticTick(FreshClaimOutcome.Unavailable, start, active: 0, limit: 4);
-        Assert.False(empty.StartupFillActive);
-        Assert.Equal(start.AddMinutes(15), empty.NextTickUtc(settings));
-    }
-
-    [Fact]
-    public void ClaimCadence_ManualTickDoesNotRestartFillAndResetsNormalCadence()
+    public void ClaimCadence_AvailableSlotRequestsImmediateRefillAfterBackoff()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "worker.json");
@@ -842,34 +844,26 @@ public sealed class WorkerPolicyTests
         var settings = WorkerConfig.Load(path);
         var start = DateTime.UnixEpoch;
         var cadence = new ClaimCadence(start);
-        cadence.CompleteAutomaticTick(FreshClaimOutcome.Unavailable, start, active: 0, limit: 4);
+        cadence.CompleteTick(FreshClaimOutcome.Unavailable, start);
+        Assert.False(cadence.IsDue(start.AddMinutes(2), settings));
 
-        cadence.CompleteManualTick(FreshClaimOutcome.ClaimedWithSpareCapacity, start.AddMinutes(2), active: 1, limit: 4);
+        cadence.RequestImmediateRefill(start.AddMinutes(2));
 
-        Assert.False(cadence.StartupFillActive);
-        Assert.Equal(start.AddMinutes(17), cadence.NextTickUtc(settings));
+        Assert.True(cadence.ImmediateRefillPending);
+        Assert.True(cadence.IsDue(start.AddMinutes(2), settings));
+        Assert.Equal(start.AddMinutes(2), cadence.NextTickUtc(settings));
     }
 
     [Fact]
-    public void WorkerConfig_DefaultsCapacityFillToOneMinuteAndReloadsItLive()
+    public void WorkerConfig_IgnoresLegacyCapacityFillInterval()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "worker.json");
         WriteConfig(path, directory.Path, 4, "model");
-        var initial = WorkerConfig.Load(path);
-        Assert.Equal(TimeSpan.FromMinutes(1), initial.EffectiveCapacityFillInterval);
-        var cadence = new ClaimCadence(DateTime.UnixEpoch);
-        cadence.CompleteAutomaticTick(FreshClaimOutcome.ClaimedWithSpareCapacity, DateTime.UnixEpoch, active: 1, limit: 4);
-
-        AddCapacityFillInterval(path, "00:00:30");
-        var state = new ConfigState(initial);
-        Assert.True(state.TryReload(path, out var error), error);
-        Assert.Equal(DateTime.UnixEpoch.AddSeconds(30), cadence.NextTickUtc(state.Current));
-
         AddCapacityFillInterval(path, "00:00:00");
-        Assert.False(state.TryReload(path, out error));
-        Assert.Contains("capacityFillInterval", error);
-        Assert.Equal(TimeSpan.FromSeconds(30), state.Current.EffectiveCapacityFillInterval);
+        var settings = WorkerConfig.Load(path);
+
+        Assert.Equal(TimeSpan.FromMinutes(15), settings.ClaimInterval);
     }
 
     [Fact]
