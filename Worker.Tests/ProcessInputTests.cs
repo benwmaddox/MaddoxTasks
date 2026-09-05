@@ -6,7 +6,7 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class ProcessInputTests
 {
     [Fact]
-    public void ResearchPrompt_FocusesSearchOnOneTaskWithoutEmbeddingLargeHistory()
+    public void ResearchPrompt_ReferencesBoundedSnapshotWithoutEmbeddingLargeHistory()
     {
         var task = new TaskDto(474, "source-id", "Source", new string('x', 3_000_000), []);
         var path = Path.Combine(Path.GetTempPath(), "research snapshot.json");
@@ -14,12 +14,23 @@ public sealed class ProcessInputTests
         Assert.True(prompt.Length < 10_000);
         Assert.Contains("source-id", prompt);
         Assert.Contains(System.Text.Json.JsonSerializer.Serialize(path), prompt);
-        Assert.Contains("Parse the file locally", prompt);
-        Assert.Contains("single selected blocked task", prompt);
+        Assert.Contains("Parse the worker-supplied snapshot locally", prompt);
+        Assert.Contains("selected source task", prompt);
         Assert.Contains("live web search tools", prompt);
         Assert.Contains("cite source URLs", prompt);
-        Assert.Contains("Do not enumerate or load the whole Maddox task database", prompt);
+        Assert.Contains("current Blocked task records", prompt);
         Assert.DoesNotContain(task.Description, prompt);
+    }
+
+    [Fact]
+    public void ResearchSnapshot_IncludesSelectedTaskAndRelatedBlockedTasks()
+    {
+        var task = new TaskDto(499, "source-id", "Unblock", "Triage three tasks", []);
+        var snapshot = WorkerHost.BuildResearchSnapshot(task, "[{\"sequence\":389,\"status\":\"Blocked\"}]");
+        using var document = System.Text.Json.JsonDocument.Parse(snapshot);
+
+        Assert.Equal(499, document.RootElement.GetProperty("selectedTask").GetProperty("Sequence").GetInt32());
+        Assert.Equal(389, document.RootElement.GetProperty("blockedTasks")[0].GetProperty("sequence").GetInt32());
     }
 
     [Theory]

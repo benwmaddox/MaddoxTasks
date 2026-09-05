@@ -918,6 +918,22 @@ public sealed class IssueEngineTests
         Assert.Equal(Status.Blocked, engine.GetState().Issues[claimed].Status);
     }
 
+    [Fact]
+    public void CompleteResearch_CanFinishLedgerOnlySourceAsDone()
+    {
+        var now = new DateTime(2026, 9, 5, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStore();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now, "Task operations", null, Status.Blocked, Priority.From(1), null, null));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        Assert.True(engine.ResearchClaimBlocked().Success);
+
+        var result = engine.CompleteResearch(issueId, completionStatus: Status.Done);
+
+        Assert.True(result.Success);
+        Assert.Equal(Status.Done, engine.GetState().Issues[issueId].Status);
+    }
+
     private static IssueId AppendNextIssue(IEventStore store, string title, string repository, int priority = 3)
     {
         var issueId = IssueId.New();

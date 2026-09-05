@@ -528,6 +528,16 @@ public sealed class WorkerPolicyTests
         Assert.Equal(["AddComment", "UpdateDescription", "ChangePriority", "AddLabel", "RemoveLabel", "SetRepositoryLabels", "ChangeStatus", "CreateIssue"], plan.Mutations.Select(mutation => mutation.Type).ToArray());
     }
 
+    [Fact]
+    public void ResearchPlanPolicy_AllowsCompletedLedgerOnlyOutcome()
+    {
+        var plan = ResearchPlanPolicy.Parse(
+            """{"outcome":"completed","summary":"Task entries updated.","findings":[],"mutations":[]}""",
+            new TaskDto(499, "01234567-89ab-cdef-0123-456789abcdef", "Unblock", "Triage tasks", []));
+
+        Assert.Equal(ResearchPlanPolicy.Completed, plan.Outcome);
+    }
+
     [Theory]
     [InlineData("SplitIssue")]
     [InlineData("RequeueBlocked")]
@@ -913,6 +923,18 @@ public sealed class WorkerPolicyTests
 
         Assert.Contains("--approve-for-me", arguments);
         Assert.DoesNotContain("--sandbox", arguments);
+    }
+
+    [Fact]
+    public void InitialCodexArguments_UseRepoRootForRepositorylessTask()
+    {
+        var job = CreateJob();
+        job.Task = job.Task with { Repositories = [] };
+
+        var arguments = WorkerHost.BuildInitialCodexArguments(job, "schema.json", "prompt", @"D:\code");
+
+        Assert.Equal(@"D:\code", arguments[arguments.IndexOf("-C") + 1]);
+        Assert.Contains("--skip-git-repo-check", arguments);
     }
 
     [Fact]

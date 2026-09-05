@@ -275,8 +275,13 @@ public sealed class IssueEngine
     /// The claim marker is required so this narrow operation cannot be used as
     /// a general status-change bypass by another agent command.
     /// </summary>
-    public ResearchCompletionResult TryCompleteResearch(IssueId issueId, bool dryRun = false)
+    public ResearchCompletionResult TryCompleteResearch(IssueId issueId, bool dryRun = false, Status completionStatus = Status.Next)
     {
+        if (completionStatus is not (Status.Next or Status.Done))
+        {
+            throw new ArgumentOutOfRangeException(nameof(completionStatus), "Research completion status must be Next or Done.");
+        }
+
         return _eventStore.ExecuteAtomic(events =>
         {
             var state = IssueState.Replay(events);
@@ -305,23 +310,23 @@ public sealed class IssueEngine
             {
                 return new EventStoreOperation<ResearchCompletionResult>(
                     [],
-                    new ResearchCompletionResult(true, "Research would move the Blocked issue to Next.", true, ResearchCompletionStatus.WouldAdvance, new IssueView(state.GetSequence(issueId), issue)));
+                    new ResearchCompletionResult(true, $"Research would move the Blocked issue to {completionStatus}.", true, ResearchCompletionStatus.WouldAdvance, new IssueView(state.GetSequence(issueId), issue)));
             }
 
             var plannedEvent = new StatusChanged(
                 Guid.NewGuid(),
                 issueId,
                 DateTime.SpecifyKind(_clock.UtcNow, DateTimeKind.Utc),
-                Status.Next);
+                completionStatus);
             issue.Apply(plannedEvent);
             return new EventStoreOperation<ResearchCompletionResult>(
                 [plannedEvent],
-                new ResearchCompletionResult(true, "Research moved the Blocked issue to Next.", false, ResearchCompletionStatus.Advanced, new IssueView(state.GetSequence(issueId), issue)));
+                new ResearchCompletionResult(true, $"Research moved the Blocked issue to {completionStatus}.", false, ResearchCompletionStatus.Advanced, new IssueView(state.GetSequence(issueId), issue)));
         });
     }
 
-    public ResearchCompletionResult CompleteResearch(IssueId issueId, bool dryRun = false)
-        => TryCompleteResearch(issueId, dryRun);
+    public ResearchCompletionResult CompleteResearch(IssueId issueId, bool dryRun = false, Status completionStatus = Status.Next)
+        => TryCompleteResearch(issueId, dryRun, completionStatus);
 
     public IssueView? ClaimNext(bool dryRun = false)
     {
