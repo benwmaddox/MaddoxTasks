@@ -9,7 +9,7 @@ namespace MaddoxTasks.Web;
 
 internal static class WebEndpoints
 {
-    public static void Map(WebApplication app, IssueEngine engine)
+    public static void Map(WebApplication app, IssueEngine engine, IAiTaskDraftGenerator draftGenerator)
     {
         app.MapGet("/", ServeIndexAsync);
         app.MapGet("/index.html", ServeIndexAsync);
@@ -36,6 +36,7 @@ internal static class WebEndpoints
         app.MapGet("/api/repository-locks", context => GetRepositoryLocksAsync(context, engine));
         app.MapGet("/api/issues/{token}", context => GetIssueAsync(context, engine));
         app.MapPost("/api/issues", context => CreateIssueAsync(context, engine));
+        app.MapPost("/api/issues/draft", context => DraftIssueAsync(context, draftGenerator));
 
         app.MapMethods("/api/issues/{token}/status", ["PATCH", "PUT", "POST"],
             context => ChangeStatusAsync(context, engine));
@@ -150,6 +151,35 @@ internal static class WebEndpoints
         });
     }
 
+    private static Task DraftIssueAsync(HttpContext context, IAiTaskDraftGenerator generator)
+        => HandleJson(context, async root =>
+        {
+            var prompt = GetOptionalString(root, "prompt");
+            if (string.IsNullOrWhiteSpace(prompt) || prompt.Length > 16000)
+            {
+                await WriteError(context, 400, "Describe the task in 1 to 16000 characters.");
+                return;
+            }
+            try
+            {
+                var draft = await generator.GenerateAsync(prompt, context.RequestAborted);
+                await WriteJson(context, 200, writer =>
+                {
+                    writer.WriteBoolean("success", true);
+                    writer.WritePropertyName("draft");
+                    draft.WriteTo(writer);
+                });
+            }
+            catch (OperationCanceledException) when (!context.RequestAborted.IsCancellationRequested)
+            {
+                await WriteError(context, 504, "AI drafting timed out. Try again.");
+            }
+            catch (Exception exception) when (exception is InvalidOperationException or IOException or System.ComponentModel.Win32Exception or JsonException or FormatException)
+            {
+                await WriteError(context, 502, "AI drafting failed. Check Codex installation, sign-in and model configuration, then try again.");
+            }
+        });
+
     private static async Task CreateIssueAsync(HttpContext context, IssueEngine engine)
     {
         await HandleJson(context, async root =>
@@ -198,7 +228,17 @@ internal static class WebEndpoints
                 return;
             }
 
-            var result = engine.Execute(new CreateIssue(title ?? string.Empty, description, priority, parentId, dueDate, status));
+            var labels = new List<string>();
+            if (root.TryGetProperty("labels", out var labelValues))
+            {
+                if (labelValues.ValueKind != JsonValueKind.Array) throw new JsonException("Labels must be an array of strings.");
+                foreach (var label in labelValues.EnumerateArray())
+                {
+                    if (label.ValueKind != JsonValueKind.String) throw new JsonException("Labels must be strings.");
+                    labels.Add(label.GetString()!);
+                }
+            }
+            var result = engine.Execute(new CreateIssue(title ?? string.Empty, description, priority, parentId, dueDate, status), labels);
             await WriteCommandResult(context, result, engine, StatusCodes.Status201Created);
         });
     }
