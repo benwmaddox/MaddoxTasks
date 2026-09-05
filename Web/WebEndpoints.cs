@@ -86,7 +86,7 @@ internal static class WebEndpoints
             writer.WriteStartArray("issues");
             foreach (var view in issueViews)
             {
-                WriteIssue(writer, view, includeHistory: false, engine);
+                WriteIssue(writer, view, includeDetails: false, includeHistory: false, engine);
             }
 
             writer.WriteEndArray();
@@ -113,7 +113,7 @@ internal static class WebEndpoints
         {
             writer.WriteBoolean("success", true);
             writer.WritePropertyName("issue");
-            WriteIssue(writer, view, includeHistory: true, engine);
+            WriteIssue(writer, view, includeDetails: true, includeHistory: true, engine);
         });
     }
 
@@ -573,7 +573,7 @@ internal static class WebEndpoints
             if (view is not null)
             {
                 writer.WritePropertyName("issue");
-                WriteIssue(writer, view, includeHistory: false, engine);
+                WriteIssue(writer, view, includeDetails: true, includeHistory: false, engine);
             }
         });
     }
@@ -606,6 +606,7 @@ internal static class WebEndpoints
     private static void WriteIssue(
         Utf8JsonWriter writer,
         IssueView view,
+        bool includeDetails,
         bool includeHistory,
         IssueEngine engine)
     {
@@ -615,7 +616,6 @@ internal static class WebEndpoints
         writer.WriteString("shortId", view.ShortId);
         writer.WriteString("id", issue.Id.ToString());
         writer.WriteString("title", issue.Title);
-        writer.WriteString("description", issue.Description);
         writer.WriteString("status", issue.Status.ToString());
         writer.WriteString("statusLabel", issue.Status.ToDisplayString());
         writer.WriteNumber("priority", issue.Priority.Value);
@@ -653,13 +653,17 @@ internal static class WebEndpoints
         }
 
         writer.WriteEndArray();
-        writer.WriteStartArray("comments");
-        foreach (var comment in issue.Comments)
+        if (includeDetails)
         {
-            WriteComment(writer, comment);
-        }
+            writer.WriteString("description", issue.Description);
+            writer.WriteStartArray("comments");
+            foreach (var comment in issue.Comments)
+            {
+                WriteComment(writer, comment);
+            }
 
-        writer.WriteEndArray();
+            writer.WriteEndArray();
+        }
 
         if (includeHistory)
         {
