@@ -699,12 +699,7 @@ public sealed class WorkerHost
 
     private async Task ValidateRepositoryAsync(string repository, CancellationToken ct)
     {
-        var root = Path.GetFullPath(config.Current.RepoRoot).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        var path = Path.GetFullPath(Path.Combine(root, repository));
-        if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !Directory.Exists(path)) throw new InvalidOperationException("Invalid proposed repository: " + repository);
-        var inside = await processes.RunAsync("git", ["rev-parse", "--is-inside-work-tree"], path, ct);
-        var remote = await processes.RunAsync("git", ["remote", "get-url", "origin"], path, ct);
-        if (inside.ExitCode != 0 || inside.Output.Trim() != "true" || remote.ExitCode != 0 || string.IsNullOrWhiteSpace(remote.Output)) throw new InvalidOperationException("Repository has no usable Git origin: " + repository);
+        await new RepositoryBootstrap(processes, config.Current.GhExe, config.Current.PrivateRepositoryOwner).EnsureAsync(config.Current.RepoRoot, repository, ct);
     }
 
     public static List<string> BuildInitialCodexArguments(Job job, string schema, string envelope)
@@ -717,7 +712,7 @@ public sealed class WorkerHost
 
     private async Task<Workspace> MakeWorkspaceAsync(Job job, string repository, CancellationToken ct)
     {
-        var source = Path.GetFullPath(Path.Combine(config.Current.RepoRoot, repository));
+        var source = await new RepositoryBootstrap(processes, config.Current.GhExe, config.Current.PrivateRepositoryOwner).EnsureAsync(config.Current.RepoRoot, repository, ct);
         var slug = Regex.Replace(job.Task.Title.ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
         if (slug.Length > 30) slug = slug[..30];
         if (slug.Length == 0) slug = "task";

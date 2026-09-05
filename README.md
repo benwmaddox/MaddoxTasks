@@ -307,6 +307,11 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 .\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
+Repository admission and workspace creation prepare each project at its exact directory beneath `repoRoot`.
+Existing `origin` remotes remain authoritative: the worker fetches and bases its isolated worktree on the remote default branch, without pulling or resetting the canonical checkout. Task publication pushes its task branch through the usual PR workflow.
+To authorize creating missing remotes, set `privateRepositoryOwner` in `worker.json` to your GitHub username (for example `benwmaddox`). The authenticated `github.com` account must match. The worker creates a **private** repository named after the project directory; authentication failures and existing-name collisions stop preparation rather than adopting another repository. Without this setting, existing origins still work, but new remote creation stops with an actionable error.
+Projects without their own Git metadata are initialized locally, even when their parent is a checkout. An empty remote receives the existing committed HEAD. For an unborn local repository, the worker creates an initial baseline from nonignored project files; Stasis manifest `output` and `.stasis_cache` are excluded. Keep project `.gitignore` rules current for other generated files and local-only material. Existing staged initial files require a manual reviewed commit first; established repositories' unrelated working changes are never staged. Normal commit hooks remain enabled. Linked project paths are rejected, and no force-push or checkout reset is used.
+
 The worker immediately claims fresh tasks one at a time until every available
 Codex slot is occupied or no eligible task can be claimed. Whenever a running
 job releases a slot, the scheduler immediately tries to fill it again. The
