@@ -6,6 +6,29 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class WorkerPolicyTests
 {
     [Fact]
+    public void ShippedWorkerConfig_UsesAstraWithLowReasoningByDefault()
+    {
+        var configPath = FindWorkerAsset("worker.json");
+        using var config = JsonDocument.Parse(File.ReadAllText(configPath));
+
+        Assert.Equal("gpt-6-astra", config.RootElement.GetProperty("model").GetString());
+        Assert.Equal("low", config.RootElement.GetProperty("reasoningEffort").GetString());
+    }
+
+    [Fact]
+    public void ShippedWorkerPrompt_RequiresAgentPolicyAndDelegationMatrix()
+    {
+        var prompt = File.ReadAllText(FindWorkerAsset("worker-prompt.md"));
+
+        Assert.Contains("read and apply the applicable user-level AGENTS.md", prompt);
+        Assert.Contains("gpt-6-astra with low reasoning", prompt);
+        Assert.Contains("gpt-5.6-luna with max reasoning", prompt);
+        Assert.Contains("gpt-5.6-sol with medium reasoning", prompt);
+        Assert.Contains("Review delegated output", prompt);
+        Assert.Contains("escalate to a stronger model if stalled", prompt);
+    }
+
+    [Fact]
     public void WorkspaceCleanupPolicy_RequiresExactOwnedRootAndTaskBranch()
     {
         using var directory = new TemporaryDirectory();
@@ -915,6 +938,26 @@ public sealed class WorkerPolicyTests
         var startInfo = ProcessRunner.CreateStartInfo("codex", @"D:\code");
         Assert.Equal(System.Text.Encoding.UTF8.CodePage, startInfo.StandardOutputEncoding?.CodePage);
         Assert.Equal(System.Text.Encoding.UTF8.CodePage, startInfo.StandardErrorEncoding?.CodePage);
+    }
+
+    private static string FindWorkerAsset(string fileName)
+    {
+        foreach (var start in new[] { AppContext.BaseDirectory, Directory.GetCurrentDirectory() })
+        {
+            for (var directory = new DirectoryInfo(Path.GetFullPath(start)); directory is not null; directory = directory.Parent)
+            {
+                foreach (var candidate in new[]
+                {
+                    Path.Combine(directory.FullName, "Worker", fileName),
+                    Path.Combine(directory.FullName, fileName)
+                })
+                {
+                    if (File.Exists(candidate)) return candidate;
+                }
+            }
+        }
+
+        throw new FileNotFoundException($"Could not find shipped worker asset '{fileName}'.");
     }
 
     private static Job CreateJob(string phase = JobPhases.Claimed, DateTime? started = null) => new()
