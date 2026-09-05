@@ -61,10 +61,10 @@ Record the durable research-attempt marker on one task:
 The command selects at most one `Blocked` task in hierarchy priority/sequence order. A task whose latest exact
 `maddox-research-worker` marker is newer than the positive cooldown is skipped; the marker is written atomically so
 concurrent workers cannot claim the same task. Preview writes no events. The worker's research Codex receives a
-read-only snapshot containing only the selected task and may perform read-only web research, but all file, Git/GitHub, and external mutations
+read-only snapshot containing the selected task and current blocked-task context and may perform read-only web research, but all file, Git/GitHub, and external mutations
 are forbidden. A validated result may change only Maddox task entries (including creating tasks). After mutations and
 findings are recorded, the worker uses its internal `CompleteResearch` command, which requires the marker and moves
-the source from `Blocked` to `Next` only if it is still `Blocked`.
+the source from `Blocked` to `Next`, or to `Done` when the ledger-only objective is complete, only if it is still `Blocked`.
 
 Repository labels are canonicalized as lowercase `repo:<name>` identities and compared case-insensitively. With no repository labels, Active and `ReadyForReview` tasks reserve the synthetic `missing` identity; an explicit `repo:missing` collides with it. Status and label changes are rejected when their resulting reservation keys conflict. The scheduled runner starts a repository-less claim from normalized `RepoRoot`, passes no `--add-dir`, and warns that no repository was specified and the impact scope is unknown.
 
@@ -125,6 +125,8 @@ Supported `type` values (all available agent commands):
 - `AddComment`
 - `RequeueBlocked`
 - `CompleteResearch` (worker-only conditional source transition)
+
+`CompleteResearch` defaults to `Next`; the worker may pass `"completionStatus":"Done"` for a fully completed ledger-only research objective. Only `Next` and `Done` are accepted, and the source must still be `Blocked` with its durable research marker.
 
 Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels.
 
