@@ -145,6 +145,48 @@ public sealed class AgentRunnerTests
         Assert.Equal(Status.Next, engine.GetState().Issues[second].Status);
     }
 
+    [Fact]
+    public void ExecuteCommandJson_ResearchClaimAndCompletionExposeDedicatedResponses()
+    {
+        var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Blocked", "Find the blocker", Status.Blocked, Priority.From(2), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(timestamp));
+
+        using var claim = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine, "{\"type\":\"research-claim\"}"));
+        Assert.True(claim.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(issueId.ToString(), claim.RootElement.GetProperty("task").GetProperty("issueId").GetString());
+        Assert.Equal("Blocked", claim.RootElement.GetProperty("task").GetProperty("status").GetString());
+
+        using var completion = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"CompleteResearch","issueId":"{{issueId}}"}"""));
+        Assert.True(completion.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("Advanced", completion.RootElement.GetProperty("status").GetString());
+        Assert.Equal("Next", completion.RootElement.GetProperty("task").GetProperty("status").GetString());
+        Assert.Equal(Status.Next, engine.GetState().Issues[issueId].Status);
+    }
+
+    [Fact]
+    public void ExecuteCommandJson_CompleteResearchDoesNotOverwriteHumanStatusChange()
+    {
+        var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Blocked", null, Status.Blocked, Priority.From(2), null, null));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(timestamp));
+        Assert.True(engine.ResearchClaimBlocked().Success);
+        Assert.True(engine.Execute(new ChangeStatus(issueId, Status.Done)).Success);
+
+        using var completion = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"CompleteResearch","issueId":"{{issueId}}"}"""));
+        Assert.False(completion.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("NotBlocked", completion.RootElement.GetProperty("status").GetString());
+        Assert.Equal(Status.Done, engine.GetState().Issues[issueId].Status);
+    }
+
     [Theory]
     [InlineData("null")]
     [InlineData("\"true\"")]

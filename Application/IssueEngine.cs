@@ -199,6 +199,116 @@ public sealed class IssueEngine
         }
     }
 
+    /// <summary>
+    /// Atomically reserve one blocked issue for the research worker by adding
+    /// the durable research-attempt comment. The issue remains Blocked until a
+    /// worker has applied and validated a complete unblocking plan.
+    /// </summary>
+    public ResearchClaimResult ResearchClaimBlocked(TimeSpan? cooldown = null, bool dryRun = false)
+    {
+        var effectiveCooldown = cooldown ?? TimeSpan.FromDays(14);
+        if (effectiveCooldown <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(cooldown), "Research cooldown must be positive.");
+        }
+
+        return _eventStore.ExecuteAtomic(events =>
+        {
+            var now = NormalizeUtc(_clock.UtcNow);
+            var state = IssueState.Replay(events);
+            var candidate = state.HierarchicalIssues()
+                .FirstOrDefault(issue => ResearchClaimPolicy.IsEligible(issue, now, effectiveCooldown));
+
+            if (candidate is null)
+            {
+                return new EventStoreOperation<ResearchClaimResult>(
+                    [],
+                    new ResearchClaimResult(
+                        true,
+                        "No eligible blocked issue is available for research.",
+                        dryRun,
+                        null,
+                        null));
+            }
+
+            var marker = new CommentAdded(
+                Guid.NewGuid(),
+                candidate.Id,
+                now,
+                ResearchClaimPolicy.MarkerComment,
+                ResearchClaimPolicy.Actor);
+
+            if (!dryRun)
+            {
+                candidate.Apply(marker);
+            }
+
+            return new EventStoreOperation<ResearchClaimResult>(
+                dryRun ? [] : [marker],
+                new ResearchClaimResult(
+                    true,
+                    dryRun
+                        ? $"Blocked issue {candidate.Id} is eligible for research."
+                        : $"Blocked issue {candidate.Id} claimed for research.",
+                    dryRun,
+                    new IssueView(state.GetSequence(candidate.Id), candidate),
+                    ResearchClaimPolicy.LatestAttemptUtc(candidate)));
+            });
+    }
+
+    /// <summary>
+    /// Complete a research claim only while its source issue is still Blocked.
+    /// The claim marker is required so this narrow operation cannot be used as
+    /// a general status-change bypass by another agent command.
+    /// </summary>
+    public ResearchCompletionResult TryCompleteResearch(IssueId issueId, bool dryRun = false)
+    {
+        return _eventStore.ExecuteAtomic(events =>
+        {
+            var state = IssueState.Replay(events);
+            if (!state.TryGetIssue(issueId, out var issue))
+            {
+                return new EventStoreOperation<ResearchCompletionResult>(
+                    [],
+                    new ResearchCompletionResult(false, $"Issue '{issueId}' was not found.", dryRun, ResearchCompletionStatus.NotFound, null));
+            }
+
+            if (!ResearchClaimPolicy.HasAttempt(issue))
+            {
+                return new EventStoreOperation<ResearchCompletionResult>(
+                    [],
+                    new ResearchCompletionResult(false, "Issue has no research claim marker.", dryRun, ResearchCompletionStatus.NotResearchClaimed, new IssueView(state.GetSequence(issueId), issue)));
+            }
+
+            if (issue.Status != Status.Blocked)
+            {
+                return new EventStoreOperation<ResearchCompletionResult>(
+                    [],
+                    new ResearchCompletionResult(false, $"Issue is no longer Blocked (current status: {issue.Status}).", dryRun, ResearchCompletionStatus.NotBlocked, new IssueView(state.GetSequence(issueId), issue)));
+            }
+
+            if (dryRun)
+            {
+                return new EventStoreOperation<ResearchCompletionResult>(
+                    [],
+                    new ResearchCompletionResult(true, "Research would move the Blocked issue to Next.", true, ResearchCompletionStatus.WouldAdvance, new IssueView(state.GetSequence(issueId), issue)));
+            }
+
+            var plannedEvent = new StatusChanged(
+                Guid.NewGuid(),
+                issueId,
+                DateTime.SpecifyKind(_clock.UtcNow, DateTimeKind.Utc),
+                Status.Next);
+            issue.Apply(plannedEvent);
+            return new EventStoreOperation<ResearchCompletionResult>(
+                [plannedEvent],
+                new ResearchCompletionResult(true, "Research moved the Blocked issue to Next.", false, ResearchCompletionStatus.Advanced, new IssueView(state.GetSequence(issueId), issue)));
+        });
+    }
+
+    public ResearchCompletionResult CompleteResearch(IssueId issueId, bool dryRun = false)
+        => TryCompleteResearch(issueId, dryRun);
+
     public IssueView? ClaimNext(bool dryRun = false)
     {
         return _eventStore.ExecuteAtomic(events =>

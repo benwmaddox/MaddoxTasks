@@ -495,6 +495,104 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void ResearchPlanPolicy_AllowsOnlyTaskEntryMutations()
+    {
+        const string sourceId = "01234567-89ab-cdef-0123-456789abcdef";
+        const string targetId = "fedcba98-7654-3210-fedc-ba9876543210";
+        var json = $$"""
+        {
+          "outcome": "unblocked",
+          "summary": "The dependency can be documented and reprioritized.",
+          "findings": ["The target task owns the missing contract."],
+          "mutations": [
+            {"type":"AddComment","issueId":"{{targetId}}","comment":"Contract is ready."},
+            {"type":"UpdateDescription","issueId":"{{targetId}}","description":"Updated contract."},
+            {"type":"ChangePriority","issueId":"{{targetId}}","newPriority":2},
+            {"type":"AddLabel","issueId":"{{targetId}}","label":"researched"},
+            {"type":"RemoveLabel","issueId":"{{targetId}}","label":"old"},
+            {"type":"SetRepositoryLabels","issueId":"{{targetId}}","repositories":["alpha"]},
+            {"type":"ChangeStatus","issueId":"{{targetId}}","newStatus":"Next"},
+            {"type":"CreateIssue","title":"Track contract","description":"Follow-up","status":"Backlog","priority":3,"repositories":["beta"]}
+          ]
+        }
+        """;
+
+        var plan = ResearchPlanPolicy.Parse(json, new TaskDto(42, sourceId, "Source", "Blocked", ["alpha"]));
+
+        Assert.Equal(ResearchPlanPolicy.Unblocked, plan.Outcome);
+        Assert.Equal(8, plan.Mutations.Length);
+        Assert.Equal(["AddComment", "UpdateDescription", "ChangePriority", "AddLabel", "RemoveLabel", "SetRepositoryLabels", "ChangeStatus", "CreateIssue"], plan.Mutations.Select(mutation => mutation.Type).ToArray());
+    }
+
+    [Theory]
+    [InlineData("SplitIssue")]
+    [InlineData("RequeueBlocked")]
+    [InlineData("RunCommand")]
+    [InlineData("DeleteIssue")]
+    public void ResearchPlanPolicy_RejectsNonTaskEntryMutationTypes(string mutationType)
+    {
+        var json = $$"""
+        {"outcome":"stillBlocked","summary":"No safe change.","findings":[],"mutations":[{"type":"{{mutationType}}"}]}
+        """;
+
+        Assert.Throws<InvalidDataException>(() => ResearchPlanPolicy.Parse(json, new TaskDto(42, "01234567-89ab-cdef-0123-456789abcdef", "Source", "Blocked", [])));
+    }
+
+    [Theory]
+    [InlineData("full")]
+    [InlineData("compact")]
+    [InlineData("guid-prefix-d")]
+    [InlineData("guid-prefix-n")]
+    [InlineData("sequence")]
+    [InlineData("hash-sequence")]
+    public void ResearchPlanPolicy_RejectsSourceStatusMutationByEveryIssueTokenForm(string tokenForm)
+    {
+        const string sourceId = "01234567-89ab-cdef-0123-456789abcdef";
+        var token = tokenForm switch
+        {
+            "full" => sourceId,
+            "compact" => "0123456789abcdef0123456789abcdef",
+            "guid-prefix-d" => "01234567-",
+            "guid-prefix-n" => "0123456789ab",
+            "sequence" => "42",
+            "hash-sequence" => "#42",
+            _ => throw new ArgumentOutOfRangeException(nameof(tokenForm))
+        };
+        var json = $$"""
+        {"outcome":"unblocked","summary":"Attempted source status change.","findings":[],"mutations":[{"type":"ChangeStatus","issueId":"{{token}}","newStatus":"Next"}]}
+        """;
+
+        Assert.Throws<InvalidDataException>(() => ResearchPlanPolicy.Parse(json, new TaskDto(42, sourceId, "Source", "Blocked", [])));
+    }
+
+    [Fact]
+    public void ResearchPrompt_AllowsReadOnlyExternalResearchButForbidsMutations()
+    {
+        var prompt = WorkerHost.BuildResearchPrompt(
+            new TaskDto(42, "source", "Blocked task", "Find the dependency", ["alpha"]),
+            "[]");
+
+        Assert.Contains("read-only web", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("external mutation", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("call external services", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Do not edit files", prompt, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResearchAdmission_AllowsOnlyOneActiveReservation()
+    {
+        var admission = new ResearchAdmission();
+
+        Assert.True(admission.TryReserve());
+        Assert.True(admission.IsActive);
+        Assert.False(admission.TryReserve());
+        admission.Release();
+        Assert.False(admission.IsActive);
+        Assert.True(admission.TryReserve());
+        admission.Release();
+    }
+
+    [Fact]
     public void ConfigReload_IsAtomicAndExistingSnapshotDoesNotChange()
     {
         using var directory = new TemporaryDirectory();
@@ -521,6 +619,25 @@ public sealed class WorkerPolicyTests
         var path = Path.Combine(directory.Path, "worker.json");
         WriteConfig(path, directory.Path, 2, "model");
         Assert.Equal(TimeSpan.FromMinutes(10), WorkerConfig.Load(path).EffectiveBlockedDisplayDuration);
+    }
+
+    [Fact]
+    public void WorkerConfig_DefaultsResearchCooldownToFourteenDaysAndRejectsNonPositiveValues()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "worker.json");
+        WriteConfig(path, directory.Path, 2, "model");
+        Assert.Equal(TimeSpan.FromDays(14), WorkerConfig.Load(path).EffectiveResearchCooldown);
+
+        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:00:00");
+        Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
+
+        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:02:00");
+        var state = new ConfigState(WorkerConfig.Load(path));
+        Assert.Equal(TimeSpan.FromMinutes(2), state.Current.EffectiveResearchCooldown);
+        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:03:00");
+        Assert.True(state.TryReload(path, out var error), error);
+        Assert.Equal(TimeSpan.FromMinutes(3), state.Current.EffectiveResearchCooldown);
     }
 
     [Fact]
@@ -863,14 +980,14 @@ public sealed class WorkerPolicyTests
 
     private static Job WithSnapshot(Job job, string model) { job.Model = model; return job; }
 
-    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null)
+    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null, string? researchCooldown = null)
     {
         File.WriteAllText(path, JsonSerializer.Serialize(new
         {
             schemaVersion = 1, claimInterval = "00:15:00", maxConcurrentCodexProcesses = cap, prPollInterval = "00:01:00",
             clarificationTimeout = "00:10:00", promptFile = "worker-prompt.md", model, reasoningEffort = "medium",
             repairMaxAttempts = 3, repairMaxElapsed = "02:00:00", reviewQuietPeriod = "00:30:00", ignoredChecks = Array.Empty<string>(),
-            blockedDisplayDuration,
+            blockedDisplayDuration, researchCooldown,
             autoMergeRepositories = new[] { "benwmaddox/StasisLang" }, autoMergeMethod = "squash", maddoxExe = "MaddoxTasks.exe",
             codexExe = "codex", ghExe = "gh", repoRoot = root, worktreeRoot = Path.Combine(root, "worktrees")
         }));

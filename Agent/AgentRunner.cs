@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using MaddoxTasks.Application;
@@ -12,6 +13,16 @@ public static partial class AgentRunner
     {
         var resolvedDefaultActor = ResolveDefaultActor(defaultActor);
         var normalizedJson = NormalizeIncomingJson(json);
+
+        if (TryExecuteResearchCompletion(normalizedJson, engine, out var researchCompletionResponse))
+        {
+            return researchCompletionResponse;
+        }
+
+        if (TryExecuteResearchClaim(normalizedJson, engine, out var researchResponse))
+        {
+            return researchResponse;
+        }
 
         if (TryExecuteRequeueBlocked(normalizedJson, engine, out var bulkResponse))
         {
@@ -51,6 +62,199 @@ public static partial class AgentRunner
                 result.IssueId?.ToString(),
                 result.EventId?.ToString(),
                 finalStatus));
+    }
+
+    public static string GetResearchClaimJson(IssueEngine engine, bool dryRun = false, TimeSpan? cooldown = null)
+    {
+        var result = engine.ResearchClaimBlocked(cooldown, dryRun);
+        return SerializeResponse(ToResearchClaimResponse(result));
+    }
+
+    public static string GetResearchCompletionJson(IssueEngine engine, IssueId issueId, bool dryRun = false)
+        => SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun)));
+
+    private static ResearchClaimResponse ToResearchClaimResponse(ResearchClaimResult result)
+        => new(
+            result.Success,
+            result.Message,
+            result.DryRun,
+            result.Task is null ? null : ToAgentIssueDto(result.Task),
+            result.LastAttemptUtc);
+
+    private static ResearchCompletionResponse ToResearchCompletionResponse(ResearchCompletionResult result)
+        => new(
+            result.Success,
+            result.Message,
+            result.DryRun,
+            result.Status.ToString(),
+            result.Task is null ? null : ToAgentIssueDto(result.Task));
+
+    private static bool TryExecuteResearchCompletion(string json, IssueEngine engine, out string response)
+    {
+        response = string.Empty;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+
+        JsonDocument document;
+        try { document = JsonDocument.Parse(json); }
+        catch (JsonException) { return false; }
+
+        using (document)
+        {
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetProperty(root, "type", out var typeElement) ||
+                typeElement.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+
+            var type = typeElement.GetString()?.Trim().Replace("-", string.Empty, StringComparison.Ordinal).ToLowerInvariant();
+            if (type != "completeresearch") return false;
+
+            var dryRun = false;
+            if (TryGetProperty(root, "dryRun", out var dryRunElement))
+            {
+                if (dryRunElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    response = SerializeResponse(new ResearchCompletionResponse(false, "Field 'dryRun' must be a boolean.", false, ResearchCompletionStatus.NotFound.ToString(), null));
+                    return true;
+                }
+
+                dryRun = dryRunElement.GetBoolean();
+            }
+
+            if (!TryResolveIssue(root, engine, out var issueId, out var error))
+            {
+                response = SerializeResponse(new ResearchCompletionResponse(false, error, dryRun, ResearchCompletionStatus.NotFound.ToString(), null));
+                return true;
+            }
+
+            try
+            {
+                response = SerializeResponse(ToResearchCompletionResponse(engine.TryCompleteResearch(issueId, dryRun)));
+            }
+            catch (Exception exception)
+            {
+                response = SerializeResponse(new ResearchCompletionResponse(false, exception.Message, dryRun, ResearchCompletionStatus.NotFound.ToString(), null));
+            }
+
+            return true;
+        }
+    }
+
+    private static bool TryExecuteResearchClaim(string json, IssueEngine engine, out string response)
+    {
+        response = string.Empty;
+        if (string.IsNullOrWhiteSpace(json)) return false;
+
+        JsonDocument document;
+        try { document = JsonDocument.Parse(json); }
+        catch (JsonException) { return false; }
+
+        using (document)
+        {
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryGetProperty(root, "type", out var typeElement) ||
+                typeElement.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+
+            var type = typeElement.GetString()?.Trim().Replace("-", string.Empty, StringComparison.Ordinal).ToLowerInvariant();
+            if (type != "researchclaim") return false;
+
+            var dryRun = false;
+            if (TryGetProperty(root, "dryRun", out var dryRunElement))
+            {
+                if (dryRunElement.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                {
+                    response = SerializeResponse(new ResearchClaimResponse(false, "Field 'dryRun' must be a boolean.", false, null, null));
+                    return true;
+                }
+
+                dryRun = dryRunElement.GetBoolean();
+            }
+
+            if (!TryParseResearchCooldown(root, out var cooldown, out var error))
+            {
+                response = SerializeResponse(new ResearchClaimResponse(false, error, dryRun, null, null));
+                return true;
+            }
+
+            try
+            {
+                response = SerializeResponse(ToResearchClaimResponse(engine.ResearchClaimBlocked(cooldown, dryRun)));
+            }
+            catch (ArgumentOutOfRangeException exception)
+            {
+                response = SerializeResponse(new ResearchClaimResponse(false, exception.Message, dryRun, null, null));
+            }
+
+            return true;
+        }
+    }
+
+    private static bool TryParseResearchCooldown(JsonElement root, out TimeSpan? cooldown, out string error)
+    {
+        cooldown = null;
+        error = string.Empty;
+        var hasCooldown = TryGetProperty(root, "cooldown", out var cooldownElement);
+        var hasDays = TryGetProperty(root, "cooldownDays", out var daysElement);
+        var hasHours = TryGetProperty(root, "cooldownHours", out var hoursElement);
+        if (hasCooldown && (hasDays || hasHours))
+        {
+            error = "Specify only one of cooldown, cooldownDays, or cooldownHours.";
+            return false;
+        }
+
+        if (hasDays && hasHours)
+        {
+            error = "Specify only one of cooldownDays or cooldownHours.";
+            return false;
+        }
+
+        if (hasCooldown)
+        {
+            if (cooldownElement.ValueKind != JsonValueKind.String ||
+                !TimeSpan.TryParse(cooldownElement.GetString(), CultureInfo.InvariantCulture, out var parsed))
+            {
+                error = "cooldown must be a positive duration such as '14.00:00:00'.";
+                return false;
+            }
+
+            if (parsed <= TimeSpan.Zero)
+            {
+                error = "cooldown must be positive.";
+                return false;
+            }
+
+            cooldown = parsed;
+            return true;
+        }
+
+        if (hasDays || hasHours)
+        {
+            var element = hasDays ? daysElement : hoursElement;
+            if (element.ValueKind != JsonValueKind.Number || !element.TryGetDouble(out var value) || !double.IsFinite(value) || value <= 0)
+            {
+                error = hasDays ? "cooldownDays must be a positive number." : "cooldownHours must be a positive number.";
+                return false;
+            }
+
+            try
+            {
+                cooldown = hasDays ? TimeSpan.FromDays(value) : TimeSpan.FromHours(value);
+                return true;
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                error = "Research cooldown is too large.";
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool TryExecuteSplitIssue(string json, IssueEngine engine, out string response)
@@ -794,6 +998,12 @@ public static partial class AgentRunner
     private static string SerializeResponse(RequeueBlockedResponse response)
         => JsonSerializer.Serialize(response, PrettyJsonContext.RequeueBlockedResponse);
 
+    private static string SerializeResponse(ResearchClaimResponse response)
+        => JsonSerializer.Serialize(response, PrettyJsonContext.ResearchClaimResponse);
+
+    private static string SerializeResponse(ResearchCompletionResponse response)
+        => JsonSerializer.Serialize(response, PrettyJsonContext.ResearchCompletionResponse);
+
     private static string SerializeResponse(SplitIssueResponse response)
         => JsonSerializer.Serialize(response, PrettyJsonContext.SplitIssueResponse);
 
@@ -815,6 +1025,18 @@ public static partial class AgentRunner
         bool DryRun,
         string[] ChangedIssueIds,
         string[] SkippedIssueIds);
+    private sealed record ResearchClaimResponse(
+        bool Success,
+        string Message,
+        bool DryRun,
+        AgentIssueDto? Task,
+        DateTime? LastAttemptUtc);
+    private sealed record ResearchCompletionResponse(
+        bool Success,
+        string Message,
+        bool DryRun,
+        string Status,
+        AgentIssueDto? Task);
     private sealed record SetRepositoryLabelsResponse(bool Success, string Message, string IssueId, string[] Repositories, AgentIssueDto Issue);
     private sealed record SplitIssueResponse(bool Success, string Message, AgentIssueDto? Parent, AgentIssueDto[] Children);
 
@@ -844,6 +1066,8 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(AgentIssueDto))]
     [JsonSerializable(typeof(AgentCommandResponse))]
     [JsonSerializable(typeof(RequeueBlockedResponse))]
+    [JsonSerializable(typeof(ResearchClaimResponse))]
+    [JsonSerializable(typeof(ResearchCompletionResponse))]
     [JsonSerializable(typeof(SetRepositoryLabelsResponse))]
     [JsonSerializable(typeof(SplitIssueResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]

@@ -23,6 +23,7 @@ public sealed class WorkerHost
     private readonly SemaphoreSlim renderLock = new(1, 1);
     private readonly CancellationTokenSource stop = new();
     private readonly ConcurrencyGate capacity;
+    private readonly ResearchAdmission researchAdmission = new();
     private volatile bool paused;
     private volatile string? configError;
     private DateTime nextTickUtc;
@@ -62,10 +63,14 @@ public sealed class WorkerHost
                 cadence.EndStartupFillIfAtCapacity(now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
                 var automaticDue = cadence.IsDue(now, config.Current);
                 var manual = wakeReasons.HasFlag(SchedulerWakeReason.Manual);
+                var capacityChanged = wakeReasons.HasFlag(SchedulerWakeReason.CapacityChanged);
                 var followup = !followups.IsEmpty;
-                if (automaticDue || manual || followup)
+                if (automaticDue || manual || followup || capacityChanged)
                 {
-                    var outcome = await TickAsync(ct, automaticDue || manual);
+                    // Capacity wakeups are enough to start a blocked-task
+                    // researcher, but do not bypass the normal fresh-claim
+                    // cadence when there is no research candidate.
+                    var outcome = await TickAsync(ct, automaticDue || manual, allowResearch: true);
                     now = clock.UtcNow;
                     if (automaticDue) cadence.CompleteAutomaticTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
                     else if (manual) cadence.CompleteManualTick(outcome, now, capacity.Active, config.Current.MaxConcurrentCodexProcesses);
@@ -86,10 +91,14 @@ public sealed class WorkerHost
 
     public void RequestStop() => stop.Cancel();
 
-    internal async Task<FreshClaimOutcome> TickAsync(CancellationToken ct, bool allowFreshClaim = true)
+    internal async Task<FreshClaimOutcome> TickAsync(CancellationToken ct, bool allowFreshClaim = true, bool allowResearch = true)
     {
         log.Write("info", "scheduler.tick", new { active = capacity.Active, queued = followups.Count, paused });
         await ReconcileAsync(ct);
+        if (allowResearch && !paused)
+        {
+            await TryStartResearchAsync(ct);
+        }
         DrainFollowups(ct);
         if (paused || !allowFreshClaim) return FreshClaimOutcome.NotAttempted;
         var freshClaim = new FreshClaimAllowance();
@@ -155,6 +164,244 @@ public sealed class WorkerHost
             _ = RunReservedJobAsync(item.Job, item.Mode, ct);
         }
     }
+
+    private async Task TryStartResearchAsync(CancellationToken ct)
+    {
+        if (!capacity.TryReserve()) return;
+        if (!researchAdmission.TryReserve())
+        {
+            capacity.Release();
+            return;
+        }
+
+        var settings = config.Current;
+        try
+        {
+            var cooldown = settings.EffectiveResearchCooldown.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
+            var claim = await RunMaddoxCommandAsync(["research-claim", "--cooldown", cooldown], ct);
+            if (claim.ExitCode != 0)
+            {
+                log.Write("warning", "research.claim.failed", new { error = claim.Error.Trim(), output = claim.Output.Trim() });
+                ReleaseResearchAdmission(signalScheduler: false);
+                return;
+            }
+
+            if (!TryReadResearchClaim(claim.Output, out var task) || task is null)
+            {
+                log.Write("info", "research.claim.empty");
+                ReleaseResearchAdmission(signalScheduler: false);
+                return;
+            }
+
+            var snapshot = await RunMaddoxCommandAsync(["issues", "--include-done"], ct);
+            if (snapshot.ExitCode != 0 || string.IsNullOrWhiteSpace(snapshot.Output))
+                throw new InvalidOperationException("Could not read the all-task snapshot for research: " + snapshot.Error.Trim());
+
+            var schema = WriteSchema("research", ResearchResultSchema);
+            log.Write("info", "research.started", new { task.Sequence, task.Title });
+            _ = RunResearchJobAsync(task, snapshot.Output, settings, schema, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            ReleaseResearchAdmission(signalScheduler: false);
+            throw;
+        }
+        catch (Exception exception)
+        {
+            log.Write("error", "research.start.failed", new { error = exception.Message });
+            ReleaseResearchAdmission(signalScheduler: false);
+        }
+    }
+
+    private async Task RunResearchJobAsync(TaskDto task, string taskSnapshotJson, WorkerConfig settings, string schema, CancellationToken ct)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeout.CancelAfter(settings.ClarificationTimeout);
+            var prompt = BuildResearchPrompt(task, taskSnapshotJson);
+            var arguments = new List<string>
+            {
+                "exec", "--json", "--output-schema", schema,
+                "-m", settings.Model,
+                "-c", $"model_reasoning_effort={settings.ReasoningEffort}",
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
+                "-C", settings.RepoRoot,
+                prompt
+            };
+
+            var run = await RunResearchCodexAsync(settings, arguments, timeout.Token);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Research Codex failed: " + run.Error.Trim());
+            var resultJson = ExtractResult(run.Output);
+            var plan = ResearchPlanPolicy.Parse(resultJson, task);
+            await ApplyResearchPlanAsync(task, plan, ct);
+            log.Write("info", "research.completed", new { task.Sequence, outcome = plan.Outcome, mutations = plan.Mutations.Length });
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            await RecordResearchFailureAsync(task, "Research timed out.", ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown leaves the source task Blocked with its durable marker.
+        }
+        catch (Exception exception)
+        {
+            log.Write("error", "research.failed", new { task.Sequence, error = exception.Message });
+            await RecordResearchFailureAsync(task, exception.Message, ct);
+        }
+        finally
+        {
+            ReleaseResearchAdmission(signalScheduler: true);
+        }
+    }
+
+    private async Task ApplyResearchPlanAsync(TaskDto sourceTask, ResearchPlan plan, CancellationToken ct)
+    {
+        foreach (var mutation in plan.Mutations)
+        {
+            switch (mutation.Type)
+            {
+                case "AddComment":
+                    await RunRequiredCommandAsync(new { type = "AddComment", issueId = mutation.IssueId, comment = mutation.Comment }, ResearchPlanPolicy.Actor, ct);
+                    break;
+                case "UpdateDescription":
+                    await RunRequiredCommandAsync(new { type = "UpdateDescription", issueId = mutation.IssueId, description = mutation.Description }, ResearchPlanPolicy.Actor, ct);
+                    break;
+                case "ChangePriority":
+                    await RunRequiredCommandAsync(new { type = "ChangePriority", issueId = mutation.IssueId, newPriority = mutation.NewPriority }, null, ct);
+                    break;
+                case "AddLabel":
+                    await RunRequiredCommandAsync(new { type = "AddLabel", issueId = mutation.IssueId, label = mutation.Label }, null, ct);
+                    break;
+                case "RemoveLabel":
+                    await RunRequiredCommandAsync(new { type = "RemoveLabel", issueId = mutation.IssueId, label = mutation.Label }, null, ct);
+                    break;
+                case "SetRepositoryLabels":
+                    await RunRequiredCommandAsync(new { type = "SetRepositoryLabels", issueId = mutation.IssueId, repositories = mutation.Repositories }, null, ct);
+                    break;
+                case "ChangeStatus":
+                    await RunRequiredCommandAsync(new { type = "ChangeStatus", issueId = mutation.IssueId, newStatus = mutation.NewStatus }, null, ct);
+                    break;
+                case "CreateIssue":
+                    await ApplyResearchCreateAsync(mutation, ct);
+                    break;
+                default:
+                    throw new InvalidDataException("Unsupported research mutation: " + mutation.Type);
+            }
+        }
+
+        // Findings are written after task mutations. For an unblocked outcome
+        // the source transition below is intentionally the final command.
+        await RunRequiredCommandAsync(
+            new { type = "AddComment", issueId = sourceTask.IssueId, comment = ResearchPlanPolicy.FindingsComment(plan) },
+            ResearchPlanPolicy.Actor,
+            ct);
+
+        if (plan.Outcome == ResearchPlanPolicy.Unblocked)
+        {
+            await RunRequiredCommandAsync(
+                new { type = "CompleteResearch", issueId = sourceTask.IssueId },
+                null,
+                ct);
+        }
+    }
+
+    private async Task ApplyResearchCreateAsync(ResearchMutation mutation, CancellationToken ct)
+    {
+        var result = await RunRequiredCommandAsync(
+            new
+            {
+                type = "CreateIssue",
+                title = mutation.Title,
+                description = mutation.Description,
+                priority = mutation.Priority ?? 3,
+                status = mutation.Status ?? "Next",
+                parentId = mutation.ParentId
+            },
+            ResearchPlanPolicy.Actor,
+            ct);
+        var issueId = ReadCommandIssueId(result.Output);
+        if (mutation.Repositories is { Length: > 0 })
+        {
+            await RunRequiredCommandAsync(
+                new { type = "SetRepositoryLabels", issueId, repositories = mutation.Repositories },
+                null,
+                ct);
+        }
+    }
+
+    private async Task RecordResearchFailureAsync(TaskDto task, string reason, CancellationToken ct)
+    {
+        if (ct.IsCancellationRequested) return;
+        try
+        {
+            await RunRequiredCommandAsync(
+                new { type = "AddComment", issueId = task.IssueId, comment = "Research worker could not complete: " + reason },
+                ResearchPlanPolicy.Actor,
+                ct);
+        }
+        catch (Exception exception)
+        {
+            log.Write("warning", "research.failure-record.failed", new { task.Sequence, error = exception.Message });
+        }
+    }
+
+    private void ReleaseResearchAdmission(bool signalScheduler)
+    {
+        try { researchAdmission.Release(); }
+        finally
+        {
+            capacity.Release();
+            if (signalScheduler) SignalScheduler(SchedulerWakeReason.CapacityChanged);
+        }
+    }
+
+    private async Task<ExecResult> RunResearchCodexAsync(WorkerConfig settings, IEnumerable<string> arguments, CancellationToken ct)
+    {
+        var terminal = new CodexTerminalEventTracker();
+        return await processes.RunAsync(settings.CodexExe, arguments, settings.RepoRoot, ct, terminalOutput: new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)));
+    }
+
+    private Task<ExecResult> RunMaddoxCommandAsync(IEnumerable<string> command, CancellationToken ct)
+        => processes.RunAsync(config.Current.MaddoxExe, ["agent", .. command], Path.GetDirectoryName(configPath)!, ct);
+
+    private static bool TryReadResearchClaim(string output, out TaskDto? task)
+    {
+        task = null;
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("success", out var success) || success.ValueKind != JsonValueKind.True) return false;
+            if (!root.TryGetProperty("task", out var taskElement) || taskElement.ValueKind == JsonValueKind.Null) return true;
+            task = JsonSerializer.Deserialize<TaskDto>(taskElement.GetRawText(), JsonOptions);
+            return task is not null;
+        }
+        catch (JsonException) { return false; }
+    }
+
+    private static string ReadCommandIssueId(string output)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            if (document.RootElement.TryGetProperty("issueId", out var issueId) && issueId.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(issueId.GetString()))
+                return issueId.GetString()!;
+        }
+        catch (JsonException) { }
+        throw new InvalidDataException("CreateIssue command returned no issue id.");
+    }
+
+    public static string BuildResearchPrompt(TaskDto sourceTask, string allTaskSnapshotJson)
+        => "You are the Maddox blocked-task research worker. Read the source task and the current all-task JSON snapshot below and determine whether the source task can be unblocked using only changes to Maddox task entries.\n\n"
+            + "This is a read-only investigation. You may perform read-only web or other external research when useful. Do not edit files, run commands that mutate state, use Git or GitHub for mutations, create branches, commit, push, open or merge pull requests, send messages, or perform any external mutation or other side effect. The worker process alone will apply the returned task-entry mutations through MaddoxTasks after validating them.\n\n"
+            + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to unblocked only when the proposed task-entry changes genuinely remove the blocker; otherwise set stillBlocked. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
+            + "SOURCE TASK:\n"
+            + JsonSerializer.Serialize(sourceTask)
+            + "\n\nALL TASKS SNAPSHOT (authoritative for this research run):\n"
+            + allTaskSnapshotJson;
 
     private async Task RunReservedJobAsync(Job job, RecoveryMode mode, CancellationToken ct)
     {
@@ -1071,4 +1318,5 @@ public sealed class WorkerHost
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
     private const string ClarifySchema = """{"type":"object","properties":{"action":{"enum":["assign","split"]},"repositories":{"type":"array","items":{"type":"string"}},"children":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"repository":{"type":"string"},"rationale":{"type":"string"}},"required":["title","description","repository","rationale"],"additionalProperties":false}},"rationale":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"ambiguous":{"type":"boolean"}},"required":["action","repositories","children","rationale","confidence","ambiguous"],"additionalProperties":false}""";
     private const string ResultSchema = """{"type":"object","properties":{"status":{"enum":["completed","noChanges","blocked"]},"summary":{"type":"string"},"validationEvidence":{"type":"array","items":{"type":"string"}},"repositories":{"type":"array","items":{"type":"object","properties":{"repository":{"type":"string"},"changed":{"type":"boolean"}},"required":["repository","changed"],"additionalProperties":false}},"commitMessage":{"type":"string"},"prTitle":{"type":"string"},"prBody":{"type":"string"},"checkDispositions":{"type":"array","items":{"type":"object","properties":{"checkId":{"type":"string"},"addressed":{"type":"boolean"},"summary":{"type":"string"}},"required":["checkId","addressed","summary"],"additionalProperties":false}},"threadDispositions":{"type":"array","items":{"type":"object","properties":{"threadId":{"type":"string"},"addressed":{"type":"boolean"},"replyBody":{"type":"string"}},"required":["threadId","addressed","replyBody"],"additionalProperties":false}}},"required":["status","summary","validationEvidence","repositories","commitMessage","prTitle","prBody","checkDispositions","threadDispositions"],"additionalProperties":false}""";
+    private const string ResearchResultSchema = """{"type":"object","properties":{"outcome":{"enum":["unblocked","stillBlocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"mutations":{"type":"array","items":{"type":"object","properties":{"type":{"enum":["AddComment","UpdateDescription","ChangePriority","AddLabel","RemoveLabel","SetRepositoryLabels","ChangeStatus","CreateIssue"]},"issueId":{"type":"string"},"comment":{"type":"string"},"description":{"type":"string"},"newPriority":{"type":"integer","minimum":1,"maximum":5},"label":{"type":"string"},"newStatus":{"enum":["Backlog","Next","Active","Blocked","ReadyForReview","Done","Rejected"]},"repositories":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":5},"status":{"enum":["Next","Backlog"]},"parentId":{"type":"string"}},"required":["type"],"additionalProperties":false}}},"required":["outcome","summary","findings","mutations"],"additionalProperties":false}""";
 }
