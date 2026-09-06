@@ -33,7 +33,16 @@ New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 # AOT on Windows needs MSVC link.exe and Windows SDK libs.
 # Use IlcUseEnvironmentalTools=true (skip findvcvarsall.bat) and set up PATH/LIB manually.
 if ($publishAot -eq "true" -and ($env:OS -eq 'Windows_NT')) {
-    $msvcRoot = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC"
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere -PathType Leaf)) {
+        throw "Windows AOT publishing requires Visual Studio with the C++ build tools (vswhere.exe was not found)."
+    }
+    # Discover all editions and versions, including newer hosted runner images.
+    $vsInstall = & $vswhere -latest -prerelease -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($vsInstall)) {
+        throw "Windows AOT publishing requires a Visual Studio installation with the x64 C++ build tools."
+    }
+    $msvcRoot = Join-Path $vsInstall "VC\Tools\MSVC"
     $msvcVersion = Get-ChildItem $msvcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty Name
     if ($msvcVersion) {
         $msvcBin = "$msvcRoot\$msvcVersion\bin\Hostx64\x64"
