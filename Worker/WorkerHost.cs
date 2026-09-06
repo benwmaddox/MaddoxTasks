@@ -465,6 +465,15 @@ public sealed class WorkerHost
         var repair = mode == RecoveryMode.ResumeRepair;
         var resume = mode is RecoveryMode.ResumeInitial or RecoveryMode.ResumeRepair;
         if (job.Phase == JobPhases.Blocked) return;
+        var normalizedRepositories = job.Task.Repositories.Select(repository => RepositoryPathPolicy.Normalize(config.Current.RepoRoot, repository)).ToArray();
+        if (!normalizedRepositories.SequenceEqual(job.Task.Repositories, StringComparer.OrdinalIgnoreCase))
+        {
+            foreach (var repository in normalizedRepositories) await ValidateRepositoryAsync(repository, ct);
+            var assignment = await RunCommandAsync(new { type = "SetRepositoryLabels", issueId = job.Task.IssueId, repositories = normalizedRepositories }, null, ct);
+            if (assignment.ExitCode != 0 || !TryReadSuccess(assignment.Output)) throw new InvalidOperationException("Repository normalization failed: " + assignment.Output.Trim() + assignment.Error.Trim());
+            job.Task = job.Task with { Repositories = normalizedRepositories };
+            Save(job);
+        }
         if (job.Task.Repositories.Length > 0 && job.Workspaces.Count == 0)
         {
             foreach (var repository in job.Task.Repositories)
@@ -509,7 +518,7 @@ public sealed class WorkerHost
         var envelope = BuildEnvelope(job, repair);
         if (resumeBatch is not null) envelope += "\n" + BuildTaskUpdatePrompt(resumeBatch);
         var arguments = resume && job.ThreadId is not null
-            ? new List<string> { "exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--skip-git-repo-check", envelope }
+            ? BuildContinuationCodexArguments(job, schema, envelope)
             : BuildInitialCodexArguments(job, schema, envelope, config.Current.RepoRoot);
         ExecResult run;
         string resultJson;
@@ -687,7 +696,7 @@ public sealed class WorkerHost
     private Task<ExecResult> RunContinuationAsync(Job job, string schema, string prompt, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(job.ThreadId)) throw new InvalidOperationException("Cannot deliver a task update without the existing Codex thread ID.");
-        return RunCodexAsync(job, ["exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--skip-git-repo-check", prompt], ct);
+        return RunCodexAsync(job, BuildContinuationCodexArguments(job, schema, prompt), ct);
     }
 
     public static string BuildTaskUpdatePrompt(PendingTaskUpdateBatch batch)
@@ -708,23 +717,23 @@ public sealed class WorkerHost
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException("Repository clarification timed out."); }
         if (run.ExitCode != 0) throw new InvalidOperationException("Repository clarification failed: " + run.Error.Trim());
         var decision = ClarificationPolicy.Parse(ExtractResult(run.Output));
-        var proposedRepositories = decision.Action == "split"
+        var proposedRepositories = (decision.Action == "split"
             ? decision.Children.Select(child => child.Repository).ToArray()
-            : decision.Repositories;
+            : decision.Repositories).Select(repository => RepositoryPathPolicy.Normalize(config.Current.RepoRoot, repository)).ToArray();
         foreach (var repository in proposedRepositories) await ValidateRepositoryAsync(repository, ct);
 
         if (decision.Action == "split")
         {
-            var children = decision.Children.Select(child => new { child.Title, child.Description, child.Repository }).ToArray();
+            var children = decision.Children.Zip(proposedRepositories, (child, repository) => new { child.Title, child.Description, Repository = repository }).ToArray();
             var response = await RunCommandAsync(new { type = "SplitIssue", issueId = job.Task.IssueId, children }, null, ct);
             if (response.ExitCode != 0 || !TryReadSuccess(response.Output)) throw new InvalidOperationException("Task split failed: " + response.Output.Trim() + response.Error.Trim());
             SetPhase(job, JobPhases.Done);
             return false;
         }
 
-        var assignment = await RunCommandAsync(new { type = "SetRepositoryLabels", issueId = job.Task.IssueId, repositories = decision.Repositories }, null, ct);
+        var assignment = await RunCommandAsync(new { type = "SetRepositoryLabels", issueId = job.Task.IssueId, repositories = proposedRepositories }, null, ct);
         if (assignment.ExitCode != 0 || !TryReadSuccess(assignment.Output)) throw new InvalidOperationException("Repository assignment failed: " + assignment.Output.Trim() + assignment.Error.Trim());
-        job.Task = job.Task with { Repositories = decision.Repositories };
+        job.Task = job.Task with { Repositories = proposedRepositories };
         Save(job);
         return true;
     }
@@ -743,6 +752,13 @@ public sealed class WorkerHost
         foreach (var workspace in job.Workspaces.Skip(1)) { arguments.Add("--add-dir"); arguments.Add(workspace.Directory); }
         arguments.Add(envelope);
         return arguments;
+    }
+
+    public static List<string> BuildContinuationCodexArguments(Job job, string schema, string prompt)
+    {
+        if (string.IsNullOrWhiteSpace(job.ThreadId)) throw new InvalidOperationException("Cannot resume without an existing Codex thread ID.");
+        return ["exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model,
+            "-c", $"model_reasoning_effort={job.Effort}", "--skip-git-repo-check", prompt];
     }
 
     private async Task<Workspace> MakeWorkspaceAsync(Job job, string repository, CancellationToken ct)
@@ -822,7 +838,7 @@ public sealed class WorkerHost
                 if (!string.IsNullOrWhiteSpace(status.Output))
                 {
                     await RequireAsync("git", ["add", "-A"], workspace.Directory, ct);
-                    await RequireAsync("git", ["commit", "-m", result.GetProperty("commitMessage").GetString() ?? $"Complete task {job.Task.Sequence}"], workspace.Directory, ct);
+                    await RequireAsync("git", ["commit", "-m", PublicationMetadata.CommitMessage(result, job.Task.Sequence)], workspace.Directory, ct, WorkspaceProcessEnvironment.IsolatedBuild());
                 }
                 else if (!await HasExecutionChangesAsync(job, workspace, ct))
                     throw new InvalidOperationException($"Persisted publication reports changes but no task commit exists for {workspace.Repository}.");
@@ -850,8 +866,15 @@ public sealed class WorkerHost
                 ?? await FindPullRequestAsync(workspace, ct);
             if (existing is null && !repair)
             {
-                var created = await RequireAsync(config.Current.GhExe, ["pr", "create", "--head", workspace.Branch, "--title", result.GetProperty("prTitle").GetString() ?? job.Task.Title, "--body", result.GetProperty("prBody").GetString() ?? result.GetProperty("summary").GetString() ?? "Automated task"], workspace.Directory, ct);
-                existing = created.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Last().Trim();
+                var created = await processes.RunAsync(config.Current.GhExe, ["pr", "create", "--head", workspace.Branch, "--title", PublicationMetadata.PullRequestTitle(result, job.Task.Title), "--body", PublicationMetadata.PullRequestBody(result)], workspace.Directory, ct);
+                if (created.ExitCode == 0)
+                    existing = created.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim();
+                else
+                {
+                    existing = await FindPullRequestAsync(workspace, ct);
+                    if (existing is null) throw new InvalidOperationException($"{Path.GetFileName(config.Current.GhExe)} failed: {created.Error.Trim()}");
+                }
+                if (string.IsNullOrWhiteSpace(existing)) throw new InvalidDataException("GitHub did not return a pull request URL for the published branch.");
                 log.Write("info", "github.pr.created", new { job.Task.Sequence, workspace.Repository, url = existing });
             }
             if (existing is not null)
@@ -1234,7 +1257,8 @@ public sealed class WorkerHost
                 if (changed) Save(job);
             }
             catch (JsonException) { }
-        }, new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput);
+        }, new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput,
+            environment: WorkspaceProcessEnvironment.IsolatedBuild());
     }
 
     private async Task BlockAsync(Job job, string reason, CancellationToken ct, string actor = "maddox-worker")
@@ -1275,7 +1299,7 @@ public sealed class WorkerHost
         if (results.Any(result => result.ExitCode != 0)) throw new InvalidOperationException("Startup preflight failed; verify MaddoxTasks, Codex, and GitHub CLI installation/authentication. No task was claimed.");
         log.Write("info", "preflight.succeeded");
     }
-    private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct) { var result = await processes.RunAsync(executable, arguments, cwd, ct); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
+    private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct, IReadOnlyDictionary<string, string>? environment = null) { var result = await processes.RunAsync(executable, arguments, cwd, ct, environment: environment); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
     private static bool TryReadSuccess(string output) { try { using var document = JsonDocument.Parse(output); return document.RootElement.GetProperty("success").GetBoolean(); } catch { return false; } }
 
     private void SetPhase(Job job, string phase)

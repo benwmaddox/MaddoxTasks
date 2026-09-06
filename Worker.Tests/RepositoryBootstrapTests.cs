@@ -30,6 +30,27 @@ public sealed class RepositoryBootstrapTests : IDisposable
     }
 
     [Fact]
+    public async Task ExistingAuthorizedGitHubRepositoryIsAdoptedWithoutCreatingDuplicate()
+    {
+        var runner = new Runner(Project) { MissingOrigin = true, ExistingGitHubRepository = true };
+
+        await new RepositoryBootstrap(runner, "gh", "owner").EnsureAsync(root, "project", default);
+
+        Assert.Contains("git remote add origin https://github.com/owner/project.git", runner.Calls);
+        Assert.DoesNotContain(runner.Calls, call => call.Contains("POST user/repos"));
+    }
+
+    [Fact]
+    public async Task AmbiguousGitHubLookupFailureDoesNotCreateOrAttachRemote()
+    {
+        var runner = new Runner(Project) { MissingOrigin = true, LookupFails = true };
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => new RepositoryBootstrap(runner, "gh", "owner").EnsureAsync(root, "project", default));
+
+        Assert.DoesNotContain(runner.Calls, call => call.Contains("POST user/repos") || call.StartsWith("git remote add"));
+    }
+
+    [Fact]
     public async Task FailedPrivateCreationDoesNotPushOrAdoptCollision()
     {
         var runner = new Runner(Project) { MissingOrigin = true, CreationFails = true };
@@ -95,10 +116,12 @@ public sealed class RepositoryBootstrapTests : IDisposable
     {
         public bool MissingOrigin { get; init; }
         public bool CreationFails { get; init; }
+        public bool ExistingGitHubRepository { get; init; }
+        public bool LookupFails { get; init; }
         public bool EmptyRemote { get; init; }
         public bool Unborn { get; init; }
         public List<string> Calls { get; } = [];
-        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null)
+        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
         {
             var command = executable + " " + string.Join(' ', arguments);
             Calls.Add(command);
@@ -107,14 +130,17 @@ public sealed class RepositoryBootstrapTests : IDisposable
                 "git rev-parse --show-toplevel" => project,
                 "git remote" => MissingOrigin ? "" : "origin",
                 "gh api --hostname github.com user --jq .login" => "owner",
+                "gh api --hostname github.com repos/owner/project --jq .clone_url" when ExistingGitHubRepository => "https://github.com/owner/project.git",
                 "gh api --hostname github.com --method POST user/repos -f name=project -F private=true --jq .clone_url" => "https://github.com/owner/project.git",
                 "git ls-remote --heads origin" => EmptyRemote ? "" : "abc refs/heads/main",
                 "git symbolic-ref --short HEAD" => "main",
                 _ => ""
             };
-            var failure = (CreationFails && command.Contains("POST user/repos")) || (Unborn && command == "git rev-parse --verify HEAD");
-            var code = failure ? 128 : command == "git show-ref --verify --quiet refs/heads/main" ? 1 : 0;
-            return Task.FromResult(new ExecResult(code, output, failure ? "failed" : ""));
+            var lookup = command == "gh api --hostname github.com repos/owner/project --jq .clone_url";
+            var failure = (CreationFails && command.Contains("POST user/repos")) || (Unborn && command == "git rev-parse --verify HEAD") || (lookup && !ExistingGitHubRepository);
+            var code = failure ? 1 : command == "git show-ref --verify --quiet refs/heads/main" ? 1 : 0;
+            var error = lookup && !ExistingGitHubRepository ? (LookupFails ? "gh: server error (HTTP 500)" : "gh: Not Found (HTTP 404)") : failure ? "failed" : "";
+            return Task.FromResult(new ExecResult(code, output, error));
         }
     }
 }

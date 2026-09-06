@@ -225,7 +225,7 @@ public sealed class WorkerHostMonitoringTests
     {
         public List<CommandCall> Commands { get; } = [];
 
-        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null)
+        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
         {
             var call = new CommandCall(executable, arguments.ToArray(), workingDirectory);
             Commands.Add(call);

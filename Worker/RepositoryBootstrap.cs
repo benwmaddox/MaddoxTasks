@@ -34,11 +34,16 @@ public sealed class RepositoryBootstrap(IProcessRunner processes, string ghExe, 
             var owner = (await Run(ghExe, "api", "--hostname", "github.com", "user", "--jq", ".login")).Output.Trim();
             if (!owner.Equals(privateRepositoryOwner, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Authenticated GitHub account does not match privateRepositoryOwner.");
-            // Creation is atomic: existing names and authentication errors fail, never attach an unrelated remote.
-            var created = (await Run(ghExe, "api", "--hostname", "github.com", "--method", "POST", "user/repos", "-f", "name=" + Path.GetFileName(path), "-F", "private=true", "--jq", ".clone_url")).Output.Trim();
-            var expected = "https://github.com/" + owner + "/" + Path.GetFileName(path) + ".git";
-            if (!created.Equals(expected, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("Created repository URL does not match the authorized destination.");
+            var repositoryName = Path.GetFileName(path);
+            var expected = "https://github.com/" + owner + "/" + repositoryName + ".git";
+            var lookup = await processes.RunAsync(ghExe, ["api", "--hostname", "github.com", $"repos/{owner}/{repositoryName}", "--jq", ".clone_url"], path, ct);
+            string destination;
+            if (lookup.ExitCode == 0) destination = lookup.Output.Trim();
+            else if (lookup.Error.Contains("HTTP 404", StringComparison.OrdinalIgnoreCase))
+                destination = (await Run(ghExe, "api", "--hostname", "github.com", "--method", "POST", "user/repos", "-f", "name=" + repositoryName, "-F", "private=true", "--jq", ".clone_url")).Output.Trim();
+            else throw new InvalidOperationException("Could not verify the authorized GitHub repository before bootstrap.");
+            if (!destination.Equals(expected, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("GitHub repository URL does not match the authorized destination.");
             await Run("git", "remote", "add", "origin", expected);
         }
         await Run("git", "remote", "get-url", "origin");

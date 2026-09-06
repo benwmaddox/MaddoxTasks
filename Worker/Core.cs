@@ -419,6 +419,48 @@ public static class WorkspaceBranchPolicy
     }
 }
 public sealed record PullRequestState(string Url, string Repository);
+
+public static class PublicationMetadata
+{
+    public static string CommitMessage(JsonElement result, int sequence) =>
+        NonBlank(result, "commitMessage", $"Complete task {sequence}");
+
+    public static string PullRequestTitle(JsonElement result, string taskTitle) =>
+        NonBlank(result, "prTitle", taskTitle);
+
+    public static string PullRequestBody(JsonElement result) =>
+        NonBlank(result, "prBody", NonBlank(result, "summary", "Automated task"));
+
+    private static string NonBlank(JsonElement result, string property, string fallback)
+    {
+        if (!result.TryGetProperty(property, out var value) || value.ValueKind != JsonValueKind.String) return fallback;
+        var text = value.GetString()?.Trim();
+        return string.IsNullOrWhiteSpace(text) ? fallback : text;
+    }
+}
+
+public static class RepositoryPathPolicy
+{
+    public static string Normalize(string repoRoot, string repository)
+    {
+        var root = Path.GetFullPath(repoRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var path = Path.GetFullPath(Path.IsPathRooted(repository) ? repository : Path.Combine(root, repository));
+        var relative = Path.GetRelativePath(root, path);
+        if (relative == "." || relative == ".." || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || Path.IsPathRooted(relative))
+            throw new InvalidDataException("Repository must resolve to a directory beneath the configured repository root: " + repository);
+        return relative.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+    }
+}
+
+public static class WorkspaceProcessEnvironment
+{
+    public static IReadOnlyDictionary<string, string> IsolatedBuild() => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["CARGO_TARGET_DIR"] = "target",
+        ["CARGO_INCREMENTAL"] = "0"
+    };
+}
 public sealed record ReviewFeedback(string ThreadId, string CommentNodeId, long CommentDatabaseId, string Body, string Url);
 public sealed record ReviewDisposition(string ThreadId, bool Addressed, string ReplyBody);
 public sealed record CheckDisposition(string CheckId, bool Addressed, string Summary);
