@@ -9,8 +9,18 @@ public sealed record CheckState(string Name, string State, string Bucket, string
     public bool IsPending => Bucket.Equals("pending", StringComparison.OrdinalIgnoreCase) || State is "PENDING" or "QUEUED" or "IN_PROGRESS" or "EXPECTED" or "WAITING" or "REQUESTED";
 }
 
-public sealed record PullRequestSnapshot(bool Merged, IReadOnlyList<CheckState> Checks, IReadOnlyList<ReviewFeedback> Feedback)
+public sealed record PullRequestSnapshot(
+    bool Merged,
+    IReadOnlyList<CheckState> Checks,
+    IReadOnlyList<ReviewFeedback> Feedback,
+    string Mergeable = "MERGEABLE",
+    string MergeStateStatus = "CLEAN",
+    string HeadOid = "")
 {
+    public bool MergeabilityPending => !Merged && Mergeable.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase);
+    public bool HasMergeConflict => !Merged && (Mergeable.Equals("CONFLICTING", StringComparison.OrdinalIgnoreCase)
+        || MergeStateStatus.Equals("DIRTY", StringComparison.OrdinalIgnoreCase));
+
     public bool IsGreen(IReadOnlyCollection<string> ignoredChecks)
     {
         var relevant = Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase)).ToArray();
@@ -38,16 +48,19 @@ public sealed class GitHubClient : IGitHubClient
     {
         var id = Parse(pullRequestUrl);
         var settings = config();
-        var view = await Require(settings.GhExe, ["pr", "view", pullRequestUrl, "--json", "mergedAt"], settings.RepoRoot, cancellationToken);
+        var view = await Require(settings.GhExe, ["pr", "view", pullRequestUrl, "--json", "mergedAt,mergeable,mergeStateStatus,headRefOid"], settings.RepoRoot, cancellationToken);
         using var viewJson = JsonDocument.Parse(view.Output);
         var merged = viewJson.RootElement.TryGetProperty("mergedAt", out var mergedAt) && mergedAt.ValueKind == JsonValueKind.String;
         if (merged) return new PullRequestSnapshot(true, [], []);
+        var mergeable = viewJson.RootElement.GetProperty("mergeable").GetString() ?? "UNKNOWN";
+        var mergeStateStatus = viewJson.RootElement.GetProperty("mergeStateStatus").GetString() ?? "UNKNOWN";
+        var headOid = viewJson.RootElement.GetProperty("headRefOid").GetString() ?? string.Empty;
 
         var checkResult = await processes.RunAsync(settings.GhExe, ["pr", "checks", pullRequestUrl, "--json", "name,state,bucket,link"], settings.RepoRoot, cancellationToken);
         var checks = await AddFailureLogsAsync(ParseChecks(checkResult.Output), id, settings, cancellationToken);
         var feedback = includeFeedback ? await GetFeedback(id, settings, cancellationToken) : [];
         log.Write("info", "github.inspect", new { pullRequestUrl, checks = checks.Count, feedback = feedback.Count });
-        return new PullRequestSnapshot(false, checks, feedback);
+        return new PullRequestSnapshot(false, checks, feedback, mergeable, mergeStateStatus, headOid);
     }
 
     public async Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken)

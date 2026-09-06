@@ -1092,8 +1092,19 @@ public sealed class WorkerHost
             snapshots.Add(snapshot);
             if (snapshot.Merged) continue;
             var failures = snapshot.Failures(config.Current.IgnoredChecks);
-            allGreen &= snapshot.IsGreen(config.Current.IgnoredChecks);
+            allGreen &= snapshot.IsGreen(config.Current.IgnoredChecks) && !snapshot.MergeabilityPending && !snapshot.HasMergeConflict;
             foreach (var failure in failures.Where(failure => job.ProcessedCheckIds.Add(failure.Id))) job.PendingCheckFailures.Add(failure with { PullRequestUrl = pullRequest.Url });
+            if (snapshot.HasMergeConflict)
+            {
+                var conflict = new CheckState(
+                    "pull-request-mergeability",
+                    "CONFLICTING",
+                    "fail",
+                    $"{pullRequest.Url}#head-{snapshot.HeadOid}",
+                    pullRequest.Url,
+                    $"GitHub reports mergeable={snapshot.Mergeable}, mergeStateStatus={snapshot.MergeStateStatus}. Merge the latest base branch into the task branch, resolve conflicts without discarding task work, rerun relevant validation, and push the repaired branch.");
+                if (job.ProcessedCheckIds.Add(conflict.Id)) job.PendingCheckFailures.Add(conflict);
+            }
             var additions = FeedbackPolicy.AddNew(job, snapshot.Feedback);
             newFeedback |= additions.Count > 0;
         }
