@@ -85,6 +85,35 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task ConflictingPullRequest_QueuesRevisionScopedRepairAndDoesNotAutoMerge()
+    {
+        var conflict = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", HeadOid = "abc123" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, conflict);
+
+        await fixture.MonitorAsync();
+
+        var failure = Assert.Single(fixture.Job.PendingCheckFailures);
+        Assert.Equal("pull-request-mergeability", failure.Name);
+        Assert.Equal("https://github.com/example/Repo/pull/1#head-abc123", failure.Link);
+        Assert.Contains("Merge the latest base branch", failure.Details, StringComparison.Ordinal);
+        Assert.False(fixture.Job.ReadyForReviewRecorded);
+        Assert.Empty(fixture.GitHub.MergedUrls);
+    }
+
+    [Fact]
+    public async Task UnknownMergeability_WaitsWithoutQueuingRepairOrAutoMerge()
+    {
+        var pending = Snapshot(false) with { Mergeable = "UNKNOWN", MergeStateStatus = "UNKNOWN" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, pending);
+
+        await fixture.MonitorAsync();
+
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.False(fixture.Job.ReadyForReviewRecorded);
+        Assert.Empty(fixture.GitHub.MergedUrls);
+    }
+
+    [Fact]
     public async Task ManualRepository_ContinuesInspectingFeedbackAfterLegacyClosedWindow()
     {
         var feedback = new ReviewFeedback("thread-1", "comment-1", 1, "Please fix this", "https://github.com/example/Repo/pull/1#discussion_r1");
