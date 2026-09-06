@@ -218,6 +218,14 @@ public sealed class WorkerPolicyTests
         var formatterRan = sideEffectingHook with { Output = sideEffectingHook.Output + "\nStasis pre-commit: formatting source before blocking this commit" };
         Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(formatterRan, "tree", "tree", true));
         Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(new ExecResult(1, "", "unrelated hook failure"), "tree", "tree", true));
+
+        var enforcedFormat = new ExecResult(1,
+            "Stasis pre-commit: enforcing canonical source format",
+            "Commit blocked: review and stage the enforced formatting changes, then commit again.");
+        Assert.True(CommitHookRecoveryPolicy.CanRestageAndRetry(enforcedFormat, "tree", "tree", true, true));
+        Assert.False(CommitHookRecoveryPolicy.CanRestageAndRetry(enforcedFormat, "tree", "changed", true, true));
+        Assert.False(CommitHookRecoveryPolicy.CanRestageAndRetry(enforcedFormat, "tree", "tree", true, false));
+        Assert.False(CommitHookRecoveryPolicy.CanRestageAndRetry(new ExecResult(1, "", "unrelated hook failure"), "tree", "tree", true, true));
     }
 
     [Fact]

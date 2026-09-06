@@ -942,6 +942,21 @@ public sealed class WorkerHost
         var indexAfterResult = await processes.RunAsync("git", ["write-tree"], workspace.Directory, ct);
         var unstaged = await processes.RunAsync("git", ["diff", "--quiet"], workspace.Directory, ct);
         var indexAfter = indexAfterResult.Output.Trim();
+        var unstagedPaths = await processes.RunAsync("git", ["diff", "--name-only"], workspace.Directory, ct);
+        var untrackedPaths = await processes.RunAsync("git", ["ls-files", "--others", "--exclude-standard"], workspace.Directory, ct);
+        var onlyStasisChanges = unstagedPaths.ExitCode == 0 && untrackedPaths.ExitCode == 0
+            && ChangedPaths(unstagedPaths.Output, untrackedPaths.Output).All(path => path.EndsWith(".stasis", StringComparison.OrdinalIgnoreCase));
+        if (indexAfterResult.ExitCode == 0 && unstaged.ExitCode is 0 or 1
+            && CommitHookRecoveryPolicy.CanRestageAndRetry(commit, indexBefore, indexAfter, unstaged.ExitCode == 1, onlyStasisChanges))
+        {
+            log.Write("warning", "git.commit.format-restage", new { workspace.Repository, workspace.Directory });
+            await RequireAsync("git", ["add", "-A", "--", ":(glob)**/*.stasis"], workspace.Directory, ct);
+            var formattedIndex = (await RequireAsync("git", ["write-tree"], workspace.Directory, ct)).Output.Trim();
+            if (formattedIndex.Equals(indexBefore, StringComparison.Ordinal))
+                throw new InvalidOperationException("The Stasis formatter reported changes but restaging did not update the commit index.");
+            await RequireAsync("git", ["commit", "-m", message], workspace.Directory, ct, environment);
+            return;
+        }
         if (indexAfterResult.ExitCode != 0 || unstaged.ExitCode is not (0 or 1)
             || !CommitHookRecoveryPolicy.CanRestoreAndBypass(commit, indexBefore, indexAfter, unstaged.ExitCode == 1))
             throw new InvalidOperationException($"git failed: {commit.Error.Trim()}");
@@ -956,6 +971,9 @@ public sealed class WorkerHost
             throw new InvalidOperationException("Could not safely restore side effects from the failed pre-commit hook.");
         await RequireAsync("git", ["commit", "--no-verify", "-m", message], workspace.Directory, ct, environment);
     }
+
+    private static IEnumerable<string> ChangedPaths(params string[] outputs) => outputs
+        .SelectMany(output => output.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
 
     private static void ValidateRepairDispositions(Job job, JsonElement result, bool repair)
     {
