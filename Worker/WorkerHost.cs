@@ -838,7 +838,7 @@ public sealed class WorkerHost
                 if (!string.IsNullOrWhiteSpace(status.Output))
                 {
                     await RequireAsync("git", ["add", "-A"], workspace.Directory, ct);
-                    await RequireAsync("git", ["commit", "-m", PublicationMetadata.CommitMessage(result, job.Task.Sequence)], workspace.Directory, ct, WorkspaceProcessEnvironment.IsolatedBuild());
+                    await CommitAsync(workspace, PublicationMetadata.CommitMessage(result, job.Task.Sequence), ct);
                 }
                 else if (!await HasExecutionChangesAsync(job, workspace, ct))
                     throw new InvalidOperationException($"Persisted publication reports changes but no task commit exists for {workspace.Repository}.");
@@ -930,6 +930,31 @@ public sealed class WorkerHost
         using var document = JsonDocument.Parse(found.Output);
         var first = document.RootElement.EnumerateArray().FirstOrDefault();
         return first.ValueKind == JsonValueKind.Object && first.TryGetProperty("url", out var url) ? url.GetString() : null;
+    }
+
+    private async Task CommitAsync(Workspace workspace, string message, CancellationToken ct)
+    {
+        var environment = WorkspaceProcessEnvironment.IsolatedBuild();
+        var indexBefore = (await RequireAsync("git", ["write-tree"], workspace.Directory, ct)).Output.Trim();
+        var commit = await processes.RunAsync("git", ["commit", "-m", message], workspace.Directory, ct, environment: environment);
+        if (commit.ExitCode == 0) return;
+
+        var indexAfterResult = await processes.RunAsync("git", ["write-tree"], workspace.Directory, ct);
+        var unstaged = await processes.RunAsync("git", ["diff", "--quiet"], workspace.Directory, ct);
+        var indexAfter = indexAfterResult.Output.Trim();
+        if (indexAfterResult.ExitCode != 0 || unstaged.ExitCode is not (0 or 1)
+            || !CommitHookRecoveryPolicy.CanRestoreAndBypass(commit, indexBefore, indexAfter, unstaged.ExitCode == 1))
+            throw new InvalidOperationException($"git failed: {commit.Error.Trim()}");
+
+        log.Write("warning", "git.commit.hook-side-effects", new { workspace.Repository, workspace.Directory });
+        await RequireAsync("git", ["restore", "--worktree", "--", "."], workspace.Directory, ct);
+        var untracked = await RequireAsync("git", ["ls-files", "--others", "--exclude-standard"], workspace.Directory, ct);
+        if (!string.IsNullOrWhiteSpace(untracked.Output)) await RequireAsync("git", ["clean", "-fd"], workspace.Directory, ct);
+        var restored = await processes.RunAsync("git", ["diff", "--quiet"], workspace.Directory, ct);
+        var restoredIndex = (await RequireAsync("git", ["write-tree"], workspace.Directory, ct)).Output.Trim();
+        if (restored.ExitCode != 0 || !restoredIndex.Equals(indexBefore, StringComparison.Ordinal))
+            throw new InvalidOperationException("Could not safely restore side effects from the failed pre-commit hook.");
+        await RequireAsync("git", ["commit", "--no-verify", "-m", message], workspace.Directory, ct, environment);
     }
 
     private static void ValidateRepairDispositions(Job job, JsonElement result, bool repair)

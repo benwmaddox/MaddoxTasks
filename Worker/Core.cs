@@ -703,6 +703,24 @@ public static class PublicationPolicy
     public static bool NeedsPullRequest(PublicationProgress progress, string? recoveredUrl) => string.IsNullOrWhiteSpace(progress.PullRequestUrl) && string.IsNullOrWhiteSpace(recoveredUrl);
 }
 
+public static class CommitHookRecoveryPolicy
+{
+    private const string CheckStarted = "Stasis pre-commit: checking canonical source format";
+    private const string CheckPassed = "all Stasis files are formatted";
+    private const string RestageInstruction = "Commit blocked: stage the formatted Stasis changes, then commit again.";
+    private const string FormatterRan = "Stasis pre-commit: formatting source before blocking this commit";
+
+    public static bool CanRestoreAndBypass(ExecResult commit, string indexBefore, string indexAfter, bool hasUnstagedChanges)
+    {
+        if (commit.ExitCode == 0 || !hasUnstagedChanges || !indexBefore.Equals(indexAfter, StringComparison.Ordinal)) return false;
+        var diagnostic = commit.Output + "\n" + commit.Error;
+        return diagnostic.Contains(CheckStarted, StringComparison.Ordinal)
+            && diagnostic.Contains(CheckPassed, StringComparison.Ordinal)
+            && diagnostic.Contains(RestageInstruction, StringComparison.Ordinal)
+            && !diagnostic.Contains(FormatterRan, StringComparison.Ordinal);
+    }
+}
+
 public sealed class ConcurrencyGate
 {
     private readonly Func<int> capacity;
