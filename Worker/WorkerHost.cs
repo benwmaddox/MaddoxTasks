@@ -221,7 +221,7 @@ public sealed class WorkerHost
             var arguments = BuildResearchCodexArguments(settings, schema, prompt);
 
             var run = await RunResearchCodexAsync(settings, arguments, timeout.Token);
-            if (run.ExitCode != 0) throw new InvalidOperationException("Research Codex failed: " + run.Error.Trim());
+            if (run.ExitCode != 0) throw new InvalidOperationException("Research Codex failed: " + ExecResultDiagnostics.Failure(run));
             var resultJson = ExtractResult(run.Output);
             var plan = ResearchPlanPolicy.Parse(resultJson, task);
             await ApplyResearchPlanAsync(task, plan, ct);
@@ -527,7 +527,7 @@ public sealed class WorkerHost
         {
             await RenderAsync();
             run = await RunCodexAsync(job, arguments, ct);
-            if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + run.Error.Trim());
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + ExecResultDiagnostics.Failure(run));
             resultJson = ExtractResult(run.Output);
             if (resumeBatch is not null)
             {
@@ -588,7 +588,7 @@ public sealed class WorkerHost
             {
                 await RenderAsync();
                 var run = await RunContinuationAsync(job, schema, prompt, ct);
-                if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + run.Error.Trim());
+                if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + ExecResultDiagnostics.Failure(run));
                 reassessedJson = ExtractResult(run.Output);
                 if (applyingTaskUpdate) TaskUpdatePolicy.MarkDelivered(job, batch);
             }
@@ -677,7 +677,7 @@ public sealed class WorkerHost
             {
                 await RenderAsync();
                 var run = await RunContinuationAsync(job, schema, prompt, ct);
-                if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + run.Error.Trim());
+                if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + ExecResultDiagnostics.Failure(run));
                 resultJson = ExtractResult(run.Output);
                 lock (journalGate)
                 {
@@ -715,7 +715,7 @@ public sealed class WorkerHost
         ExecResult run;
         try { run = await RunCodexAsync(job, ["exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--sandbox", "read-only", "--skip-git-repo-check", "-C", config.Current.RepoRoot, prompt], timeout.Token); }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested) { throw new TimeoutException("Repository clarification timed out."); }
-        if (run.ExitCode != 0) throw new InvalidOperationException("Repository clarification failed: " + run.Error.Trim());
+        if (run.ExitCode != 0) throw new InvalidOperationException("Repository clarification failed: " + ExecResultDiagnostics.Failure(run));
         var decision = ClarificationPolicy.Parse(ExtractResult(run.Output));
         var proposedRepositories = (decision.Action == "split"
             ? decision.Children.Select(child => child.Repository).ToArray()
