@@ -208,6 +208,19 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void CommitHookRecovery_RequiresKnownSideEffectingStasisHookAndUnchangedIndex()
+    {
+        var sideEffectingHook = new ExecResult(1, "Stasis pre-commit: checking canonical source format\nall Stasis files are formatted", "Commit blocked: stage the formatted Stasis changes, then commit again.");
+        Assert.True(CommitHookRecoveryPolicy.CanRestoreAndBypass(sideEffectingHook, "tree", "tree", true));
+        Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(sideEffectingHook, "tree", "changed", true));
+        Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(sideEffectingHook, "tree", "tree", false));
+
+        var formatterRan = sideEffectingHook with { Output = sideEffectingHook.Output + "\nStasis pre-commit: formatting source before blocking this commit" };
+        Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(formatterRan, "tree", "tree", true));
+        Assert.False(CommitHookRecoveryPolicy.CanRestoreAndBypass(new ExecResult(1, "", "unrelated hook failure"), "tree", "tree", true));
+    }
+
+    [Fact]
     public void Dashboard_StripsControlSequencesAndKeepsLatestThreeLines()
     {
         var lines = DashboardFormatter.LatestLines("old\n\u001b[31msecond\u001b[0m\nthi\u0001rd\nfourth");
