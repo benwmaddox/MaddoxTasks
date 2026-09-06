@@ -709,6 +709,9 @@ public static class CommitHookRecoveryPolicy
     private const string CheckPassed = "all Stasis files are formatted";
     private const string RestageInstruction = "Commit blocked: stage the formatted Stasis changes, then commit again.";
     private const string FormatterRan = "Stasis pre-commit: formatting source before blocking this commit";
+    private const string EnforcedFormatStarted = "Stasis pre-commit: enforcing canonical source format";
+    private const string EnforcedPathFormatStarted = "Stasis pre-commit: enforcing canonical format on staged source paths";
+    private const string EnforcedRestageInstruction = "Commit blocked: review and stage the enforced formatting changes, then commit again.";
 
     public static bool CanRestoreAndBypass(ExecResult commit, string indexBefore, string indexAfter, bool hasUnstagedChanges)
     {
@@ -718,6 +721,16 @@ public static class CommitHookRecoveryPolicy
             && diagnostic.Contains(CheckPassed, StringComparison.Ordinal)
             && diagnostic.Contains(RestageInstruction, StringComparison.Ordinal)
             && !diagnostic.Contains(FormatterRan, StringComparison.Ordinal);
+    }
+
+    public static bool CanRestageAndRetry(ExecResult commit, string indexBefore, string indexAfter, bool hasUnstagedChanges, bool onlyStasisChanges)
+    {
+        if (commit.ExitCode == 0 || !hasUnstagedChanges || !onlyStasisChanges
+            || !indexBefore.Equals(indexAfter, StringComparison.Ordinal)) return false;
+        var diagnostic = commit.Output + "\n" + commit.Error;
+        return (diagnostic.Contains(EnforcedFormatStarted, StringComparison.Ordinal)
+                || diagnostic.Contains(EnforcedPathFormatStarted, StringComparison.Ordinal))
+            && diagnostic.Contains(EnforcedRestageInstruction, StringComparison.Ordinal);
     }
 }
 
