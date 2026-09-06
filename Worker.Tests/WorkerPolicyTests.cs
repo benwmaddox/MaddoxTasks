@@ -56,6 +56,28 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void WorkspaceBranchPolicy_SelectsFirstCollisionFreeRetryWithoutOverwritingPriorWork()
+    {
+        var local = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "codex/task-1-fix" };
+        var remote = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "codex/task-1-fix-retry-2" };
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { @"D:\worktrees\repo-1-retry-3" };
+
+        var candidate = WorkspaceBranchPolicy.SelectAvailable("codex/task-1-fix", @"D:\worktrees\repo-1", local, remote, directories);
+
+        Assert.Equal("codex/task-1-fix-retry-4", candidate.Branch);
+        Assert.Equal(@"D:\worktrees\repo-1-retry-4", candidate.Directory);
+    }
+
+    [Fact]
+    public void WorkspaceBranchPolicy_StartsMergedWorkFromTargetAndUnmergedWorkFromPriorHead()
+    {
+        Assert.Equal("origin/main", WorkspaceBranchPolicy.SelectStartingRef("[{\"mergedAt\":\"2026-09-05T00:00:00Z\",\"baseRefName\":\"main\"}]", "origin/trunk", "origin/codex/task-1-fix"));
+        Assert.Equal("origin/codex/task-1-fix", WorkspaceBranchPolicy.SelectStartingRef("[{\"mergedAt\":null,\"baseRefName\":\"main\"}]", "origin/trunk", "origin/codex/task-1-fix"));
+        Assert.Equal("origin/codex/task-1-fix", WorkspaceBranchPolicy.SelectStartingRef("[]", "origin/trunk", "origin/codex/task-1-fix"));
+        Assert.Equal("origin/trunk", WorkspaceBranchPolicy.SelectStartingRef("[{\"mergedAt\":\"2026-09-05T00:00:00Z\",\"baseRefName\":\"\"}]", "origin/trunk", "origin/codex/task-1-fix"));
+    }
+
+    [Fact]
     public void WorkspaceCleanupPolicy_NeverSelectsBlockedJobsEvenWhenCleanupWasPreviouslyPending()
     {
         var blocked = CreateJob(JobPhases.Blocked);
@@ -981,26 +1003,6 @@ public sealed class WorkerPolicyTests
         Assert.Equal("StasisLang", RepositoryPathPolicy.Normalize(root, "StasisLang"));
         Assert.Equal("StasisLang", RepositoryPathPolicy.Normalize(root, Path.Combine(root, "StasisLang")));
         Assert.Throws<InvalidDataException>(() => RepositoryPathPolicy.Normalize(root, Path.GetDirectoryName(root)!));
-    }
-
-    [Fact]
-    public void WorkspaceNaming_UsesStableNonOverwritingRetryNames()
-    {
-        var first = WorkspaceNaming.Candidate(@"D:\worktrees", 12, "Fix the thing", "Repo", 1);
-        var retry = WorkspaceNaming.Candidate(@"D:\worktrees", 12, "Fix the thing", "Repo", 2);
-
-        Assert.Equal("codex/task-12-fix-the-thing", first.Branch);
-        Assert.Equal(@"D:\worktrees\Repo-12", first.Directory);
-        Assert.Equal("codex/task-12-fix-the-thing-retry-2", retry.Branch);
-        Assert.Equal(@"D:\worktrees\Repo-12-retry-2", retry.Directory);
-    }
-
-    [Fact]
-    public void WorkspaceNaming_ContinuesUnmergedRemoteWorkAndRestartsAfterMerge()
-    {
-        Assert.Equal("origin/codex/task-12-fix", WorkspaceNaming.SelectStartingRef("[]", "origin/main", "origin/codex/task-12-fix"));
-        Assert.Equal("origin/codex/task-12-fix", WorkspaceNaming.SelectStartingRef("[{\"mergedAt\":null,\"baseRefName\":\"main\"}]", "origin/main", "origin/codex/task-12-fix"));
-        Assert.Equal("origin/main", WorkspaceNaming.SelectStartingRef("[{\"mergedAt\":\"2026-09-05T00:00:00Z\",\"baseRefName\":\"main\"}]", "origin/trunk", "origin/codex/task-12-fix"));
     }
 
     [Fact]

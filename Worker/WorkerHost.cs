@@ -764,31 +764,51 @@ public sealed class WorkerHost
     private async Task<Workspace> MakeWorkspaceAsync(Job job, string repository, CancellationToken ct)
     {
         var source = await new RepositoryBootstrap(processes, config.Current.GhExe, config.Current.PrivateRepositoryOwner).EnsureAsync(config.Current.RepoRoot, repository, ct);
+        var slug = Regex.Replace(job.Task.Title.ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
+        if (slug.Length > 30) slug = slug[..30];
+        if (slug.Length == 0) slug = "task";
+        var branch = $"codex/task-{job.Task.Sequence}-{slug}";
+        var repositorySlug = Regex.Replace(repository, "[^A-Za-z0-9._-]+", "-");
+        var directory = Path.Combine(config.Current.WorktreeRoot, $"{repositorySlug}-{job.Task.Sequence}");
         await RequireAsync("git", ["fetch", "origin"], source, ct);
         var head = (await processes.RunAsync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], source, ct)).Output.Trim();
         if (string.IsNullOrWhiteSpace(head)) head = "origin/main";
+        var localBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var remoteBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         string? priorRemoteBranch = null;
-        for (var attempt = 1; attempt <= 100; attempt++)
+        WorkspaceBranchCandidate candidate;
+        while (true)
         {
-            var (branch, directory) = WorkspaceNaming.Candidate(config.Current.WorktreeRoot, job.Task.Sequence, job.Task.Title, repository, attempt);
-            if (Directory.Exists(directory)) continue;
-            var branchExists = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{branch}"], source, ct);
-            if (branchExists.ExitCode == 0) continue;
-            if (branchExists.ExitCode != 1) throw new InvalidOperationException("Could not inspect local task branches: " + branchExists.Error.Trim());
-            var remoteBranchExists = await processes.RunAsync("git", ["ls-remote", "--exit-code", "--heads", "origin", branch], source, ct);
-            if (remoteBranchExists.ExitCode == 0) { priorRemoteBranch = branch; continue; }
-            if (remoteBranchExists.ExitCode != 2) throw new InvalidOperationException("Could not verify remote branch ownership: " + remoteBranchExists.Error.Trim());
-            var startingRef = head;
-            if (priorRemoteBranch is not null)
+            candidate = WorkspaceBranchPolicy.SelectAvailable(branch, directory, localBranches, remoteBranches, directories);
+            if (Directory.Exists(candidate.Directory))
             {
-                var priorPullRequests = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", priorRemoteBranch, "--state", "all", "--limit", "1", "--json", "mergedAt,baseRefName"], source, ct);
-                startingRef = WorkspaceNaming.SelectStartingRef(priorPullRequests.Output, head, $"origin/{priorRemoteBranch}");
+                directories.Add(candidate.Directory);
             }
-            await RequireAsync("git", ["worktree", "add", "-b", branch, directory, startingRef], source, ct);
-            var remote = (await RequireAsync("git", ["remote", "get-url", "origin"], source, ct)).Output.Trim();
-            return new Workspace(repository, directory, branch, remote, startingRef);
+            var local = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{candidate.Branch}"], source, ct);
+            if (local.ExitCode == 0) localBranches.Add(candidate.Branch);
+            else if (local.ExitCode != 1) throw new InvalidOperationException("Could not inspect local task branches: " + local.Error.Trim());
+            var remoteProbe = await processes.RunAsync("git", ["ls-remote", "--exit-code", "--heads", "origin", candidate.Branch], source, ct);
+            if (remoteProbe.ExitCode == 0)
+            {
+                remoteBranches.Add(candidate.Branch);
+                priorRemoteBranch = candidate.Branch;
+            }
+            else if (remoteProbe.ExitCode != 2) throw new InvalidOperationException("Could not verify remote branch ownership: " + remoteProbe.Error.Trim());
+            if (!localBranches.Contains(candidate.Branch)
+                && !remoteBranches.Contains(candidate.Branch)
+                && !directories.Contains(candidate.Directory)) break;
         }
-        throw new InvalidOperationException($"No unused worktree and branch name remains for task {job.Task.Sequence} in repository {repository}.");
+
+        var startingRef = head;
+        if (priorRemoteBranch is not null)
+        {
+            var priorPullRequests = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", priorRemoteBranch, "--state", "all", "--limit", "1", "--json", "mergedAt,baseRefName"], source, ct);
+            startingRef = WorkspaceBranchPolicy.SelectStartingRef(priorPullRequests.Output, head, $"origin/{priorRemoteBranch}");
+        }
+        await RequireAsync("git", ["worktree", "add", "-b", candidate.Branch, candidate.Directory, startingRef], source, ct);
+        var remote = (await RequireAsync("git", ["remote", "get-url", "origin"], source, ct)).Output.Trim();
+        return new Workspace(repository, candidate.Directory, candidate.Branch, remote, startingRef);
     }
 
     private async Task ValidateOwnedWorkspacesAsync(Job job, CancellationToken ct)
@@ -906,7 +926,7 @@ public sealed class WorkerHost
 
     private async Task<string?> FindPullRequestAsync(Workspace workspace, CancellationToken ct)
     {
-        var found = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", workspace.Branch, "--state", "all", "--limit", "1", "--json", "url"], workspace.Directory, ct);
+        var found = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", workspace.Branch, "--state", "open", "--limit", "1", "--json", "url"], workspace.Directory, ct);
         using var document = JsonDocument.Parse(found.Output);
         var first = document.RootElement.EnumerateArray().FirstOrDefault();
         return first.ValueKind == JsonValueKind.Object && first.TryGetProperty("url", out var url) ? url.GetString() : null;

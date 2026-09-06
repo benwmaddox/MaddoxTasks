@@ -380,6 +380,44 @@ public static class ClarificationPolicy
     }
 }
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
+
+public sealed record WorkspaceBranchCandidate(string Branch, string Directory);
+
+public static class WorkspaceBranchPolicy
+{
+    public static WorkspaceBranchCandidate SelectAvailable(
+        string baseBranch,
+        string baseDirectory,
+        IReadOnlySet<string> localBranches,
+        IReadOnlySet<string> remoteBranches,
+        IReadOnlySet<string> directories)
+    {
+        for (var attempt = 1; attempt <= 10_000; attempt++)
+        {
+            var suffix = attempt == 1 ? string.Empty : $"-retry-{attempt}";
+            var candidate = new WorkspaceBranchCandidate(baseBranch + suffix, baseDirectory + suffix);
+            if (!localBranches.Contains(candidate.Branch)
+                && !remoteBranches.Contains(candidate.Branch)
+                && !directories.Contains(candidate.Directory)) return candidate;
+        }
+
+        throw new InvalidOperationException("No collision-free task branch is available.");
+    }
+
+    public static string SelectStartingRef(string pullRequestsJson, string defaultHead, string priorRemoteRef)
+    {
+        using var document = JsonDocument.Parse(pullRequestsJson);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Pull request lookup did not return an array.");
+        var prior = document.RootElement.EnumerateArray().FirstOrDefault();
+        if (prior.ValueKind != JsonValueKind.Object) return priorRemoteRef;
+        if (!prior.TryGetProperty("mergedAt", out var mergedAt)
+            || mergedAt.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return priorRemoteRef;
+        if (!prior.TryGetProperty("baseRefName", out var baseRefName)
+            || string.IsNullOrWhiteSpace(baseRefName.GetString())) return defaultHead;
+        return "origin/" + baseRefName.GetString();
+    }
+}
 public sealed record PullRequestState(string Url, string Repository);
 
 public static class PublicationMetadata
@@ -412,35 +450,6 @@ public static class RepositoryPathPolicy
             || Path.IsPathRooted(relative))
             throw new InvalidDataException("Repository must resolve to a directory beneath the configured repository root: " + repository);
         return relative.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
-    }
-}
-
-public static class WorkspaceNaming
-{
-    public static (string Branch, string Directory) Candidate(string worktreeRoot, int sequence, string title, string repository, int attempt)
-    {
-        if (attempt < 1) throw new ArgumentOutOfRangeException(nameof(attempt));
-        var slug = Regex.Replace(title.ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
-        if (slug.Length > 30) slug = slug[..30];
-        if (slug.Length == 0) slug = "task";
-        var suffix = attempt == 1 ? string.Empty : $"-retry-{attempt}";
-        var branch = $"codex/task-{sequence}-{slug}{suffix}";
-        var repositorySlug = Regex.Replace(repository, "[^A-Za-z0-9._-]+", "-");
-        return (branch, Path.Combine(worktreeRoot, $"{repositorySlug}-{sequence}{suffix}"));
-    }
-
-    public static string SelectStartingRef(string pullRequestsJson, string defaultHead, string priorRemoteRef)
-    {
-        using var document = JsonDocument.Parse(pullRequestsJson);
-        if (document.RootElement.ValueKind != JsonValueKind.Array)
-            throw new InvalidDataException("Pull request lookup did not return an array.");
-        var prior = document.RootElement.EnumerateArray().FirstOrDefault();
-        if (prior.ValueKind != JsonValueKind.Object) return priorRemoteRef;
-        if (!prior.TryGetProperty("mergedAt", out var mergedAt)
-            || mergedAt.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return priorRemoteRef;
-        if (!prior.TryGetProperty("baseRefName", out var baseRefName)
-            || string.IsNullOrWhiteSpace(baseRefName.GetString())) return defaultHead;
-        return "origin/" + baseRefName.GetString();
     }
 }
 
