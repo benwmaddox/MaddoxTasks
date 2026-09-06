@@ -912,7 +912,22 @@ public sealed class WorkerPolicyTests
         var arguments = WorkerHost.BuildInitialCodexArguments(job, "schema.json", "prompt");
 
         Assert.Contains("--approve-for-me", arguments);
+        Assert.Contains("--skip-git-repo-check", arguments);
         Assert.DoesNotContain("--sandbox", arguments);
+    }
+
+    [Fact]
+    public void ContinuationCodexArguments_KeepRepositoryTrustRecoveryEnabled()
+    {
+        var job = CreateJob();
+        job.ThreadId = "thread-123";
+
+        var arguments = WorkerHost.BuildContinuationCodexArguments(job, "schema.json", "prompt");
+
+        Assert.Equal("resume", arguments[1]);
+        Assert.Equal("thread-123", arguments[2]);
+        Assert.Contains("--skip-git-repo-check", arguments);
+        Assert.Equal("prompt", arguments[^1]);
     }
 
     [Fact]
@@ -924,6 +939,55 @@ public sealed class WorkerPolicyTests
 
         Assert.Equal(["-c", $"safe.directory={workingDirectory.Replace('\\', '/')}", "status", "--porcelain"], git);
         Assert.Equal(["--version"], codex);
+    }
+
+    [Fact]
+    public void PublicationMetadata_UsesSafeFallbacksForBlankStructuredFields()
+    {
+        using var document = JsonDocument.Parse("""{"commitMessage":"  ","prTitle":"","prBody":"\r\n","summary":"Implemented the fix"}""");
+
+        Assert.Equal("Complete task 42", PublicationMetadata.CommitMessage(document.RootElement, 42));
+        Assert.Equal("Task title", PublicationMetadata.PullRequestTitle(document.RootElement, "Task title"));
+        Assert.Equal("Implemented the fix", PublicationMetadata.PullRequestBody(document.RootElement));
+    }
+
+    [Fact]
+    public void RepositoryPathPolicy_NormalizesAbsoluteAndRelativePathsBeneathRoot()
+    {
+        var root = Path.GetFullPath(Path.Combine(Path.GetTempPath(), "maddox-repositories"));
+
+        Assert.Equal("StasisLang", RepositoryPathPolicy.Normalize(root, "StasisLang"));
+        Assert.Equal("StasisLang", RepositoryPathPolicy.Normalize(root, Path.Combine(root, "StasisLang")));
+        Assert.Throws<InvalidDataException>(() => RepositoryPathPolicy.Normalize(root, Path.GetDirectoryName(root)!));
+    }
+
+    [Fact]
+    public void WorkspaceNaming_UsesStableNonOverwritingRetryNames()
+    {
+        var first = WorkspaceNaming.Candidate(@"D:\worktrees", 12, "Fix the thing", "Repo", 1);
+        var retry = WorkspaceNaming.Candidate(@"D:\worktrees", 12, "Fix the thing", "Repo", 2);
+
+        Assert.Equal("codex/task-12-fix-the-thing", first.Branch);
+        Assert.Equal(@"D:\worktrees\Repo-12", first.Directory);
+        Assert.Equal("codex/task-12-fix-the-thing-retry-2", retry.Branch);
+        Assert.Equal(@"D:\worktrees\Repo-12-retry-2", retry.Directory);
+    }
+
+    [Fact]
+    public void WorkspaceNaming_ContinuesUnmergedRemoteWorkAndRestartsAfterMerge()
+    {
+        Assert.Equal("origin/codex/task-12-fix", WorkspaceNaming.SelectStartingRef("[]", "origin/main", "origin/codex/task-12-fix"));
+        Assert.Equal("origin/codex/task-12-fix", WorkspaceNaming.SelectStartingRef("[{\"mergedAt\":null,\"baseRefName\":\"main\"}]", "origin/main", "origin/codex/task-12-fix"));
+        Assert.Equal("origin/main", WorkspaceNaming.SelectStartingRef("[{\"mergedAt\":\"2026-09-05T00:00:00Z\",\"baseRefName\":\"main\"}]", "origin/trunk", "origin/codex/task-12-fix"));
+    }
+
+    [Fact]
+    public void WorkspaceProcessEnvironment_IsolatesCargoPerCommandWorkingDirectory()
+    {
+        var environment = WorkspaceProcessEnvironment.IsolatedBuild();
+
+        Assert.Equal("target", environment["CARGO_TARGET_DIR"]);
+        Assert.Equal("0", environment["CARGO_INCREMENTAL"]);
     }
 
     [Fact]
