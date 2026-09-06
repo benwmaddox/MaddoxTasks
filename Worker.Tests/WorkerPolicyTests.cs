@@ -229,6 +229,15 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void ExecResultDiagnostics_PrefersStderrAndFallsBackToBoundedStdout()
+    {
+        Assert.Equal("stderr detail", ExecResultDiagnostics.Failure(new ExecResult(1, "stdout detail", "stderr detail")));
+        Assert.Equal("stdout detail", ExecResultDiagnostics.Failure(new ExecResult(1, "stdout detail", "")));
+        Assert.Equal("[earlier output truncated]\n6789", ExecResultDiagnostics.Failure(new ExecResult(1, "0123456789", ""), 4));
+        Assert.Equal("exit code 7 with no process output", ExecResultDiagnostics.Failure(new ExecResult(7, "", "")));
+    }
+
+    [Fact]
     public void Dashboard_StripsControlSequencesAndKeepsLatestThreeLines()
     {
         var lines = DashboardFormatter.LatestLines("old\n\u001b[31msecond\u001b[0m\nthi\u0001rd\nfourth");

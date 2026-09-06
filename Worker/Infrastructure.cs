@@ -7,6 +7,17 @@ using Microsoft.Win32.SafeHandles;
 namespace MaddoxTasks.Worker;
 
 public sealed record ExecResult(int ExitCode, string Output, string Error);
+
+public static class ExecResultDiagnostics
+{
+    public static string Failure(ExecResult result, int maxLength = 4_000)
+    {
+        if (maxLength < 1) throw new ArgumentOutOfRangeException(nameof(maxLength));
+        var detail = !string.IsNullOrWhiteSpace(result.Error) ? result.Error.Trim() : result.Output.Trim();
+        if (detail.Length == 0) return $"exit code {result.ExitCode} with no process output";
+        return detail.Length <= maxLength ? detail : "[earlier output truncated]\n" + detail[^maxLength..];
+    }
+}
 public sealed record TerminalOutputDirective(Func<string, bool> IsTerminal, TimeSpan GracePeriod);
 
 public interface IProcessRunner
