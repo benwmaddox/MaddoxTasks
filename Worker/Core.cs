@@ -774,6 +774,17 @@ public static class WorkerFailurePolicy
     private static string Limit(string value, int maxLength) => value.Length <= maxLength ? value : value[..maxLength] + "...";
 }
 
+public static class CodexClientFailurePolicy
+{
+    public static bool IsWorkerWide(string diagnostic)
+    {
+        var normalized = diagnostic.ToLowerInvariant();
+        return normalized.Contains("requires a newer version of codex", StringComparison.Ordinal)
+            || normalized.Contains("failed to load models cache", StringComparison.Ordinal)
+            || normalized.Contains("failed to install system skills", StringComparison.Ordinal);
+    }
+}
+
 public static class WorkerRetryPolicy
 {
     public static TimeSpan MaxRetryDelay { get; } = TimeSpan.FromHours(1);

@@ -323,6 +323,12 @@ public sealed class WorkerHost
             RecordCodexUnavailable(retryUtc);
             log.Write("warning", "research.usage.deferred", new { task.Sequence, retryUtc });
         }
+        catch (Exception exception) when (CodexClientFailurePolicy.IsWorkerWide(exception.Message))
+        {
+            var retryUtc = clock.UtcNow + settings.EffectiveResearchFailureCooldown;
+            RecordCodexUnavailable(retryUtc);
+            log.Write("error", "research.client.deferred", new { task.Sequence, retryUtc, error = exception.Message });
+        }
         catch (Exception exception)
         {
             log.Write("error", "research.failed", new { task.Sequence, error = exception.Message });
@@ -1513,6 +1519,7 @@ public sealed class WorkerHost
         if (job.PullRequests.Count > 0 && snapshots.All(snapshot => snapshot.Merged))
         {
             await ReconcileAsync(ct);
+            await ChangeStatusAsync(job, "Done", ct);
             job.CleanupPending = true;
             SetPhase(job, JobPhases.Done);
             try { await CleanupAsync(job, ct); }
