@@ -92,6 +92,11 @@ public sealed class WorkerHost
     {
         log.Write("info", "scheduler.tick", new { active = capacity.Active, queued = followups.Count, paused });
         await ReconcileAsync(ct);
+        if (TryGetCodexUnavailableUntil(out var unavailableUntilUtc))
+        {
+            log.Write("warning", "codex.usage.deferred", new { unavailableUntilUtc });
+            return FreshClaimOutcome.Unavailable;
+        }
         if (allowResearch && !paused)
         {
             await TryStartResearchAsync(ct);
@@ -242,6 +247,11 @@ public sealed class WorkerHost
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
             // Shutdown leaves the source task Blocked with its durable marker.
+        }
+        catch (Exception exception) when (CodexUsageLimitPolicy.TryGetRetryUtc(exception.Message, clock.UtcNow, TimeZoneInfo.Local, out var retryUtc))
+        {
+            RecordCodexUnavailable(retryUtc);
+            log.Write("warning", "research.usage.deferred", new { task.Sequence, retryUtc });
         }
         catch (Exception exception)
         {
@@ -433,6 +443,19 @@ public sealed class WorkerHost
             else await ProcessJobAsync(job, mode, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception exception) when (CodexUsageLimitPolicy.TryGetRetryUtc(exception.Message, clock.UtcNow, TimeZoneInfo.Local, out var retryUtc))
+        {
+            RecordCodexUnavailable(retryUtc);
+            log.Write("warning", "job.usage.deferred", new { job.Task.Sequence, retryUtc });
+            try
+            {
+                await AddCommentAsync(job, $"Worker deferred after the account-wide Codex usage limit was reached. Retry is scheduled after {retryUtc:O}; retained workspace and task state were preserved.", ct);
+                await ChangeStatusAsync(job, "Next", ct);
+                job.BlockReason = $"Codex usage unavailable until {retryUtc:O}.";
+                SetPhase(job, JobPhases.Blocked);
+            }
+            catch (Exception deferException) { log.Write("error", "job.defer.failed", new { job.Task.Sequence, error = deferException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
+        }
         catch (Exception exception)
         {
             log.Write("error", "job.failed", new { job.Task.Sequence, error = exception.Message });
@@ -450,6 +473,25 @@ public sealed class WorkerHost
             catch (Exception blockException) { log.Write("error", "job.block.failed", new { job.Task.Sequence, error = blockException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
         }
         finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); await RenderAsync(); }
+    }
+
+    private bool TryGetCodexUnavailableUntil(out DateTime unavailableUntilUtc)
+    {
+        lock (journalGate)
+        {
+            unavailableUntilUtc = journal.CodexUnavailableUntilUtc ?? default;
+            return unavailableUntilUtc > clock.UtcNow;
+        }
+    }
+
+    private void RecordCodexUnavailable(DateTime retryUtc)
+    {
+        lock (journalGate)
+        {
+            if (journal.CodexUnavailableUntilUtc is null || retryUtc > journal.CodexUnavailableUntilUtc)
+                journal.CodexUnavailableUntilUtc = retryUtc;
+            journal.Save(journalPath);
+        }
     }
 
     private async Task EnsureReservationAttributionAsync(Job job, CancellationToken ct)
