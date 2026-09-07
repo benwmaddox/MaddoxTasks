@@ -18,7 +18,7 @@ public sealed class ProcessInputTests
         Assert.Contains("selected source task", prompt);
         Assert.Contains("live web search tools", prompt);
         Assert.Contains("cite source URLs", prompt);
-        Assert.Contains("current Blocked task records", prompt);
+        Assert.Contains("current task records", prompt);
         Assert.DoesNotContain(task.Description, prompt);
     }
 
@@ -30,7 +30,7 @@ public sealed class ProcessInputTests
         using var document = System.Text.Json.JsonDocument.Parse(snapshot);
 
         Assert.Equal(499, document.RootElement.GetProperty("selectedTask").GetProperty("Sequence").GetInt32());
-        Assert.Equal(389, document.RootElement.GetProperty("blockedTasks")[0].GetProperty("sequence").GetInt32());
+        Assert.Equal(389, document.RootElement.GetProperty("tasks")[0].GetProperty("sequence").GetInt32());
     }
 
     [Theory]

@@ -71,6 +71,20 @@ public sealed class WorkerLifecycleTests
     }
 
     [Fact]
+    public void WorkerRetryPolicy_NewRepairableFingerprintGetsFreshElapsedBudget()
+    {
+        using var directory = new TemporaryDirectory();
+        var config = TestConfig(directory.Path, maxAttempts: 2, maxElapsed: TimeSpan.FromHours(1));
+        var started = new DateTime(2026, 9, 7, 10, 0, 0, DateTimeKind.Utc);
+        var job = CreateJob(JobPhases.RetryWaiting);
+
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "first failure", started, config, out _));
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "different failure", started.AddHours(2), config, out _));
+        Assert.Equal(1, job.WorkerRetryAttempts);
+        Assert.Equal(started.AddHours(2), job.WorkerRetryStartedUtc);
+    }
+
+    [Fact]
     public void WorkerRetryPolicy_RetriesTransientFailuresIndefinitelyWithCappedDelay()
     {
         using var directory = new TemporaryDirectory();
@@ -154,6 +168,10 @@ public sealed class WorkerLifecycleTests
         Assert.True(RepairRetryPolicy.BeginGeneration(job, url, "head-a", checks, feedback, now));
         job.RepairAttemptsByPullRequest[url] = 2;
         Assert.False(RepairRetryPolicy.BeginGeneration(job, url, "head-a", checks, feedback, now.AddMinutes(1)));
+        Assert.Equal(2, job.RepairAttemptsByPullRequest[url]);
+
+        var sameRunDifferentState = new[] { checks[0] with { State = "TIMED_OUT", Bucket = "fail" } };
+        Assert.False(RepairRetryPolicy.BeginGeneration(job, url, "head-a", sameRunDifferentState, feedback, now.AddMinutes(1)));
         Assert.Equal(2, job.RepairAttemptsByPullRequest[url]);
 
         Assert.True(RepairRetryPolicy.BeginGeneration(job, url, "head-b", checks, feedback, now.AddMinutes(2)));
@@ -247,11 +265,13 @@ public sealed class WorkerLifecycleTests
         Assert.True(clarification.Observe("{\"type\":\"turn.completed\"}"));
     }
 
-    [Fact]
-    public void ResearchResultSchema_RequiresEveryDeclaredObjectProperty()
+    [Theory]
+    [InlineData("ResearchResultSchema")]
+    [InlineData("ResultSchema")]
+    public void ResultSchemas_RequireEveryDeclaredObjectProperty(string fieldName)
     {
         var schema = (string?)typeof(WorkerHost)
-            .GetField("ResearchResultSchema", BindingFlags.NonPublic | BindingFlags.Static)!
+            .GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Static)!
             .GetRawConstantValue();
 
         using var document = JsonDocument.Parse(schema!);
@@ -270,7 +290,7 @@ public sealed class WorkerLifecycleTests
         checkDispositions = Array.Empty<object>(),
         threadDispositions = Array.Empty<object>(),
         workComplete,
-        blocker = new { kind, summary, evidence = evidence ?? ["evidence"] }
+        blocker = new { kind, summary, evidence = evidence ?? ["evidence"], retryAtUtc = (string?)null }
     });
 
     private static Job CreateJob(string phase) => new()

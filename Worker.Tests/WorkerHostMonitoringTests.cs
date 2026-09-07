@@ -102,6 +102,51 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task IncompleteInspectionAndClosedPullRequest_CannotBecomeReadyForReview()
+    {
+        using (var incomplete = HostFixture.Create(autoMergeAllowed: false, Snapshot(false) with { InspectionComplete = false, InspectionError = "network" }))
+        {
+            await incomplete.MonitorAsync();
+            Assert.False(incomplete.Job.ReadyForReviewRecorded);
+        }
+
+        using (var closed = HostFixture.Create(autoMergeAllowed: false, Snapshot(false) with { State = "CLOSED" }))
+        {
+            await closed.MonitorAsync();
+            Assert.False(closed.Job.ReadyForReviewRecorded);
+            Assert.Equal(JobPhases.Blocked, closed.Job.Phase);
+            Assert.Contains(closed.Processes.Commands, command => command.IsStatus("Blocked"));
+        }
+    }
+
+    [Fact]
+    public async Task TimedOutCheck_IsRerunWithoutCodexRepair()
+    {
+        var timedOut = new CheckState("build", "TIMED_OUT", "fail", "https://github.com/example/Repo/actions/runs/123");
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false, [timedOut]));
+
+        await fixture.MonitorAsync();
+
+        Assert.Equal([timedOut.Link], fixture.GitHub.RerunUrls);
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.False(fixture.Job.ReadyForReviewRecorded);
+    }
+
+    [Fact]
+    public async Task ActionRequiredCheck_MovesCompletedPullRequestToReviewWithoutAutoMerge()
+    {
+        var approval = new CheckState("deploy", "ACTION_REQUIRED", "fail", "https://github.com/example/Repo/actions/runs/456");
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(false, [approval]));
+
+        await fixture.MonitorAsync();
+
+        Assert.True(fixture.Job.ReadyForReviewRecorded);
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.Empty(fixture.GitHub.MergedUrls);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("ReadyForReview"));
+    }
+
+    [Fact]
     public async Task GitHubInspection_CapturesExactPullRequestBase()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
@@ -115,7 +160,7 @@ public sealed class WorkerHostMonitoringTests
         var snapshot = await client.InspectAsync("https://github.com/example/Repo/pull/1", false, CancellationToken.None);
 
         Assert.Equal("release/next", snapshot.BaseRefName);
-        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.LastOrDefault() == "mergedAt,mergeable,mergeStateStatus,headRefOid,baseRefName");
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.LastOrDefault() == "state,mergedAt,mergeable,mergeStateStatus,headRefOid,baseRefName");
     }
 
     [Fact]
@@ -341,6 +386,7 @@ public sealed class WorkerHostMonitoringTests
 
         public List<(string Url, bool IncludeFeedback)> Inspections { get; } = [];
         public List<string> MergedUrls { get; } = [];
+        public List<string> RerunUrls { get; } = [];
 
         public Task<PullRequestSnapshot> InspectAsync(string pullRequestUrl, bool includeFeedback, CancellationToken cancellationToken)
         {
@@ -351,6 +397,7 @@ public sealed class WorkerHostMonitoringTests
 
         public Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task ResolveAsync(string pullRequestUrl, string threadId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken) { RerunUrls.Add(actionsRunUrl); return Task.CompletedTask; }
         public Task MergeAsync(string pullRequestUrl, CancellationToken cancellationToken) { MergedUrls.Add(pullRequestUrl); return Task.CompletedTask; }
     }
 

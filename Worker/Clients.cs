@@ -23,8 +23,8 @@ public sealed record CheckState(string Name, string State, string Bucket, string
             var state = State.Trim().ToUpperInvariant();
             var bucket = Bucket.Trim().ToLowerInvariant();
             if (state == "ACTION_REQUIRED") return CheckClassification.HumanGate;
-            if (state == "FAILURE" || bucket == "fail") return CheckClassification.CodeRepair;
             if (state is "STARTUP_FAILURE" or "CANCELLED" or "TIMED_OUT") return CheckClassification.TransientRerun;
+            if (state == "FAILURE" || bucket == "fail") return CheckClassification.CodeRepair;
             if (bucket == "pending" || state is "PENDING" or "QUEUED" or "IN_PROGRESS" or "EXPECTED" or "WAITING" or "REQUESTED")
                 return CheckClassification.Pending;
             if (state is "SUCCESS" or "NEUTRAL" or "SKIPPED" || bucket is "pass" or "skipping")
@@ -65,6 +65,13 @@ public sealed record PullRequestSnapshot(
         return relevant.All(check => check.Classification == CheckClassification.Passing);
     }
 
+    public bool IsReviewReady(IReadOnlyCollection<string> ignoredChecks)
+    {
+        if (Merged || !IsOpen || !InspectionComplete || MergeabilityPending || HasMergeConflict) return false;
+        var relevant = Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase)).ToArray();
+        return relevant.All(check => check.Classification is CheckClassification.Passing or CheckClassification.HumanGate);
+    }
+
     public IReadOnlyList<CheckState> Failures(IReadOnlyCollection<string> ignoredChecks) =>
         Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.IsFailure).ToArray();
 
@@ -85,10 +92,7 @@ public interface IGitHubClient
     Task ResolveAsync(string pullRequestUrl, string threadId, CancellationToken cancellationToken);
     Task MergeAsync(string pullRequestUrl, CancellationToken cancellationToken);
 
-    // A default keeps older test and embedding clients source-compatible. The
-    // production client overrides it, and the worker supplies its own bounded
-    // cancellation token; this method never retries internally.
-    Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken) => Task.CompletedTask;
+    Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken);
 
     Task RerunWorkflowAsync(string actionsRunUrl, CancellationToken cancellationToken) => RerunAsync(actionsRunUrl, cancellationToken);
 }
@@ -219,7 +223,10 @@ public sealed class GitHubClient : IGitHubClient
 
         if (IsNoChecksResponse(output, error)) return new CheckParseResult([], true, null);
 
-        var detail = !string.IsNullOrWhiteSpace(parseError) ? parseError : ExecResultDiagnostics.Failure(result);
+        var processFailure = ExecResultDiagnostics.Failure(result);
+        var detail = string.Join("; ", new[] { parseError, processFailure }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal));
         return new CheckParseResult([], false, "pull-request checks inspection incomplete: " + Limit(detail, 1_000));
     }
 

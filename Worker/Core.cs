@@ -48,7 +48,7 @@ public sealed record WorkerConfig(
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
-    public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(14);
+    public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(1);
     // Worker retries have their own bounds.  They intentionally do not reuse
     // the pull-request repair budget: a transient worker failure is a
     // different failure domain from a repeatedly failing review check.
@@ -726,14 +726,16 @@ public sealed record WorkerFailureClassification(string Kind, string Summary, st
 /// </summary>
 public static class WorkerFailurePolicy
 {
-    public static WorkerFailureClassification Classify(Exception exception)
+    public static WorkerFailureClassification Classify(Exception exception) => Classify(exception, DateTime.UtcNow);
+
+    public static WorkerFailureClassification Classify(Exception exception, DateTime nowUtc)
     {
         var text = Flatten(exception);
         var normalized = text.ToLowerInvariant();
         var kind = ClassifyKind(exception, normalized);
         var summary = Limit(text, 1_500);
         var fingerprint = WorkerRetryPolicy.Fingerprint(kind, text);
-        var retryAtUtc = RetryTimestampPolicy.ParseFuture(text, DateTime.UtcNow);
+        var retryAtUtc = RetryTimestampPolicy.ParseFuture(text, nowUtc);
         return new WorkerFailureClassification(kind, summary, fingerprint, retryAtUtc);
     }
 
@@ -824,8 +826,12 @@ public static class WorkerRetryPolicy
 
         var fingerprint = Fingerprint(kind, summary);
         var same = string.Equals(job.WorkerRetryFingerprint, fingerprint, StringComparison.Ordinal);
-        job.WorkerRetryStartedUtc ??= nowUtc;
-        if (!same) job.WorkerRetryAttempts = 0;
+        if (!same)
+        {
+            job.WorkerRetryAttempts = 0;
+            job.WorkerRetryStartedUtc = nowUtc;
+        }
+        else job.WorkerRetryStartedUtc ??= nowUtc;
 
         // Service/transient failures are temporal gates.  They must continue
         // to be retried after a long outage or usage-limit reset; the delay is
@@ -1136,11 +1142,13 @@ public sealed class Job
     public string? WorkerRetryMode { get; set; }
     public bool WorkerRetryFreshSession { get; set; }
     public Dictionary<string, string> RepairGenerationByPullRequest { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, DateTime> TransientCheckRerunUtc { get; set; } = new(StringComparer.Ordinal);
     public string? LastBlockerKind { get; set; }
     public string? LastBlockerSummary { get; set; }
     public string[] LastBlockerEvidence { get; set; } = [];
     public bool HumanReviewRequested { get; set; }
     public bool BlockCommentRecorded { get; set; }
+    public string? BlockActor { get; set; }
 }
 
 public static class AdoptedWorkspaceResultPolicy
@@ -1328,7 +1336,7 @@ public static class RepairRetryPolicy
         IEnumerable<ReviewFeedback> pendingFeedback)
     {
         var checkIdentity = pendingChecks
-            .Select(check => string.Join('\u001f', check.Id, check.PullRequestUrl, check.Name))
+            .Select(check => string.Join('\u001f', check.Name, check.PullRequestUrl, check.Link))
             .OrderBy(identity => identity, StringComparer.Ordinal);
         var feedbackIdentity = pendingFeedback
             .Select(feedback => string.Join('\u001f', feedback.ThreadId, feedback.CommentNodeId, feedback.Url))
@@ -1818,6 +1826,7 @@ public static class BlockedWorkspaceAdoption
         candidate.RepairAttemptsByPullRequest.Clear();
         candidate.RepairStartedUtcByPullRequest.Clear();
         candidate.RepairGenerationByPullRequest.Clear();
+        candidate.TransientCheckRerunUtc.Clear();
         candidate.ObservedTaskUpdatedAt = null;
         candidate.ObservedDescription = null;
         candidate.ProcessedHumanCommentKeys.Clear();
@@ -1834,6 +1843,7 @@ public static class BlockedWorkspaceAdoption
         candidate.LastBlockerEvidence = [];
         candidate.HumanReviewRequested = false;
         candidate.BlockCommentRecorded = false;
+        candidate.BlockActor = null;
         return candidate;
     }
 

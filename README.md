@@ -274,14 +274,14 @@ If actor is omitted for `UpdateDescription`/`AddComment`, default resolution ord
 
 `agent issues` includes a deterministic `repositories` array derived from `repo:` labels. `agent claim` and `agent next` order work hierarchically: task families are ordered by their top-level root priority and sequence, then each family is traversed child-first with siblings ordered by priority and sequence. For `agent next`, `Active` is only a tiebreaker among otherwise equal-priority siblings or roots; it never overrides descendant-before-ancestor traversal. A child is considered using only its own reservation keys, so a reserved parent does not block a disjoint child, and a reserved child does not block a later claimable sibling. Before selecting, `agent claim` automatically resets any `Active` task whose latest mutation is at least 24 hours old (24 hours with no activity) and which has a current-period comment beginning `Reservation owner: codexThreadId=` with a nonempty value (including `unavailable`). The reset writes a `Next` status event and an audit comment, in issue-sequence order, then atomically selects the first eligible `Next` issue whose reservation keys are not held by `Active` or `ReadyForReview` work. A repository-less task is eligible and uses the synthetic `missing` reservation while still returning `repositories: []`. Historical reservation comments from earlier Active periods, non-Codex reservations, young tasks, and `ReadyForReview` tasks are not reset. Cleanup is persisted even when no claim is available. `agent next` reports the first `Active` or `Next` issue in the same hierarchy order. Both commands handle missing or cyclic parent links deterministically. Claim prints `null` when no issue is available; scheduled runners should stop for that hour. `--dry-run` simulates stale cleanup and selection, reports the preview issue as `Next`, and writes no events. For a repository-less claim, `scripts/run-reserved-task.ps1` starts Codex in the normalized `RepoRoot`, passes no `--add-dir`, and warns that the impact scope is unknown.
 
-The long-running worker follows the same repository-less rule: it starts Codex in `RepoRoot` and attempts the stated objective instead of treating a missing `repo:` label as repository ambiguity. For task-management objectives, Codex may use only the published executable's agent JSON commands and may not change the claimed source status. The worker owns the source lifecycle. A processing failure before any worktree exists returns the task to `Next` with a retry comment; only a substantive blocked result from the task run moves it to `Blocked`.
+The long-running worker follows the same repository-less rule: it starts Codex in `RepoRoot` and attempts the stated objective instead of treating a missing `repo:` label as repository ambiguity. For task-management objectives, Codex may use only the published executable's agent JSON commands and may not change the claimed source status. The worker owns the source lifecycle. Retryable processing failures remain `Active` and use the same durable retry schedule whether or not a worktree exists; only a proven external gate or an exhausted repairable-worker retry moves the task to `Blocked`.
 
 The worker also reserves at most one shared Codex slot for blocked-task research. `agent research-claim` atomically
 selects one eligible `Blocked` task in the same hierarchy order and records a durable
 `maddox-research-worker` comment marker. A task with a marker newer than the configured
-`researchCooldown` (14 days by default) is skipped, so concurrent or recurring runs do not
+`researchCooldown` (1 day by default) is skipped, so concurrent or recurring runs do not
 research the same task too often. If the worker records its exact failure marker after the latest attempt,
-the task instead becomes eligible after the configurable one-hour failure cooldown. Each run receives the selected task plus current blocked-task
+the task instead becomes eligible after the configurable one-hour failure cooldown. Each run receives the selected task plus current all-task
 context in a temporary JSON file, without direct database access. Live web search
 is enabled so the researcher can investigate that task's blocker, open relevant sources,
 and cite evidence for a concrete resolution. The research Codex process runs read-only;
@@ -340,13 +340,29 @@ and non-ignored untracked files, for diagnosis or later recovery. Destructive
 worktree and branch cleanup is eligible only after the job reaches `Done`;
 best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 Worker-owned failures and structured `transientWorker` or `workerRepairable` blockers
-keep the task `Active` and retry the retained workspace with bounded exponential
-backoff. Configure the independent bounds with `workerRetryMaxAttempts` (3),
-`workerRetryMaxElapsed` (2 hours), and `workerRetryBaseDelay` (5 minutes). Only
+keep the task `Active` and retry the retained workspace with exponential backoff.
+Temporal failures keep retrying, honor provider reset timestamps, and cap the delay at
+one hour. Repairable worker failures are bounded by `workerRetryMaxAttempts` (3) and
+`workerRetryMaxElapsed` (2 hours); `workerRetryBaseDelay` (5 minutes) controls both. Only
 explicit external gates such as credentials, hardware, missing input, upstream
 dependencies, user decisions, or policy restrictions move the task to `Blocked`.
 Failed blocked-task research uses `researchFailureCooldown` (1 hour) before another
-claim instead of the normal 14-day `researchCooldown`.
+claim instead of the normal 1-day `researchCooldown`.
+
+During recovery, the worker may use an already-authenticated noninteractive tool to
+change an external system only when the task or repository names the exact resource
+and account. It inspects and records preconditions, plans rollback or replacement,
+applies the narrowest change, and verifies the result. Secrets are never copied into
+logs, commits, comments, or task results. Irreversible revoke/delete actions require
+an explicit task instruction and verified replacement first. Maddox task state and
+worker-owned Git publication remain worker responsibilities and are not delegated to
+Codex. The worker must not invent visual or hardware acceptance gates; a native UI
+step requires a configured execution lane. It must not claim CUA or another
+interactive capability is available unless that lane is actually configured and
+exposed in the runtime. Missing interactive authentication or hardware is reported
+as a typed `missingCredential` or `missingHardware` blocker.
+`humanReview` is reserved for a subjective or visual decision about already-produced
+PR artifacts after worker-owned implementation and evidence are complete.
 
 When implementation is complete and only human review remains, the worker verifies
 that a known pull request is still open, all checks pass, and no actionable review
