@@ -432,10 +432,112 @@ public static class WorkerBlockerKinds
     public static bool IsRetryable(string kind) => kind is TransientWorker or WorkerRepairable;
 }
 
-public sealed record WorkerBlocker(string Kind, string Summary, string[] Evidence)
+/// <summary>
+/// Extracts an absolute future retry/reset time from a worker diagnostic.
+/// Codex and service diagnostics are not consistent about formatting, so the
+/// parser accepts the common human form (for example, "try again at Sep 10th,
+/// 2026 3:14 PM") as well as ISO-8601 timestamps.  Timestamp-less diagnostics
+/// remain valid and use the normal bounded backoff.
+/// </summary>
+public static class RetryTimestampPolicy
+{
+    private static readonly Regex Marker = new(
+        @"(?ix)\b(?:try\s+again|retry|reset(?:s)?|available)\b(?:\s+(?:again|after|at|on|around|from|until|is|will|be)){0,5}\s+(?<value>[A-Za-z0-9][^.;\r\n]{0,96})",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex Ordinal = new(@"(?<=\d)(?:st|nd|rd|th)\b", RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    private static readonly string[] Formats =
+    [
+        "MMM d, yyyy h:mm tt",
+        "MMMM d, yyyy h:mm tt",
+        "MMM d yyyy h:mm tt",
+        "MMMM d yyyy h:mm tt",
+        "yyyy-MM-dd HH:mm",
+        "yyyy-MM-dd HH:mm:ss",
+        "yyyy-MM-ddTHH:mm",
+        "yyyy-MM-ddTHH:mm:ss",
+        "yyyy-MM-ddTHH:mm:ss.FFFFFFFK",
+        "yyyy-MM-ddTHH:mm:ssK"
+    ];
+
+    public static DateTime? ParseFuture(string? detail, DateTime nowUtc)
+        => TryParseFuture(detail, nowUtc, out var parsed) ? parsed : null;
+
+    public static DateTime? ParseFutureTimestamp(string? detail, DateTime nowUtc)
+        => ParseFuture(detail, nowUtc);
+
+    public static bool TryParseFuture(string? detail, DateTime nowUtc, out DateTime retryAtUtc)
+    {
+        retryAtUtc = default;
+        if (string.IsNullOrWhiteSpace(detail)) return false;
+
+        var now = NormalizeUtc(nowUtc);
+        foreach (var candidate in Candidates(detail))
+        {
+            if (!TryParseCandidate(candidate, out var parsed) || parsed <= now) continue;
+            retryAtUtc = parsed;
+            return true;
+        }
+        return false;
+    }
+
+    private static IEnumerable<string> Candidates(string detail)
+    {
+        yield return detail.Trim();
+        foreach (Match match in Marker.Matches(detail))
+        {
+            var value = match.Groups["value"].Value.Trim();
+            if (value.Length == 0) continue;
+            yield return value;
+
+            // A sentence often appends an explanation after the timestamp.
+            // Try progressively shorter prefixes so that punctuation-free
+            // human diagnostics still parse deterministically.
+            var words = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            for (var length = words.Length - 1; length >= 2; length--)
+                yield return string.Join(' ', words.Take(length));
+        }
+    }
+
+    private static bool TryParseCandidate(string candidate, out DateTime utc)
+    {
+        candidate = Ordinal.Replace(candidate.Trim().TrimEnd('.', ',', ';'), string.Empty);
+        if (DateTimeOffset.TryParse(candidate, CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var offset))
+        {
+            utc = offset.UtcDateTime;
+            return true;
+        }
+
+        if (DateTime.TryParseExact(candidate, Formats, CultureInfo.InvariantCulture,
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var exact))
+        {
+            utc = NormalizeUtc(exact);
+            return true;
+        }
+
+        if (DateTime.TryParse(candidate, CultureInfo.GetCultureInfo("en-US"),
+                DateTimeStyles.AllowWhiteSpaces | DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out var general))
+        {
+            utc = NormalizeUtc(general);
+            return true;
+        }
+
+        utc = default;
+        return false;
+    }
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+}
+
+public sealed record WorkerBlocker(string Kind, string Summary, string[] Evidence, DateTime? RetryAtUtc = null)
 {
     public bool IsRetryable => WorkerBlockerKinds.IsRetryable(Kind);
     public bool IsHumanReview => Kind == WorkerBlockerKinds.HumanReview;
+    public bool RequiresFreshSession => WorkerRetryPolicy.RequiresFreshSession(Kind, Summary);
 }
 
 public sealed record WorkerResult(
@@ -517,6 +619,8 @@ public static class WorkerResultPolicy
         if (string.IsNullOrWhiteSpace(blocker.Summary)) throw new InvalidDataException("Worker blocker requires a non-empty summary.");
         if (blocker.Evidence is null || blocker.Evidence.Any(string.IsNullOrWhiteSpace))
             throw new InvalidDataException("Worker blocker evidence must contain only non-empty strings.");
+        if (blocker.Kind != WorkerBlockerKinds.None && blocker.Evidence.Length == 0)
+            throw new InvalidDataException("Non-none worker blockers require at least one evidence item.");
 
         if (blocker.Kind == WorkerBlockerKinds.HumanReview && !workComplete)
             throw new InvalidDataException("humanReview requires workComplete=true.");
@@ -563,12 +667,29 @@ public static class WorkerResultPolicy
                 throw new InvalidDataException("Worker blocker evidence must contain only non-empty strings.");
             return item.GetString()!.Trim();
         }).ToArray();
-        return new WorkerBlocker(kind, summary!.Trim(), evidence);
+        var retryAtUtc = ParseRetryAt(property, summary!);
+        return new WorkerBlocker(kind, summary!.Trim(), evidence, retryAtUtc);
     }
 
     private static WorkerBlocker LegacyBlocker(string status, string summary) => status == "blocked"
-        ? new WorkerBlocker(WorkerBlockerKinds.UpstreamDependency, summary, [])
+        ? new WorkerBlocker(WorkerBlockerKinds.UpstreamDependency, summary, [summary])
         : new WorkerBlocker(WorkerBlockerKinds.None, summary, []);
+
+    private static DateTime? ParseRetryAt(JsonElement blocker, string summary)
+    {
+        foreach (var name in new[] { "retryAtUtc", "retryAfterUtc", "retryAt", "resetAtUtc", "resetAt" })
+        {
+            var value = FindProperty(blocker, name);
+            if (value is null) continue;
+            if (value.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) continue;
+            if (value.Value.ValueKind != JsonValueKind.String)
+                throw new InvalidDataException($"Worker blocker field '{name}' must be a timestamp string or null.");
+            var explicitValue = value.Value.GetString();
+            if (RetryTimestampPolicy.TryParseFuture(explicitValue, DateTime.UtcNow, out var explicitRetryAt)) return explicitRetryAt;
+        }
+
+        return RetryTimestampPolicy.ParseFuture(summary, DateTime.UtcNow);
+    }
 
     private static bool ReadBoolean(JsonElement property, string name)
     {
@@ -592,9 +713,10 @@ public static class WorkerResultPolicy
     }
 }
 
-public sealed record WorkerFailureClassification(string Kind, string Summary, string Fingerprint)
+public sealed record WorkerFailureClassification(string Kind, string Summary, string Fingerprint, DateTime? RetryAtUtc = null)
 {
     public bool Retryable => WorkerBlockerKinds.IsRetryable(Kind);
+    public bool RequiresFreshSession => WorkerRetryPolicy.RequiresFreshSession(Kind, Summary);
 }
 
 /// <summary>
@@ -611,7 +733,8 @@ public static class WorkerFailurePolicy
         var kind = ClassifyKind(exception, normalized);
         var summary = Limit(text, 1_500);
         var fingerprint = WorkerRetryPolicy.Fingerprint(kind, text);
-        return new WorkerFailureClassification(kind, summary, fingerprint);
+        var retryAtUtc = RetryTimestampPolicy.ParseFuture(text, DateTime.UtcNow);
+        return new WorkerFailureClassification(kind, summary, fingerprint, retryAtUtc);
     }
 
     private static string ClassifyKind(Exception exception, string text)
@@ -651,6 +774,8 @@ public static class WorkerFailurePolicy
 
 public static class WorkerRetryPolicy
 {
+    public static TimeSpan MaxRetryDelay { get; } = TimeSpan.FromHours(1);
+
     public static string Fingerprint(string kind, string detail)
     {
         var normalized = string.Join(' ', detail.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
@@ -658,15 +783,41 @@ public static class WorkerRetryPolicy
         return Convert.ToHexString(digest).ToLowerInvariant();
     }
 
+    /// <summary>
+    /// Internal-thread/session failures cannot be repaired by resuming the
+    /// same Codex conversation.  The next attempt should retain the worktree
+    /// and repair context but start a fresh session.
+    /// </summary>
+    public static bool RequiresFreshSession(string kind, string? detail = null)
+    {
+        if (kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase)) return true;
+        if (!kind.Equals(WorkerBlockerKinds.TransientWorker, StringComparison.OrdinalIgnoreCase)) return false;
+        var normalized = detail?.ToLowerInvariant() ?? string.Empty;
+        return normalized.Contains("internal thread", StringComparison.Ordinal)
+            || normalized.Contains("thread not found", StringComparison.Ordinal)
+            || normalized.Contains("thread unavailable", StringComparison.Ordinal)
+            || normalized.Contains("unknown thread", StringComparison.Ordinal)
+            || normalized.Contains("invalid thread", StringComparison.Ordinal)
+            || normalized.Contains("thread id", StringComparison.Ordinal)
+            || normalized.Contains("session not found", StringComparison.Ordinal)
+            || normalized.Contains("invalid session", StringComparison.Ordinal)
+            || normalized.Contains("resume failed", StringComparison.Ordinal);
+    }
+
+    public static bool ShouldStartFreshSession(Job job) => job.WorkerRetryFreshSession;
+
     public static bool HasSafeMetadata(Job job) => job.Phase == JobPhases.RetryWaiting
         && job.WorkerRetryAttempts > 0
         && !string.IsNullOrWhiteSpace(job.WorkerRetryFingerprint)
-        && job.WorkerRetryStartedUtc is not null
-        && job.WorkerRetryNextUtc is not null;
+        && IsUsableTimestamp(job.WorkerRetryStartedUtc)
+        && IsUsableTimestamp(job.WorkerRetryNextUtc);
 
     public static bool IsDue(Job job, DateTime nowUtc) => HasSafeMetadata(job) && nowUtc >= job.WorkerRetryNextUtc!.Value;
 
     public static bool TrySchedule(Job job, string kind, string summary, DateTime nowUtc, WorkerConfig config, out TimeSpan delay)
+        => TrySchedule(job, kind, summary, nowUtc, config, retryAtUtc: null, out delay);
+
+    public static bool TrySchedule(Job job, string kind, string summary, DateTime nowUtc, WorkerConfig config, DateTime? retryAtUtc, out TimeSpan delay)
     {
         delay = TimeSpan.Zero;
         if (!WorkerBlockerKinds.IsRetryable(kind)) return false;
@@ -674,21 +825,133 @@ public static class WorkerRetryPolicy
         var fingerprint = Fingerprint(kind, summary);
         var same = string.Equals(job.WorkerRetryFingerprint, fingerprint, StringComparison.Ordinal);
         job.WorkerRetryStartedUtc ??= nowUtc;
-        if (nowUtc - job.WorkerRetryStartedUtc.Value >= config.EffectiveWorkerRetryMaxElapsed) return false;
         if (!same) job.WorkerRetryAttempts = 0;
-        if (job.WorkerRetryAttempts >= config.EffectiveWorkerRetryMaxAttempts) return false;
+
+        // Service/transient failures are temporal gates.  They must continue
+        // to be retried after a long outage or usage-limit reset; the delay is
+        // capped to keep malformed or unbounded diagnostics from creating a
+        // single effectively permanent sleep.  workerRepairable remains
+        // bounded by the configured attempt and elapsed-time budget.
+        if (kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase))
+        {
+            if (nowUtc - job.WorkerRetryStartedUtc.Value >= config.EffectiveWorkerRetryMaxElapsed) return false;
+            if (job.WorkerRetryAttempts >= config.EffectiveWorkerRetryMaxAttempts) return false;
+        }
 
         job.WorkerRetryFingerprint = fingerprint;
         job.WorkerRetryLastKind = kind;
         job.WorkerRetryLastSummary = summary;
-        job.WorkerRetryAttempts++;
+        job.WorkerRetryAttempts = job.WorkerRetryAttempts == int.MaxValue ? int.MaxValue : job.WorkerRetryAttempts + 1;
+        job.WorkerRetryFreshSession = RequiresFreshSession(kind, summary);
         var exponent = Math.Min(job.WorkerRetryAttempts - 1, 10);
         var multiplier = Math.Pow(2, exponent);
-        var seconds = Math.Min(config.EffectiveWorkerRetryBaseDelay.TotalSeconds * multiplier, TimeSpan.FromHours(1).TotalSeconds);
+        var seconds = Math.Min(config.EffectiveWorkerRetryBaseDelay.TotalSeconds * multiplier, MaxRetryDelay.TotalSeconds);
         delay = TimeSpan.FromSeconds(Math.Max(1, seconds));
-        job.WorkerRetryNextUtc = nowUtc + delay;
+        var parsedRetryAt = retryAtUtc is { } explicitRetryAt
+            ? NormalizeUtc(explicitRetryAt)
+            : RetryTimestampPolicy.ParseFuture(summary, NormalizeUtc(nowUtc));
+        if (parsedRetryAt is { } retryAt && retryAt > NormalizeUtc(nowUtc))
+        {
+            // A service-provided reset is authoritative.  Persisting the
+            // absolute UTC instant makes restart recovery deterministic.
+            job.WorkerRetryNextUtc = retryAt;
+            job.WorkerRetryResetUtc = retryAt;
+        }
+        else
+        {
+            job.WorkerRetryNextUtc = NormalizeUtc(nowUtc) + delay;
+            job.WorkerRetryResetUtc = null;
+        }
         return true;
     }
+
+    public static bool TrySchedule(Job job, WorkerBlocker blocker, DateTime nowUtc, WorkerConfig config, out TimeSpan delay)
+        => TrySchedule(job, blocker.Kind, blocker.Summary, nowUtc, config, blocker.RetryAtUtc, out delay);
+
+    public static bool TryParseRetryAt(string? detail, DateTime nowUtc, out DateTime retryAtUtc)
+        => RetryTimestampPolicy.TryParseFuture(detail, nowUtc, out retryAtUtc);
+
+    /// <summary>
+    /// Rebuilds the minimum retry ledger when an older worker crashed between
+    /// journal writes.  A RetryWaiting phase is already an explicit durable
+    /// decision to retry; dropping it into a terminal Blocked state would lose
+    /// recoverable task work.  The reconstruction is intentionally
+    /// conservative: it preserves any valid fields, counts the reconstructed
+    /// retry as one attempt, and uses the normal bounded delay before launch.
+    /// </summary>
+    public static bool TryReconstruct(Job job, DateTime nowUtc, WorkerConfig config, out RetryMetadataReconstruction reconstruction)
+    {
+        reconstruction = default!;
+        if (job.Phase != JobPhases.RetryWaiting || HasSafeMetadata(job)) return false;
+
+        var now = NormalizeUtc(nowUtc);
+        var kind = WorkerBlockerKinds.All.Contains(job.LastBlockerKind ?? string.Empty)
+            && WorkerBlockerKinds.IsRetryable(job.LastBlockerKind!)
+            ? job.LastBlockerKind!
+            : WorkerBlockerKinds.WorkerRepairable;
+        var summary = string.IsNullOrWhiteSpace(job.LastBlockerSummary)
+            ? "Retry metadata was incomplete after a worker interruption; reconstructing a safe retry."
+            : job.LastBlockerSummary!.Trim();
+
+        var started = UsableTimestamp(job.WorkerRetryStartedUtc)
+            ?? UsableTimestamp(job.PhaseChangedUtc)
+            ?? UsableTimestamp(job.StartedUtc)
+            ?? now;
+        if (started > now) started = now;
+
+        var attempts = Math.Max(1, job.WorkerRetryAttempts);
+        job.WorkerRetryAttempts = attempts;
+        job.WorkerRetryStartedUtc = started;
+        job.WorkerRetryLastKind = kind;
+        job.WorkerRetryLastSummary = summary;
+        job.WorkerRetryFingerprint ??= Fingerprint(kind, summary);
+        if (string.IsNullOrWhiteSpace(job.WorkerRetryFingerprint)) job.WorkerRetryFingerprint = Fingerprint(kind, summary);
+        job.WorkerRetryFreshSession |= RequiresFreshSession(kind, summary);
+
+        var mode = ResolveRetryMode(job);
+        job.WorkerRetryMode = mode.ToString();
+        var parsedReset = job.WorkerRetryResetUtc is { } reset && reset > now
+            ? NormalizeUtc(reset)
+            : RetryTimestampPolicy.ParseFuture(summary, now);
+        job.WorkerRetryResetUtc = parsedReset;
+        var next = UsableTimestamp(job.WorkerRetryNextUtc);
+        if (next is null || next <= now)
+            next = parsedReset is { } future ? future : now + config.EffectiveWorkerRetryBaseDelay;
+        job.WorkerRetryNextUtc = next;
+        reconstruction = new RetryMetadataReconstruction(
+            mode,
+            $"Reconstructed retry metadata for {kind}; next attempt scheduled at {next:O}.");
+        return true;
+    }
+
+    public static bool TryReconstruct(Job job, DateTime nowUtc, WorkerConfig config, out RecoveryMode mode, out string reason)
+    {
+        if (TryReconstruct(job, nowUtc, config, out var reconstruction))
+        {
+            mode = reconstruction.Mode;
+            reason = reconstruction.Reason;
+            return true;
+        }
+
+        mode = RecoveryPlanner.ModeFor(job);
+        reason = string.Empty;
+        return false;
+    }
+
+    private static RecoveryMode ResolveRetryMode(Job job)
+    {
+        if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.ResumeRepair;
+        if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeInitial), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.ResumeInitial;
+        if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Initial), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.Initial;
+        if (job.PendingResultIsRepair || job.PendingCheckFailures.Count > 0 || job.PendingFeedback.Count > 0) return RecoveryMode.ResumeRepair;
+        return string.IsNullOrWhiteSpace(job.ThreadId) ? RecoveryMode.Initial : RecoveryMode.ResumeInitial;
+    }
+
+    private static bool IsUsableTimestamp(DateTime? value) => value is { } timestamp && timestamp != DateTime.MinValue && timestamp != DateTime.MaxValue;
+    private static DateTime? UsableTimestamp(DateTime? value) => IsUsableTimestamp(value) ? NormalizeUtc(value!.Value) : null;
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
 
     public static void Clear(Job job)
     {
@@ -699,8 +962,12 @@ public static class WorkerRetryPolicy
         job.WorkerRetryLastKind = null;
         job.WorkerRetryLastSummary = null;
         job.WorkerRetryMode = null;
+        job.WorkerRetryResetUtc = null;
+        job.WorkerRetryFreshSession = false;
     }
 }
+
+public sealed record RetryMetadataReconstruction(RecoveryMode Mode, string Reason);
 
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
 
@@ -741,7 +1008,7 @@ public static class WorkspaceBranchPolicy
         return "origin/" + baseRefName.GetString();
     }
 }
-public sealed record PullRequestState(string Url, string Repository);
+public sealed record PullRequestState(string Url, string Repository, string HeadOid = "");
 
 public static class PublicationMetadata
 {
@@ -862,14 +1129,18 @@ public sealed class Job
     public int WorkerRetryAttempts { get; set; }
     public DateTime? WorkerRetryStartedUtc { get; set; }
     public DateTime? WorkerRetryNextUtc { get; set; }
+    public DateTime? WorkerRetryResetUtc { get; set; }
     public string? WorkerRetryFingerprint { get; set; }
     public string? WorkerRetryLastKind { get; set; }
     public string? WorkerRetryLastSummary { get; set; }
     public string? WorkerRetryMode { get; set; }
+    public bool WorkerRetryFreshSession { get; set; }
+    public Dictionary<string, string> RepairGenerationByPullRequest { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public string? LastBlockerKind { get; set; }
     public string? LastBlockerSummary { get; set; }
     public string[] LastBlockerEvidence { get; set; } = [];
     public bool HumanReviewRequested { get; set; }
+    public bool BlockCommentRecorded { get; set; }
 }
 
 public static class AdoptedWorkspaceResultPolicy
@@ -973,6 +1244,7 @@ public static class JobPhases
     public const string Publishing = "Publishing";
     public const string Monitoring = "Monitoring";
     public const string RetryWaiting = "Retry waiting";
+    public const string StatusSyncPending = "Status sync pending";
     public const string Blocked = "Blocked";
     public const string Done = "Done";
 }
@@ -1005,6 +1277,7 @@ public static class RecoveryPlanner
 
     public static RecoveryMode ModeFor(Job job) => job.Phase switch
     {
+        JobPhases.StatusSyncPending => RecoveryMode.SyncBlocked,
         JobPhases.Publishing when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
         JobPhases.Repairing => RecoveryMode.ResumeRepair,
         JobPhases.Implementing when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
@@ -1024,7 +1297,7 @@ public static class RecoveryPlanner
     }
 }
 
-public enum RecoveryMode { Initial, ResumeInitial, ResumeRepair, Publish, Monitoring, UnrecoverablePublication }
+public enum RecoveryMode { Initial, ResumeInitial, ResumeRepair, Publish, Monitoring, SyncBlocked, UnrecoverablePublication }
 
 public static class MergeBasePolicy
 {
@@ -1042,6 +1315,63 @@ public static class MergeBasePolicy
 
 public static class RepairRetryPolicy
 {
+    /// <summary>
+    /// Creates a stable identity for one repair generation.  A new PR head or
+    /// a new pending check/review identity represents substantive new work and
+    /// therefore gets a fresh repair budget.  Status/details are deliberately
+    /// excluded so polling the same failure does not reset the budget.
+    /// </summary>
+    public static string GenerationFingerprint(
+        string pullRequestUrl,
+        string? headOid,
+        IEnumerable<CheckState> pendingChecks,
+        IEnumerable<ReviewFeedback> pendingFeedback)
+    {
+        var checkIdentity = pendingChecks
+            .Select(check => string.Join('\u001f', check.Id, check.PullRequestUrl, check.Name))
+            .OrderBy(identity => identity, StringComparer.Ordinal);
+        var feedbackIdentity = pendingFeedback
+            .Select(feedback => string.Join('\u001f', feedback.ThreadId, feedback.CommentNodeId, feedback.Url))
+            .OrderBy(identity => identity, StringComparer.Ordinal);
+        var payload = string.Join("\n", new[]
+        {
+            pullRequestUrl.Trim().ToLowerInvariant(),
+            string.IsNullOrWhiteSpace(headOid) ? "<unknown-head>" : headOid.Trim().ToLowerInvariant(),
+            "checks:" + string.Join("\u001e", checkIdentity),
+            "feedback:" + string.Join("\u001e", feedbackIdentity)
+        });
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
+    }
+
+    public static bool BeginGeneration(
+        Job job,
+        string pullRequestUrl,
+        string? headOid,
+        IEnumerable<CheckState> pendingChecks,
+        IEnumerable<ReviewFeedback> pendingFeedback,
+        DateTime nowUtc)
+    {
+        var fingerprint = GenerationFingerprint(pullRequestUrl, headOid, pendingChecks, pendingFeedback);
+        if (job.RepairGenerationByPullRequest.TryGetValue(pullRequestUrl, out var previous)
+            && previous.Equals(fingerprint, StringComparison.Ordinal)) return false;
+
+        job.RepairGenerationByPullRequest[pullRequestUrl] = fingerprint;
+        job.RepairAttemptsByPullRequest[pullRequestUrl] = 0;
+        job.RepairStartedUtcByPullRequest[pullRequestUrl] = nowUtc;
+        job.RepairAttempts = 0;
+        job.RepairStartedUtc = nowUtc;
+        return true;
+    }
+
+    public static bool EnsureGeneration(
+        Job job,
+        string pullRequestUrl,
+        string? headOid,
+        IEnumerable<CheckState> pendingChecks,
+        IEnumerable<ReviewFeedback> pendingFeedback,
+        DateTime nowUtc)
+        => BeginGeneration(job, pullRequestUrl, headOid, pendingChecks, pendingFeedback, nowUtc);
+
     public static void RearmChecks(Job job, IEnumerable<CheckState> checks)
     {
         var ids = checks.Select(check => check.Id).ToHashSet(StringComparer.Ordinal);
@@ -1473,6 +1803,7 @@ public static class BlockedWorkspaceAdoption
         candidate.RepairStartedUtc = null;
         candidate.RepairAttemptsByPullRequest.Clear();
         candidate.RepairStartedUtcByPullRequest.Clear();
+        candidate.RepairGenerationByPullRequest.Clear();
         candidate.ObservedTaskUpdatedAt = null;
         candidate.ObservedDescription = null;
         candidate.ProcessedHumanCommentKeys.Clear();
@@ -1488,6 +1819,7 @@ public static class BlockedWorkspaceAdoption
         candidate.LastBlockerSummary = null;
         candidate.LastBlockerEvidence = [];
         candidate.HumanReviewRequested = false;
+        candidate.BlockCommentRecorded = false;
         return candidate;
     }
 
@@ -1540,21 +1872,93 @@ public sealed class CodexTerminalEventTracker
 
     private static bool ContainsStructuredResult(JsonElement element)
     {
-        if (element.ValueKind == JsonValueKind.Object)
+        if (element.ValueKind == JsonValueKind.String)
         {
-            if (element.TryGetProperty("status", out var status) && status.ValueKind == JsonValueKind.String
-                && element.TryGetProperty("summary", out var summary) && summary.ValueKind == JsonValueKind.String) return true;
-            if (element.TryGetProperty("result", out var result))
+            try
             {
-                if (result.ValueKind == JsonValueKind.Object) return true;
-                if (result.ValueKind == JsonValueKind.String && IsJsonObject(result.GetString())) return true;
+                using var document = JsonDocument.Parse(element.GetString() ?? string.Empty);
+                return ContainsStructuredResult(document.RootElement);
             }
-            if (element.TryGetProperty("item", out var item) && item.ValueKind == JsonValueKind.Object
-                && item.TryGetProperty("type", out var itemType) && itemType.GetString() == "agent_message"
-                && item.TryGetProperty("text", out var text) && text.ValueKind == JsonValueKind.String && IsJsonObject(text.GetString())) return true;
-            if (element.TryGetProperty("last_agent_message", out var lastMessage) && lastMessage.ValueKind == JsonValueKind.String && IsJsonObject(lastMessage.GetString())) return true;
-            if (element.TryGetProperty("payload", out var payload) && payload.ValueKind == JsonValueKind.Object && ContainsStructuredResult(payload)) return true;
+            catch (JsonException) { return false; }
         }
+
+        if (element.ValueKind != JsonValueKind.Object) return false;
+        if (IsWorkerLifecycleResult(element) || IsResearchResult(element) || IsClarificationResult(element)) return true;
+
+        // Codex has emitted all of these wrappers across its JSON event
+        // variants.  Recurse only through named result/message payloads and
+        // require a complete known contract at the leaf; an arbitrary object
+        // under `result` or an incidental agent message is not enough.
+        foreach (var name in new[] { "result", "payload", "output", "response", "data" })
+            if (TryGetProperty(element, name, out var nested) && ContainsStructuredResult(nested)) return true;
+
+        if (TryGetProperty(element, "item", out var item)
+            && item.ValueKind == JsonValueKind.Object
+            && TryGetString(item, "type", out var itemType)
+            && itemType.Equals("agent_message", StringComparison.OrdinalIgnoreCase)
+            && TryGetProperty(item, "text", out var text)
+            && ContainsStructuredResult(text)) return true;
+        if (TryGetProperty(element, "last_agent_message", out var lastMessage) && ContainsStructuredResult(lastMessage)) return true;
+        if (TryGetProperty(element, "message", out var message) && ContainsStructuredResult(message)) return true;
+        return false;
+    }
+
+    private static bool IsWorkerLifecycleResult(JsonElement element)
+        => HasNonBlankString(element, "status")
+            && HasNonBlankString(element, "summary")
+            && HasBoolean(element, "workComplete")
+            && HasObject(element, "blocker")
+            && HasArray(element, "repositories");
+
+    private static bool IsResearchResult(JsonElement element)
+        => HasNonBlankString(element, "outcome")
+            && HasNonBlankString(element, "summary")
+            && HasArray(element, "findings")
+            && HasArray(element, "mutations");
+
+    private static bool IsClarificationResult(JsonElement element)
+        => HasNonBlankString(element, "action")
+            && HasArray(element, "repositories")
+            && HasArray(element, "children")
+            && HasNonBlankString(element, "rationale")
+            && HasNumber(element, "confidence")
+            && HasBoolean(element, "ambiguous");
+
+    private static bool HasNonBlankString(JsonElement element, string name)
+        => TryGetString(element, name, out var value) && !string.IsNullOrWhiteSpace(value);
+
+    private static bool HasBoolean(JsonElement element, string name)
+        => TryGetProperty(element, name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False;
+
+    private static bool HasNumber(JsonElement element, string name)
+        => TryGetProperty(element, name, out var value) && value.ValueKind == JsonValueKind.Number;
+
+    private static bool HasArray(JsonElement element, string name)
+        => TryGetProperty(element, name, out var value) && value.ValueKind == JsonValueKind.Array;
+
+    private static bool HasObject(JsonElement element, string name)
+        => TryGetProperty(element, name, out var value) && value.ValueKind == JsonValueKind.Object;
+
+    private static bool TryGetString(JsonElement element, string name, out string value)
+    {
+        if (TryGetProperty(element, name, out var property) && property.ValueKind == JsonValueKind.String)
+        {
+            value = property.GetString() ?? string.Empty;
+            return true;
+        }
+        value = string.Empty;
+        return false;
+    }
+
+    private static bool TryGetProperty(JsonElement element, string name, out JsonElement value)
+    {
+        foreach (var property in element.EnumerateObject())
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        value = default;
         return false;
     }
 
@@ -1566,9 +1970,4 @@ public sealed class CodexTerminalEventTracker
             && payload.TryGetProperty("type", out var payloadType) && payloadType.GetString() == "task_complete";
     }
 
-    private static bool IsJsonObject(string? text)
-    {
-        try { using var document = JsonDocument.Parse(text ?? string.Empty); return document.RootElement.ValueKind == JsonValueKind.Object; }
-        catch (JsonException) { return false; }
-    }
 }
