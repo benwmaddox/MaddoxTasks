@@ -1000,15 +1000,32 @@ public sealed class WorkerHost
 
             await RequireAsync("git", ["fetch", "origin"], workspace.Directory, ct);
             var remoteBase = $"origin/{preparedConflict.BaseRefName}";
-            var merge = await processes.RunAsync("git", ["merge", "--no-commit", "--no-ff", "--", remoteBase], workspace.Directory, ct);
             var preparation = $"Worker fetched and prepared the exact pull request base {remoteBase} before repair.";
-            if (merge.ExitCode != 0)
+            var mergeHead = await processes.RunAsync("git", ["rev-parse", "--verify", "-q", "MERGE_HEAD"], workspace.Directory, ct);
+            if (mergeHead.ExitCode == 0)
             {
+                var expectedBase = await RequireAsync("git", ["rev-parse", remoteBase], workspace.Directory, ct);
+                if (!mergeHead.Output.Trim().Equals(expectedBase.Output.Trim(), StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"Retained merge state targets {mergeHead.Output.Trim()}, not the current exact base {expectedBase.Output.Trim()}.");
                 var unresolved = await processes.RunAsync("git", ["diff", "--name-only", "--diff-filter=U"], workspace.Directory, ct);
-                if (unresolved.ExitCode != 0 || string.IsNullOrWhiteSpace(unresolved.Output))
-                    throw new InvalidOperationException("git merge failed without leaving unresolved paths: " + merge.Error.Trim());
-                preparation += " Unresolved merge paths are present for Codex to resolve: "
-                    + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+                if (unresolved.ExitCode != 0)
+                    throw new InvalidOperationException("Could not inspect retained merge conflicts: " + unresolved.Error.Trim());
+                preparation += string.IsNullOrWhiteSpace(unresolved.Output)
+                    ? " The retained merge already targets that exact base and all conflicts are resolved and staged; validate and publish it without restarting the merge."
+                    : " The retained merge already targets that exact base. Unresolved merge paths are present for Codex to resolve: "
+                        + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+            }
+            else
+            {
+                var merge = await processes.RunAsync("git", ["merge", "--no-commit", "--no-ff", "--", remoteBase], workspace.Directory, ct);
+                if (merge.ExitCode != 0)
+                {
+                    var unresolved = await processes.RunAsync("git", ["diff", "--name-only", "--diff-filter=U"], workspace.Directory, ct);
+                    if (unresolved.ExitCode != 0 || string.IsNullOrWhiteSpace(unresolved.Output))
+                        throw new InvalidOperationException("git merge failed without leaving unresolved paths: " + merge.Error.Trim());
+                    preparation += " Unresolved merge paths are present for Codex to resolve: "
+                        + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+                }
             }
             var index = job.PendingCheckFailures.FindIndex(check => check.Id == conflict.Id);
             if (index >= 0) job.PendingCheckFailures[index] = preparedConflict with { Details = preparedConflict.Details + "\n" + preparation };
