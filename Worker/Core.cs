@@ -646,6 +646,7 @@ public sealed class Journal
 {
     private static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
     public List<Job> Jobs { get; set; } = [];
+    public DateTime? CodexUnavailableUntilUtc { get; set; }
     public static Journal Load(string path) => File.Exists(path)
         ? JsonSerializer.Deserialize<Journal>(File.ReadAllText(path), Json) ?? new Journal()
         : new Journal();
@@ -657,6 +658,38 @@ public sealed class Journal
         File.WriteAllText(temporary, JsonSerializer.Serialize(this, Json));
         File.Move(temporary, path, true);
     }
+}
+
+public static partial class CodexUsageLimitPolicy
+{
+    private const string UsageLimitMarker = "You've hit your usage limit.";
+
+    public static bool TryGetRetryUtc(string diagnostic, DateTime nowUtc, TimeZoneInfo localZone, out DateTime retryUtc)
+    {
+        retryUtc = default;
+        if (!diagnostic.Contains(UsageLimitMarker, StringComparison.OrdinalIgnoreCase)) return false;
+
+        var match = RetryTimeRegex().Match(diagnostic);
+        if (match.Success)
+        {
+            var normalized = OrdinalSuffixRegex().Replace(match.Groups["retry"].Value, "$1");
+            if (DateTime.TryParseExact(normalized, "MMM d, yyyy h:mm tt", System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AllowWhiteSpaces, out var localTime))
+            {
+                retryUtc = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(localTime, DateTimeKind.Unspecified), localZone);
+                return true;
+            }
+        }
+
+        retryUtc = DateTime.SpecifyKind(nowUtc, DateTimeKind.Utc).AddHours(1);
+        return true;
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"try again at (?<retry>[A-Za-z]{3} \d{1,2}(?:st|nd|rd|th)?, \d{4} \d{1,2}:\d{2} [AP]M)", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex RetryTimeRegex();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"(\d{1,2})(?:st|nd|rd|th)", System.Text.RegularExpressions.RegexOptions.IgnoreCase)]
+    private static partial System.Text.RegularExpressions.Regex OrdinalSuffixRegex();
 }
 
 public static class RecoveryPlanner
