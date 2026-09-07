@@ -245,6 +245,33 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task MergeabilityRepair_ResumesResolvedMergeOnlyForExactCurrentBase()
+    {
+        using var resumed = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        resumed.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", resumed.Job.PullRequests[0].Url, "details", "main"));
+        resumed.Processes.Responder = call => call.Arguments.SequenceEqual(["rev-parse", "--verify", "-q", "MERGE_HEAD"])
+            ? new ExecResult(0, "base123\n", "")
+            : call.Arguments.SequenceEqual(["rev-parse", "origin/main"])
+                ? new ExecResult(0, "base123\n", "")
+                : new ExecResult(0, "", "");
+
+        await resumed.PrepareMergeabilityAsync();
+
+        Assert.DoesNotContain(resumed.Processes.Commands, call => call.Arguments.FirstOrDefault() == "merge");
+        Assert.Contains("all conflicts are resolved and staged", resumed.Job.PendingCheckFailures[0].Details);
+
+        using var mismatched = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        mismatched.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", mismatched.Job.PullRequests[0].Url, "details", "main"));
+        mismatched.Processes.Responder = call => call.Arguments.SequenceEqual(["rev-parse", "--verify", "-q", "MERGE_HEAD"])
+            ? new ExecResult(0, "stale-base\n", "")
+            : call.Arguments.SequenceEqual(["rev-parse", "origin/main"])
+                ? new ExecResult(0, "current-base\n", "")
+                : new ExecResult(0, "", "");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(mismatched.PrepareMergeabilityAsync);
+    }
+
+    [Fact]
     public async Task LegacyMergeabilityRepair_RefreshesMissingBaseMetadata()
     {
         var refreshed = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", BaseRefName = "release/legacy" };
@@ -266,6 +293,7 @@ public sealed class WorkerHostMonitoringTests
         accepted.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", accepted.Job.PullRequests[0].Url, "details", "main"));
         accepted.Processes.Responder = call => call.Arguments.FirstOrDefault() switch
         {
+            "rev-parse" when call.Arguments.Contains("MERGE_HEAD") => new ExecResult(1, "", ""),
             "merge" => new ExecResult(1, "", "conflict"),
             "diff" when call.Arguments.Contains("--diff-filter=U") => new ExecResult(0, "src/file.cs\n", ""),
             _ => new ExecResult(0, "", "")
@@ -276,9 +304,12 @@ public sealed class WorkerHostMonitoringTests
 
         using var rejected = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
         rejected.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", rejected.Job.PullRequests[0].Url, "details", "main"));
-        rejected.Processes.Responder = call => call.Arguments.FirstOrDefault() == "merge"
-            ? new ExecResult(1, "", "fatal")
-            : new ExecResult(0, "", "");
+        rejected.Processes.Responder = call => call.Arguments.FirstOrDefault() switch
+        {
+            "rev-parse" when call.Arguments.Contains("MERGE_HEAD") => new ExecResult(1, "", ""),
+            "merge" => new ExecResult(1, "", "fatal"),
+            _ => new ExecResult(0, "", "")
+        };
 
         await Assert.ThrowsAsync<InvalidOperationException>(rejected.PrepareMergeabilityAsync);
     }
@@ -488,6 +519,8 @@ public sealed class WorkerHostMonitoringTests
             var call = new CommandCall(executable, arguments.ToArray(), workingDirectory);
             Commands.Add(call);
             if (Responder is not null) return Task.FromResult(Responder(call));
+            if (call.Arguments.SequenceEqual(["rev-parse", "--verify", "-q", "MERGE_HEAD"]))
+                return Task.FromResult(new ExecResult(1, string.Empty, string.Empty));
             return Task.FromResult(call.Arguments.Contains("command", StringComparer.Ordinal)
                 ? new ExecResult(0, "{\"success\":true}", string.Empty)
                 : new ExecResult(0, string.Empty, string.Empty));
