@@ -674,9 +674,41 @@ public static class RecoveryPlanner
         JobPhases.Publishing => RecoveryMode.UnrecoverablePublication,
         _ => RecoveryMode.Initial
     };
+
+    public static RecoveryMode ModeForAdopted(Job job)
+    {
+        if (job.PullRequests.Count == 0) return RecoveryMode.Initial;
+        return job.PendingCheckFailures.Count > 0 || job.PendingFeedback.Count > 0
+            ? RecoveryMode.ResumeRepair
+            : RecoveryMode.Monitoring;
+    }
 }
 
-public enum RecoveryMode { Initial, ResumeInitial, ResumeRepair, Publish, UnrecoverablePublication }
+public enum RecoveryMode { Initial, ResumeInitial, ResumeRepair, Publish, Monitoring, UnrecoverablePublication }
+
+public static class MergeBasePolicy
+{
+    public static bool IsValid(string baseRefName)
+    {
+        if (string.IsNullOrWhiteSpace(baseRefName) || baseRefName == "@" || baseRefName.StartsWith('-') || baseRefName.Length > 255) return false;
+        if (baseRefName.StartsWith('/') || baseRefName.EndsWith('/') || baseRefName.EndsWith('.')
+            || baseRefName.Contains("..", StringComparison.Ordinal) || baseRefName.Contains("@{", StringComparison.Ordinal)
+            || baseRefName.Contains("//", StringComparison.Ordinal)) return false;
+        if (baseRefName.Split('/').Any(component => component.StartsWith('.') || component.EndsWith(".lock", StringComparison.OrdinalIgnoreCase))) return false;
+        return !baseRefName.Any(character => char.IsControl(character) || char.IsWhiteSpace(character)
+            || character is '~' or '^' or ':' or '?' or '*' or '[' or '\\');
+    }
+}
+
+public static class RepairRetryPolicy
+{
+    public static void RearmChecks(Job job, IEnumerable<CheckState> checks)
+    {
+        var ids = checks.Select(check => check.Id).ToHashSet(StringComparer.Ordinal);
+        job.PendingCheckFailures.RemoveAll(check => ids.Contains(check.Id));
+        job.ProcessedCheckIds.RemoveWhere(ids.Contains);
+    }
+}
 
 public sealed record ClaimSnapshot(WorkerConfig Config, string Prompt);
 public static class ClaimAdmission

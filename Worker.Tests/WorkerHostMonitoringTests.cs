@@ -87,7 +87,7 @@ public sealed class WorkerHostMonitoringTests
     [Fact]
     public async Task ConflictingPullRequest_QueuesRevisionScopedRepairAndDoesNotAutoMerge()
     {
-        var conflict = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", HeadOid = "abc123" };
+        var conflict = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", HeadOid = "abc123", BaseRefName = "release/next" };
         using var fixture = HostFixture.Create(autoMergeAllowed: true, conflict);
 
         await fixture.MonitorAsync();
@@ -95,9 +95,96 @@ public sealed class WorkerHostMonitoringTests
         var failure = Assert.Single(fixture.Job.PendingCheckFailures);
         Assert.Equal("pull-request-mergeability", failure.Name);
         Assert.Equal("https://github.com/example/Repo/pull/1#head-abc123", failure.Link);
+        Assert.Equal("release/next", failure.BaseRefName);
         Assert.Contains("Merge the latest base branch", failure.Details, StringComparison.Ordinal);
         Assert.False(fixture.Job.ReadyForReviewRecorded);
         Assert.Empty(fixture.GitHub.MergedUrls);
+    }
+
+    [Fact]
+    public async Task GitHubInspection_CapturesExactPullRequestBase()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Processes.Responder = call => call.Arguments.Contains("view", StringComparer.Ordinal)
+            ? new ExecResult(0, "{\"mergedAt\":null,\"mergeable\":\"CONFLICTING\",\"mergeStateStatus\":\"DIRTY\",\"headRefOid\":\"abc123\",\"baseRefName\":\"release/next\"}", "")
+            : call.Arguments.Contains("checks", StringComparer.Ordinal)
+                ? new ExecResult(0, "[]", "")
+                : new ExecResult(0, "", "");
+        var client = new GitHubClient(fixture.Processes, () => fixture.Settings, new NullLog());
+
+        var snapshot = await client.InspectAsync("https://github.com/example/Repo/pull/1", false, CancellationToken.None);
+
+        Assert.Equal("release/next", snapshot.BaseRefName);
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.LastOrDefault() == "mergedAt,mergeable,mergeStateStatus,headRefOid,baseRefName");
+    }
+
+    [Fact]
+    public async Task MergeabilityRepair_FetchesAndPreparesExactBaseBeforeCodex()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", fixture.Job.PullRequests[0].Url, "details", "release/next"));
+
+        await fixture.PrepareMergeabilityAsync();
+
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.SequenceEqual(["fetch", "origin"]));
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.SequenceEqual(["merge", "--no-commit", "--no-ff", "--", "origin/release/next"]));
+        Assert.Contains("prepared the exact pull request base origin/release/next", fixture.Job.PendingCheckFailures[0].Details);
+    }
+
+    [Fact]
+    public async Task LegacyMergeabilityRepair_RefreshesMissingBaseMetadata()
+    {
+        var refreshed = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", BaseRefName = "release/legacy" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, refreshed);
+        fixture.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", fixture.Job.PullRequests[0].Url, "legacy details"));
+
+        await fixture.PrepareMergeabilityAsync();
+
+        Assert.Single(fixture.GitHub.Inspections);
+        Assert.False(fixture.GitHub.Inspections[0].IncludeFeedback);
+        Assert.Equal("release/legacy", fixture.Job.PendingCheckFailures[0].BaseRefName);
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.SequenceEqual(["merge", "--no-commit", "--no-ff", "--", "origin/release/legacy"]));
+    }
+
+    [Fact]
+    public async Task MergeabilityRepair_AcceptsConflictOnlyWhenUnresolvedPathsExist()
+    {
+        using var accepted = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        accepted.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", accepted.Job.PullRequests[0].Url, "details", "main"));
+        accepted.Processes.Responder = call => call.Arguments.FirstOrDefault() switch
+        {
+            "merge" => new ExecResult(1, "", "conflict"),
+            "diff" when call.Arguments.Contains("--diff-filter=U") => new ExecResult(0, "src/file.cs\n", ""),
+            _ => new ExecResult(0, "", "")
+        };
+
+        await accepted.PrepareMergeabilityAsync();
+        Assert.Contains("src/file.cs", accepted.Job.PendingCheckFailures[0].Details);
+
+        using var rejected = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        rejected.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", rejected.Job.PullRequests[0].Url, "details", "main"));
+        rejected.Processes.Responder = call => call.Arguments.FirstOrDefault() == "merge"
+            ? new ExecResult(1, "", "fatal")
+            : new ExecResult(0, "", "");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(rejected.PrepareMergeabilityAsync);
+    }
+
+    [Fact]
+    public async Task NoOpCheckRepair_ReturnsToFreshMonitoringAndKeepsAttemptBounds()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var failure = new CheckState("build", "FAILURE", "fail", "check", fixture.Job.PullRequests[0].Url);
+        fixture.Job.PendingCheckFailures.Add(failure);
+        fixture.Job.ProcessedCheckIds.Add(failure.Id);
+        fixture.Job.RepairAttemptsByPullRequest[fixture.Job.PullRequests[0].Url] = 2;
+
+        await fixture.CompleteNoOpRepairAsync(failure.Id);
+
+        Assert.Equal(JobPhases.Monitoring, fixture.Job.Phase);
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.DoesNotContain(failure.Id, fixture.Job.ProcessedCheckIds);
+        Assert.Equal(2, fixture.Job.RepairAttemptsByPullRequest[fixture.Job.PullRequests[0].Url]);
     }
 
     [Fact]
@@ -185,6 +272,7 @@ public sealed class WorkerHostMonitoringTests
             Clock = new MutableClock(new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc));
             QuietPeriod = TimeSpan.FromMinutes(30);
             Processes = new FakeProcessRunner();
+            Settings = WorkerConfig.Load(configPath);
             GitHub = new FakeGitHubClient(snapshots);
             var job = new Job
             {
@@ -208,6 +296,7 @@ public sealed class WorkerHostMonitoringTests
         public WorkerHost Host { get; }
         public MutableClock Clock { get; }
         public FakeProcessRunner Processes { get; }
+        public WorkerConfig Settings { get; }
         public FakeGitHubClient GitHub { get; }
         public Job Job { get; }
         public TimeSpan QuietPeriod { get; }
@@ -225,6 +314,21 @@ public sealed class WorkerHostMonitoringTests
         {
             var method = typeof(WorkerHost).GetMethod("RunContinuationAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task<ExecResult>)method.Invoke(Host, [Job, "schema.json", "continue", CancellationToken.None])!;
+        }
+
+        public async Task PrepareMergeabilityAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("PrepareMergeabilityRepairsAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
+        }
+
+        public async Task CompleteNoOpRepairAsync(string checkId)
+        {
+            using var result = JsonDocument.Parse($$"""
+            {"status":"noChanges","summary":"stale failure","repositories":[{"repository":"Repo","changed":false}],"checkDispositions":[{"checkId":{{JsonSerializer.Serialize(checkId)}},"addressed":false}],"threadDispositions":[]}
+            """);
+            var method = typeof(WorkerHost).GetMethod("CompleteResultAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [Job, result.RootElement, true, CancellationToken.None])!;
         }
 
         public void Dispose() => directory.Dispose();
@@ -253,11 +357,13 @@ public sealed class WorkerHostMonitoringTests
     private sealed class FakeProcessRunner : IProcessRunner
     {
         public List<CommandCall> Commands { get; } = [];
+        public Func<CommandCall, ExecResult>? Responder { get; set; }
 
         public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
         {
             var call = new CommandCall(executable, arguments.ToArray(), workingDirectory);
             Commands.Add(call);
+            if (Responder is not null) return Task.FromResult(Responder(call));
             return Task.FromResult(call.Arguments.Contains("command", StringComparer.Ordinal)
                 ? new ExecResult(0, "{\"success\":true}", string.Empty)
                 : new ExecResult(0, string.Empty, string.Empty));

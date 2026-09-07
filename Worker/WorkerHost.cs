@@ -125,6 +125,7 @@ public sealed class WorkerHost
                 return FreshClaimOutcome.Unavailable;
             }
             Job job;
+            RecoveryMode mode;
             try
             {
                 var task = JsonSerializer.Deserialize<TaskDto>(claim.Output, JsonOptions) ?? throw new InvalidDataException("Claim response was empty.");
@@ -135,6 +136,7 @@ public sealed class WorkerHost
                     var owned = BlockedWorkspaceAdoption.TryAdopt(journal, task, snapshot.Config.WorktreeRoot, clock.UtcNow);
                     adopted = owned is not null;
                     job = owned ?? new Job { Task = task, Prompt = snapshot.Prompt, Model = snapshot.Config.Model, Effort = snapshot.Config.ReasoningEffort, StartedUtc = clock.UtcNow, PhaseChangedUtc = clock.UtcNow };
+                    mode = owned is null ? RecoveryMode.Initial : RecoveryPlanner.ModeForAdopted(job);
                     job.BlockedReassessmentAttempted = false;
                     TaskUpdatePolicy.Seed(job, task);
                     if (!journal.Jobs.Contains(job)) journal.Jobs.Add(job);
@@ -146,7 +148,13 @@ public sealed class WorkerHost
                 log.Write("info", "job.claimed", new { task.Sequence, task.Title, task.Repositories, adoptedBlockedWorkspace = adopted });
             }
             catch { capacity.Release(); throw; }
-            _ = RunReservedJobAsync(job, RecoveryMode.Initial, ct);
+            if (mode == RecoveryMode.Monitoring)
+            {
+                SetPhase(job, JobPhases.Monitoring);
+                capacity.Release();
+                SignalScheduler(SchedulerWakeReason.CapacityChanged);
+            }
+            else _ = RunReservedJobAsync(job, mode, ct);
             return admittedWithSpareCapacity ? FreshClaimOutcome.ClaimedWithSpareCapacity : FreshClaimOutcome.ClaimedAtCapacity;
         }
         return FreshClaimOutcome.NotAttempted;
@@ -509,6 +517,7 @@ public sealed class WorkerHost
                 job.ExecutionStartHeads[workspace.Repository] = (await RequireAsync("git", ["rev-parse", "HEAD"], workspace.Directory, ct)).Output.Trim();
             Save(job);
         }
+        if (repair) await PrepareMergeabilityRepairsAsync(job, ct);
         PendingTaskUpdateBatch? resumeBatch = null;
         if (resume)
         {
@@ -639,10 +648,16 @@ public sealed class WorkerHost
         }
 
         var repairingChecks = job.PendingCheckFailures.Count > 0;
+        var checksBeforePublication = job.PendingCheckFailures.ToArray();
         var changed = await PublishAsync(job, result, repair, ct);
         if (repair && repairingChecks && !changed)
         {
-            await BlockAsync(job, "Codex repair produced no changes for failing CI checks.", ct);
+            await ApplyReviewDispositionsAsync(job, result, ct);
+            RepairRetryPolicy.RearmChecks(job, checksBeforePublication);
+            job.PendingResultJson = null;
+            job.Publication.Clear();
+            job.ExecutionStartHeads.Clear();
+            SetPhase(job, JobPhases.Monitoring);
             return;
         }
         if (!repair && !job.CodexResultCommentRecorded)
@@ -673,6 +688,44 @@ public sealed class WorkerHost
             ? "\nRETAINED WORKSPACE:\nThis worker-owned workspace was retained from a previous blocked attempt. Treat its existing staged, unstaged, untracked, and task-branch commit changes as task-owned work: inspect and preserve them, finish and validate the task, and report changed:true when they remain for publication."
             : string.Empty;
         return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}{adoptedContext}\nRESTRICTIONS:\n{restrictions}{repairContext}";
+    }
+
+    private async Task PrepareMergeabilityRepairsAsync(Job job, CancellationToken ct)
+    {
+        var conflicts = job.PendingCheckFailures
+            .Where(check => check.Name.Equals("pull-request-mergeability", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        foreach (var conflict in conflicts)
+        {
+            var pullRequest = job.PullRequests.FirstOrDefault(item => item.Url.Equals(conflict.PullRequestUrl, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidDataException("Pull request mergeability repair does not match a retained pull request.");
+            var preparedConflict = conflict;
+            if (string.IsNullOrWhiteSpace(preparedConflict.BaseRefName))
+            {
+                var refreshed = await github.InspectAsync(pullRequest.Url, includeFeedback: false, ct);
+                preparedConflict = preparedConflict with { BaseRefName = refreshed.BaseRefName };
+            }
+            if (!MergeBasePolicy.IsValid(preparedConflict.BaseRefName))
+                throw new InvalidDataException($"Pull request mergeability repair has an invalid base ref: {preparedConflict.BaseRefName}");
+            var workspace = job.Workspaces.FirstOrDefault(item => item.Repository.Equals(pullRequest.Repository, StringComparison.OrdinalIgnoreCase))
+                ?? throw new InvalidDataException($"Pull request mergeability repair has no workspace for {pullRequest.Repository}.");
+
+            await RequireAsync("git", ["fetch", "origin"], workspace.Directory, ct);
+            var remoteBase = $"origin/{preparedConflict.BaseRefName}";
+            var merge = await processes.RunAsync("git", ["merge", "--no-commit", "--no-ff", "--", remoteBase], workspace.Directory, ct);
+            var preparation = $"Worker fetched and prepared the exact pull request base {remoteBase} before repair.";
+            if (merge.ExitCode != 0)
+            {
+                var unresolved = await processes.RunAsync("git", ["diff", "--name-only", "--diff-filter=U"], workspace.Directory, ct);
+                if (unresolved.ExitCode != 0 || string.IsNullOrWhiteSpace(unresolved.Output))
+                    throw new InvalidOperationException("git merge failed without leaving unresolved paths: " + merge.Error.Trim());
+                preparation += " Unresolved merge paths are present for Codex to resolve: "
+                    + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+            }
+            var index = job.PendingCheckFailures.FindIndex(check => check.Id == conflict.Id);
+            if (index >= 0) job.PendingCheckFailures[index] = preparedConflict with { Details = preparedConflict.Details + "\n" + preparation };
+            Save(job);
+        }
     }
 
     private async Task<string> DeliverPendingTaskUpdatesAsync(Job job, string resultJson, string schema, CancellationToken ct)
@@ -1135,7 +1188,8 @@ public sealed class WorkerHost
                     "fail",
                     $"{pullRequest.Url}#head-{snapshot.HeadOid}",
                     pullRequest.Url,
-                    $"GitHub reports mergeable={snapshot.Mergeable}, mergeStateStatus={snapshot.MergeStateStatus}. Merge the latest base branch into the task branch, resolve conflicts without discarding task work, rerun relevant validation, and push the repaired branch.");
+                    $"GitHub reports mergeable={snapshot.Mergeable}, mergeStateStatus={snapshot.MergeStateStatus}. Merge the latest base branch into the task branch, resolve conflicts without discarding task work, rerun relevant validation, and push the repaired branch.",
+                    snapshot.BaseRefName);
                 if (job.ProcessedCheckIds.Add(conflict.Id)) job.PendingCheckFailures.Add(conflict);
             }
             var additions = FeedbackPolicy.AddNew(job, snapshot.Feedback);
