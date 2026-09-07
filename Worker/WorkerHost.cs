@@ -1747,7 +1747,12 @@ public sealed class WorkerHost
     }
     private Task<ExecResult> AddCommentAsync(Job job, string comment, CancellationToken ct) => AddCommentAsync(job, comment, "maddox-worker", ct);
     private Task<ExecResult> AddCommentAsync(Job job, string comment, string actor, CancellationToken ct) => RunRequiredCommandAsync(new { type = "AddComment", issueId = job.Task.IssueId, comment }, actor, ct);
-    private Task<ExecResult> ChangeStatusAsync(Job job, string newStatus, CancellationToken ct) => RunRequiredCommandAsync(new { type = "ChangeStatus", issueId = job.Task.IssueId, newStatus }, null, ct);
+    private async Task<ExecResult> ChangeStatusAsync(Job job, string newStatus, CancellationToken ct)
+    {
+        var result = await RunCommandAsync(new { type = "ChangeStatus", issueId = job.Task.IssueId, newStatus }, null, ct);
+        if (result.ExitCode == 0 && (TryReadSuccess(result.Output) || AlreadyHasStatus(result.Output, newStatus))) return result;
+        throw new InvalidOperationException("Maddox command failed: " + result.Output.Trim() + result.Error.Trim());
+    }
     private Task<ExecResult> RunCommandAsync(object command, string? actor, CancellationToken ct)
     {
         var arguments = new List<string> { "agent", "command" };
@@ -1784,6 +1789,20 @@ public sealed class WorkerHost
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception exception) { log.Write("warning", eventName, new { error = exception.Message }); }
+    }
+    private static bool AlreadyHasStatus(string output, string status)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            var root = document.RootElement;
+            return root.TryGetProperty("success", out var success)
+                && success.ValueKind == JsonValueKind.False
+                && root.TryGetProperty("message", out var message)
+                && message.ValueKind == JsonValueKind.String
+                && message.GetString()!.Contains($"already has status '{status}'.", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (JsonException) { return false; }
     }
     private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct, IReadOnlyDictionary<string, string>? environment = null) { var result = await processes.RunAsync(executable, arguments, cwd, ct, environment: environment); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
     private static bool TryReadSuccess(string output) { try { using var document = JsonDocument.Parse(output); return document.RootElement.GetProperty("success").GetBoolean(); } catch { return false; } }

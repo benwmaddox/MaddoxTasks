@@ -60,6 +60,21 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task MergedPullRequest_AcceptsAlreadyDoneStatusAfterReconciliation()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(true));
+        fixture.Processes.Responder = call => call.IsStatus("Done")
+            ? new ExecResult(0, "{\"success\":false,\"message\":\"Issue task already has status 'Done'.\",\"status\":null}", "")
+            : call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
+
+        await fixture.MonitorAsync();
+
+        Assert.Equal(JobPhases.Done, fixture.Job.Phase);
+    }
+
+    [Fact]
     public async Task GreenCi_RecordsReadyForReviewImmediatelyForManualRepository()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
