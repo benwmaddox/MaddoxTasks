@@ -605,6 +605,22 @@ public sealed class WorkerHost
             return;
         }
         if (status == "blocked") { await BlockAsync(job, result.GetProperty("summary").GetString() ?? "Codex reported blocked.", ct, $"{job.Model} {job.Effort}"); return; }
+        if (await ShouldReassessAdoptedWorkspaceResultAsync(job, result, ct))
+        {
+            job.AdoptedResultReassessmentAttempted = true;
+            Save(job);
+            var schema = WriteSchema("result", ResultSchema);
+            const string prompt = "Reassess the structured result for this retained worker-owned workspace. Existing staged, unstaged, untracked, or committed changes in the supplied worktree are task-owned work from the previous attempt, not unrelated user changes. Inspect and preserve them, finish and validate the task, and report changed:true for each repository containing that retained task work so the worker can commit and publish it. Return changed:false only when the repository is clean and contains no task-owned commit after the execution start. Return the normal required structured result schema.";
+            await RenderAsync();
+            var run = await RunContinuationAsync(job, schema, prompt, ct);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex retained-workspace result reassessment failed: " + ExecResultDiagnostics.Failure(run));
+            var reassessedJson = ExtractResult(run.Output);
+            job.PendingResultJson = reassessedJson;
+            Save(job);
+            using var reassessed = JsonDocument.Parse(reassessedJson);
+            await CompleteResultAsync(job, reassessed.RootElement, repair, ct);
+            return;
+        }
         await ValidateResultAsync(job, result, ct);
         ValidateRepairDispositions(job, result, repair);
 
@@ -653,7 +669,10 @@ public sealed class WorkerHost
             : "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews.";
         var repairContext = repair ? $"\nFAILING CHECKS:\n{JsonSerializer.Serialize(job.PendingCheckFailures)}\nACTIONABLE REVIEW THREADS:\n{JsonSerializer.Serialize(job.PendingFeedback)}\nReturn one checkDispositions item for every failing check ID and one threadDispositions item for every review thread ID. Mark review feedback addressed only when the requested change is complete and include the reply to post." : string.Empty;
         var executionRoot = repositoryless ? $"\nREPO ROOT:\n{config.Current.RepoRoot}" : string.Empty;
-        return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}\nRESTRICTIONS:\n{restrictions}{repairContext}";
+        var adoptedContext = job.AdoptedBlockedWorkspace
+            ? "\nRETAINED WORKSPACE:\nThis worker-owned workspace was retained from a previous blocked attempt. Treat its existing staged, unstaged, untracked, and task-branch commit changes as task-owned work: inspect and preserve them, finish and validate the task, and report changed:true when they remain for publication."
+            : string.Empty;
+        return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}{adoptedContext}\nRESTRICTIONS:\n{restrictions}{repairContext}";
     }
 
     private async Task<string> DeliverPendingTaskUpdatesAsync(Job job, string resultJson, string schema, CancellationToken ct)
@@ -913,6 +932,20 @@ public sealed class WorkerHost
         item => item.GetProperty("repository").GetString() ?? string.Empty,
         item => item.GetProperty("changed").GetBoolean(),
         StringComparer.OrdinalIgnoreCase);
+
+    private async Task<bool> ShouldReassessAdoptedWorkspaceResultAsync(Job job, JsonElement result, CancellationToken ct)
+    {
+        Dictionary<string, bool> reported;
+        try { reported = ResultRepositories(result); }
+        catch { return false; }
+        if (reported.Count != job.Workspaces.Count || job.Workspaces.Any(workspace => !reported.ContainsKey(workspace.Repository))) return false;
+        foreach (var workspace in job.Workspaces)
+        {
+            var repositoryChanged = await HasExecutionChangesAsync(job, workspace, ct);
+            if (AdoptedWorkspaceResultPolicy.ShouldReassess(job.AdoptedBlockedWorkspace, job.AdoptedResultReassessmentAttempted, reported[workspace.Repository], repositoryChanged)) return true;
+        }
+        return false;
+    }
 
     private async Task<bool> HasExecutionChangesAsync(Job job, Workspace workspace, CancellationToken ct)
     {
