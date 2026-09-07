@@ -64,9 +64,13 @@ public static partial class AgentRunner
                 finalStatus));
     }
 
-    public static string GetResearchClaimJson(IssueEngine engine, bool dryRun = false, TimeSpan? cooldown = null)
+    public static string GetResearchClaimJson(
+        IssueEngine engine,
+        bool dryRun = false,
+        TimeSpan? cooldown = null,
+        TimeSpan? failureCooldown = null)
     {
-        var result = engine.ResearchClaimBlocked(cooldown, dryRun);
+        var result = engine.ResearchClaimBlocked(cooldown, dryRun, failureCooldown);
         return SerializeResponse(ToResearchClaimResponse(result));
     }
 
@@ -189,7 +193,7 @@ public static partial class AgentRunner
                 dryRun = dryRunElement.GetBoolean();
             }
 
-            if (!TryParseResearchCooldown(root, out var cooldown, out var error))
+            if (!TryParseResearchCooldown(root, out var cooldown, out var failureCooldown, out var error))
             {
                 response = SerializeResponse(new ResearchClaimResponse(false, error, dryRun, null, null));
                 return true;
@@ -197,7 +201,7 @@ public static partial class AgentRunner
 
             try
             {
-                response = SerializeResponse(ToResearchClaimResponse(engine.ResearchClaimBlocked(cooldown, dryRun)));
+                response = SerializeResponse(ToResearchClaimResponse(engine.ResearchClaimBlocked(cooldown, dryRun, failureCooldown)));
             }
             catch (ArgumentOutOfRangeException exception)
             {
@@ -208,9 +212,14 @@ public static partial class AgentRunner
         }
     }
 
-    private static bool TryParseResearchCooldown(JsonElement root, out TimeSpan? cooldown, out string error)
+    private static bool TryParseResearchCooldown(
+        JsonElement root,
+        out TimeSpan? cooldown,
+        out TimeSpan? failureCooldown,
+        out string error)
     {
         cooldown = null;
+        failureCooldown = null;
         error = string.Empty;
         var hasCooldown = TryGetProperty(root, "cooldown", out var cooldownElement);
         var hasDays = TryGetProperty(root, "cooldownDays", out var daysElement);
@@ -243,10 +252,8 @@ public static partial class AgentRunner
             }
 
             cooldown = parsed;
-            return true;
         }
-
-        if (hasDays || hasHours)
+        else if (hasDays || hasHours)
         {
             var element = hasDays ? daysElement : hoursElement;
             if (element.ValueKind != JsonValueKind.Number || !element.TryGetDouble(out var value) || !double.IsFinite(value) || value <= 0)
@@ -258,13 +265,30 @@ public static partial class AgentRunner
             try
             {
                 cooldown = hasDays ? TimeSpan.FromDays(value) : TimeSpan.FromHours(value);
-                return true;
             }
             catch (ArgumentOutOfRangeException)
             {
                 error = "Research cooldown is too large.";
                 return false;
             }
+        }
+
+        if (TryGetProperty(root, "failureCooldown", out var failureCooldownElement))
+        {
+            if (failureCooldownElement.ValueKind != JsonValueKind.String ||
+                !TimeSpan.TryParse(failureCooldownElement.GetString(), CultureInfo.InvariantCulture, out var parsedFailureCooldown))
+            {
+                error = "failureCooldown must be a positive duration such as '01:00:00'.";
+                return false;
+            }
+
+            if (parsedFailureCooldown <= TimeSpan.Zero)
+            {
+                error = "failureCooldown must be positive.";
+                return false;
+            }
+
+            failureCooldown = parsedFailureCooldown;
         }
 
         return true;

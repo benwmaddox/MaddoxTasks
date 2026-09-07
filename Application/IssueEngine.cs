@@ -218,12 +218,20 @@ public sealed class IssueEngine
     /// the durable research-attempt comment. The issue remains Blocked until a
     /// worker has applied and validated a complete unblocking plan.
     /// </summary>
-    public ResearchClaimResult ResearchClaimBlocked(TimeSpan? cooldown = null, bool dryRun = false)
+    public ResearchClaimResult ResearchClaimBlocked(
+        TimeSpan? cooldown = null,
+        bool dryRun = false,
+        TimeSpan? failureCooldown = null)
     {
         var effectiveCooldown = cooldown ?? TimeSpan.FromDays(14);
+        var effectiveFailureCooldown = failureCooldown ?? TimeSpan.FromHours(1);
         if (effectiveCooldown <= TimeSpan.Zero)
         {
             throw new ArgumentOutOfRangeException(nameof(cooldown), "Research cooldown must be positive.");
+        }
+        if (effectiveFailureCooldown <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(failureCooldown), "Research failure cooldown must be positive.");
         }
 
         return _eventStore.ExecuteAtomic(events =>
@@ -231,7 +239,7 @@ public sealed class IssueEngine
             var now = NormalizeUtc(_clock.UtcNow);
             var state = IssueState.Replay(events);
             var candidate = state.HierarchicalIssues()
-                .FirstOrDefault(issue => ResearchClaimPolicy.IsEligible(issue, now, effectiveCooldown));
+                .FirstOrDefault(issue => ResearchClaimPolicy.IsEligible(issue, now, effectiveCooldown, effectiveFailureCooldown));
 
             if (candidate is null)
             {
