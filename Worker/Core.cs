@@ -1,6 +1,8 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace MaddoxTasks.Worker;
 
@@ -38,11 +40,22 @@ public sealed record WorkerConfig(
     string WorktreeRoot,
     TimeSpan? BlockedDisplayDuration = null,
     TimeSpan? ResearchCooldown = null,
-    string? PrivateRepositoryOwner = null)
+    string? PrivateRepositoryOwner = null,
+    int? WorkerRetryMaxAttempts = null,
+    TimeSpan? WorkerRetryMaxElapsed = null,
+    TimeSpan? WorkerRetryBaseDelay = null,
+    TimeSpan? ResearchFailureCooldown = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
     public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(14);
+    // Worker retries have their own bounds.  They intentionally do not reuse
+    // the pull-request repair budget: a transient worker failure is a
+    // different failure domain from a repeatedly failing review check.
+    public int EffectiveWorkerRetryMaxAttempts => WorkerRetryMaxAttempts ?? 3;
+    public TimeSpan EffectiveWorkerRetryMaxElapsed => WorkerRetryMaxElapsed ?? TimeSpan.FromHours(2);
+    public TimeSpan EffectiveWorkerRetryBaseDelay => WorkerRetryBaseDelay ?? TimeSpan.FromMinutes(5);
+    public TimeSpan EffectiveResearchFailureCooldown => ResearchFailureCooldown ?? TimeSpan.FromHours(1);
 
     public static WorkerConfig Load(string path)
     {
@@ -63,6 +76,10 @@ public sealed record WorkerConfig(
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
         if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
         if (ResearchCooldown is { } researchCooldown && researchCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchCooldown must be positive.");
+        if (WorkerRetryMaxAttempts is { } workerRetryMaxAttempts && workerRetryMaxAttempts < 1) throw new InvalidDataException("workerRetryMaxAttempts must be positive.");
+        if (WorkerRetryMaxElapsed is { } workerRetryMaxElapsed && workerRetryMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("workerRetryMaxElapsed must be positive.");
+        if (WorkerRetryBaseDelay is { } workerRetryBaseDelay && workerRetryBaseDelay <= TimeSpan.Zero) throw new InvalidDataException("workerRetryBaseDelay must be positive.");
+        if (ResearchFailureCooldown is { } researchFailureCooldown && researchFailureCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchFailureCooldown must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");
@@ -379,6 +396,312 @@ public static class ClarificationPolicy
         if (unique != decision.Children.Length) throw new InvalidDataException("Each split child must own a unique repository.");
     }
 }
+
+/// <summary>
+/// The only blocker values a worker result may use.  Keeping this list closed
+/// is important: a free-form blocker must never silently become a retry or a
+/// ReadyForReview transition.
+/// </summary>
+public static class WorkerBlockerKinds
+{
+    public const string None = "none";
+    public const string TransientWorker = "transientWorker";
+    public const string WorkerRepairable = "workerRepairable";
+    public const string UpstreamDependency = "upstreamDependency";
+    public const string MissingCredential = "missingCredential";
+    public const string MissingHardware = "missingHardware";
+    public const string MissingInput = "missingInput";
+    public const string UserDecision = "userDecision";
+    public const string PolicyRestriction = "policyRestriction";
+    public const string HumanReview = "humanReview";
+
+    public static IReadOnlySet<string> All { get; } = new HashSet<string>(StringComparer.Ordinal)
+    {
+        None,
+        TransientWorker,
+        WorkerRepairable,
+        UpstreamDependency,
+        MissingCredential,
+        MissingHardware,
+        MissingInput,
+        UserDecision,
+        PolicyRestriction,
+        HumanReview
+    };
+
+    public static bool IsRetryable(string kind) => kind is TransientWorker or WorkerRepairable;
+}
+
+public sealed record WorkerBlocker(string Kind, string Summary, string[] Evidence)
+{
+    public bool IsRetryable => WorkerBlockerKinds.IsRetryable(Kind);
+    public bool IsHumanReview => Kind == WorkerBlockerKinds.HumanReview;
+}
+
+public sealed record WorkerResult(
+    string Status,
+    string Summary,
+    bool WorkComplete,
+    WorkerBlocker Blocker,
+    bool IsLegacy = false);
+
+/// <summary>
+/// Parses the lifecycle part of a Codex result independently from the
+/// repository publication manifest.  New Codex invocations use strict mode;
+/// persisted journals may opt into the narrow legacy defaults below so an old
+/// worker journal can still be recovered safely.
+/// </summary>
+public static class WorkerResultPolicy
+{
+    private static readonly string[] Statuses = ["completed", "noChanges", "blocked"];
+
+    public static WorkerResult Parse(string json, bool allowLegacy = false)
+    {
+        using var document = JsonDocument.Parse(json);
+        return Parse(document.RootElement, allowLegacy);
+    }
+
+    public static WorkerResult Parse(JsonElement root, bool allowLegacy = false)
+    {
+        if (root.ValueKind != JsonValueKind.Object) throw new InvalidDataException("Worker result must be a JSON object.");
+
+        var statusValue = OptionalString(root, "status");
+        if (string.IsNullOrWhiteSpace(statusValue)) throw new InvalidDataException("Worker result requires a non-empty 'status'.");
+        var status = Statuses.FirstOrDefault(value => value.Equals(statusValue.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (status is null) throw new InvalidDataException("Worker result status must be 'completed', 'noChanges', or 'blocked'.");
+
+        var summary = OptionalString(root, "summary");
+        var hasSummary = !string.IsNullOrWhiteSpace(summary);
+        if (!hasSummary && !allowLegacy) throw new InvalidDataException("Worker result requires a non-empty 'summary'.");
+        summary = hasSummary ? summary!.Trim() : "Legacy worker result";
+
+        var workCompleteProperty = FindProperty(root, "workComplete");
+        if (workCompleteProperty is { } workValue && workValue.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) workCompleteProperty = null;
+        var blockerProperty = FindProperty(root, "blocker");
+        if (blockerProperty is { } blockerValue && blockerValue.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) blockerProperty = null;
+        var isLegacy = workCompleteProperty is null || blockerProperty is null || !hasSummary;
+        if (isLegacy && !allowLegacy)
+            throw new InvalidDataException("New worker results require workComplete and blocker.");
+
+        var workComplete = workCompleteProperty is { } workElement
+            ? ReadBoolean(workElement, "workComplete")
+            : status != "blocked";
+        var blocker = blockerProperty is { } blockerElement
+            ? ParseBlocker(blockerElement, summary!, allowLegacy)
+            : LegacyBlocker(status, summary!);
+
+        ValidateCombination(status, workComplete, blocker);
+        return new WorkerResult(status, summary!, workComplete, blocker, isLegacy);
+    }
+
+    public static bool TryParse(string json, out WorkerResult? result, out string? error, bool allowLegacy = false)
+    {
+        try
+        {
+            result = Parse(json, allowLegacy);
+            error = null;
+            return true;
+        }
+        catch (Exception exception) when (exception is JsonException or InvalidDataException or InvalidOperationException)
+        {
+            result = null;
+            error = exception.Message;
+            return false;
+        }
+    }
+
+    public static void ValidateCombination(string status, bool workComplete, WorkerBlocker blocker)
+    {
+        if (!WorkerBlockerKinds.All.Contains(blocker.Kind))
+            throw new InvalidDataException($"Worker blocker kind '{blocker.Kind}' is not allowed.");
+        if (string.IsNullOrWhiteSpace(blocker.Summary)) throw new InvalidDataException("Worker blocker requires a non-empty summary.");
+        if (blocker.Evidence is null || blocker.Evidence.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidDataException("Worker blocker evidence must contain only non-empty strings.");
+
+        if (blocker.Kind == WorkerBlockerKinds.HumanReview && !workComplete)
+            throw new InvalidDataException("humanReview requires workComplete=true.");
+
+        if (status is "completed" or "noChanges")
+        {
+            if (!workComplete) throw new InvalidDataException($"{status} requires workComplete=true.");
+            if (blocker.Kind is not (WorkerBlockerKinds.None or WorkerBlockerKinds.HumanReview))
+                throw new InvalidDataException($"{status} may use only blocker none or humanReview.");
+            return;
+        }
+
+        if (blocker.Kind == WorkerBlockerKinds.None)
+            throw new InvalidDataException("blocked requires a non-none blocker.");
+        if (blocker.Kind == WorkerBlockerKinds.HumanReview)
+            throw new InvalidDataException("humanReview is valid only for completed or noChanges results.");
+    }
+
+    private static WorkerBlocker ParseBlocker(JsonElement property, string resultSummary, bool allowLegacy)
+    {
+        if (property.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("Worker result blocker must be an object.");
+        var kindValue = OptionalString(property, "kind");
+        var summary = OptionalString(property, "summary");
+        var evidenceProperty = FindProperty(property, "evidence");
+        var complete = !string.IsNullOrWhiteSpace(kindValue) && !string.IsNullOrWhiteSpace(summary)
+            && evidenceProperty is { } evidenceElement && evidenceElement.ValueKind == JsonValueKind.Array;
+        if (!complete && !allowLegacy)
+            throw new InvalidDataException("Worker result blocker requires kind, summary, and evidence.");
+        if (!complete)
+        {
+            // A malformed legacy blocked result is deliberately treated as an
+            // external blocker.  It cannot accidentally receive a retry.
+            return LegacyBlocker("blocked", resultSummary);
+        }
+
+        var kind = WorkerBlockerKinds.All.FirstOrDefault(value => value.Equals(kindValue!.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (kind is null) throw new InvalidDataException($"Worker blocker kind '{kindValue}' is not allowed.");
+        if (evidenceProperty!.Value.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Worker blocker evidence must be an array of strings.");
+        var evidence = evidenceProperty.Value.EnumerateArray().Select(item =>
+        {
+            if (item.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(item.GetString()))
+                throw new InvalidDataException("Worker blocker evidence must contain only non-empty strings.");
+            return item.GetString()!.Trim();
+        }).ToArray();
+        return new WorkerBlocker(kind, summary!.Trim(), evidence);
+    }
+
+    private static WorkerBlocker LegacyBlocker(string status, string summary) => status == "blocked"
+        ? new WorkerBlocker(WorkerBlockerKinds.UpstreamDependency, summary, [])
+        : new WorkerBlocker(WorkerBlockerKinds.None, summary, []);
+
+    private static bool ReadBoolean(JsonElement property, string name)
+    {
+        if (property.ValueKind is JsonValueKind.True or JsonValueKind.False) return property.GetBoolean();
+        throw new InvalidDataException($"Worker field '{name}' must be a boolean.");
+    }
+
+    private static string? OptionalString(JsonElement root, string name)
+    {
+        var property = FindProperty(root, name);
+        if (property is null || property.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return null;
+        if (property.Value.ValueKind != JsonValueKind.String) throw new InvalidDataException($"Worker field '{name}' must be a string.");
+        return property.Value.GetString();
+    }
+
+    private static JsonElement? FindProperty(JsonElement root, string name)
+    {
+        foreach (var property in root.EnumerateObject())
+            if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase)) return property.Value;
+        return null;
+    }
+}
+
+public sealed record WorkerFailureClassification(string Kind, string Summary, string Fingerprint)
+{
+    public bool Retryable => WorkerBlockerKinds.IsRetryable(Kind);
+}
+
+/// <summary>
+/// Classifies worker-owned failures by stable categories.  Explicit credential,
+/// hardware, and human-decision signals are intentionally checked before broad
+/// transient patterns so they cannot be retried forever from free-form text.
+/// </summary>
+public static class WorkerFailurePolicy
+{
+    public static WorkerFailureClassification Classify(Exception exception)
+    {
+        var text = Flatten(exception);
+        var normalized = text.ToLowerInvariant();
+        var kind = ClassifyKind(exception, normalized);
+        var summary = Limit(text, 1_500);
+        var fingerprint = WorkerRetryPolicy.Fingerprint(kind, text);
+        return new WorkerFailureClassification(kind, summary, fingerprint);
+    }
+
+    private static string ClassifyKind(Exception exception, string text)
+    {
+        if (ContainsAny(text, "credential", "authentication failed", "authentication token", "not logged in", "login required", "github token", "gh auth", "unauthorized", "http 401", "permission denied (publickey)"))
+            return WorkerBlockerKinds.MissingCredential;
+        if (ContainsAny(text, "gpu", "cuda", "device not found", "no hardware", "hardware unavailable", "runner.os", "virtualization"))
+            return WorkerBlockerKinds.MissingHardware;
+        if (ContainsAny(text, "user decision", "waiting for user", "manual approval", "human approval", "needs review", "clarification required"))
+            return WorkerBlockerKinds.UserDecision;
+        if (exception is System.ComponentModel.Win32Exception or FileNotFoundException)
+            return WorkerBlockerKinds.TransientWorker;
+        if (ContainsAny(text, "rate limit", "rate-limit", "too many requests", "429", "quota", "usage limit", "overloaded", "temporarily unavailable", "service unavailable", "try again later", "timed out", "timeout", "connection reset", "connection refused", "socket", "network", "dns", "could not resolve", "github api", "api request failed", "git fetch", "git push", "process failed to start", "failed to start", "failed to launch", "could not start", "cannot start", "executable not found", "no such file or directory", "system cannot find", "process start", "tool failed", "502", "503", "504"))
+            return WorkerBlockerKinds.TransientWorker;
+        if (ContainsAny(text, "merge conflict", "conflicting", "worktree is dirty", "workspace", "structured result", "codex result", "repository manifest", "result change flag"))
+            return WorkerBlockerKinds.WorkerRepairable;
+        if (exception is IOException or InvalidDataException)
+            return WorkerBlockerKinds.WorkerRepairable;
+        // Unknown process failures are worker-owned until bounded retries prove
+        // otherwise. External gates must be reported explicitly by the
+        // structured result instead of being inferred from an opaque exception.
+        return WorkerBlockerKinds.WorkerRepairable;
+    }
+
+    private static bool ContainsAny(string value, params string[] needles) => needles.Any(value.Contains);
+
+    private static string Flatten(Exception exception)
+    {
+        var values = new List<string>();
+        for (var current = exception; current is not null; current = current.InnerException)
+            if (!string.IsNullOrWhiteSpace(current.Message)) values.Add(current.Message.Trim());
+        return string.Join(" | ", values);
+    }
+
+    private static string Limit(string value, int maxLength) => value.Length <= maxLength ? value : value[..maxLength] + "...";
+}
+
+public static class WorkerRetryPolicy
+{
+    public static string Fingerprint(string kind, string detail)
+    {
+        var normalized = string.Join(' ', detail.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).ToLowerInvariant();
+        var digest = SHA256.HashData(Encoding.UTF8.GetBytes(kind + "\n" + normalized));
+        return Convert.ToHexString(digest).ToLowerInvariant();
+    }
+
+    public static bool HasSafeMetadata(Job job) => job.Phase == JobPhases.RetryWaiting
+        && job.WorkerRetryAttempts > 0
+        && !string.IsNullOrWhiteSpace(job.WorkerRetryFingerprint)
+        && job.WorkerRetryStartedUtc is not null
+        && job.WorkerRetryNextUtc is not null;
+
+    public static bool IsDue(Job job, DateTime nowUtc) => HasSafeMetadata(job) && nowUtc >= job.WorkerRetryNextUtc!.Value;
+
+    public static bool TrySchedule(Job job, string kind, string summary, DateTime nowUtc, WorkerConfig config, out TimeSpan delay)
+    {
+        delay = TimeSpan.Zero;
+        if (!WorkerBlockerKinds.IsRetryable(kind)) return false;
+
+        var fingerprint = Fingerprint(kind, summary);
+        var same = string.Equals(job.WorkerRetryFingerprint, fingerprint, StringComparison.Ordinal);
+        job.WorkerRetryStartedUtc ??= nowUtc;
+        if (nowUtc - job.WorkerRetryStartedUtc.Value >= config.EffectiveWorkerRetryMaxElapsed) return false;
+        if (!same) job.WorkerRetryAttempts = 0;
+        if (job.WorkerRetryAttempts >= config.EffectiveWorkerRetryMaxAttempts) return false;
+
+        job.WorkerRetryFingerprint = fingerprint;
+        job.WorkerRetryLastKind = kind;
+        job.WorkerRetryLastSummary = summary;
+        job.WorkerRetryAttempts++;
+        var exponent = Math.Min(job.WorkerRetryAttempts - 1, 10);
+        var multiplier = Math.Pow(2, exponent);
+        var seconds = Math.Min(config.EffectiveWorkerRetryBaseDelay.TotalSeconds * multiplier, TimeSpan.FromHours(1).TotalSeconds);
+        delay = TimeSpan.FromSeconds(Math.Max(1, seconds));
+        job.WorkerRetryNextUtc = nowUtc + delay;
+        return true;
+    }
+
+    public static void Clear(Job job)
+    {
+        job.WorkerRetryAttempts = 0;
+        job.WorkerRetryStartedUtc = null;
+        job.WorkerRetryNextUtc = null;
+        job.WorkerRetryFingerprint = null;
+        job.WorkerRetryLastKind = null;
+        job.WorkerRetryLastSummary = null;
+        job.WorkerRetryMode = null;
+    }
+}
+
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
 
 public sealed record WorkspaceBranchCandidate(string Branch, string Directory);
@@ -536,6 +859,17 @@ public sealed class Job
     public bool BlockedReassessmentAttempted { get; set; }
     public bool AdoptedBlockedWorkspace { get; set; }
     public bool AdoptedResultReassessmentAttempted { get; set; }
+    public int WorkerRetryAttempts { get; set; }
+    public DateTime? WorkerRetryStartedUtc { get; set; }
+    public DateTime? WorkerRetryNextUtc { get; set; }
+    public string? WorkerRetryFingerprint { get; set; }
+    public string? WorkerRetryLastKind { get; set; }
+    public string? WorkerRetryLastSummary { get; set; }
+    public string? WorkerRetryMode { get; set; }
+    public string? LastBlockerKind { get; set; }
+    public string? LastBlockerSummary { get; set; }
+    public string[] LastBlockerEvidence { get; set; } = [];
+    public bool HumanReviewRequested { get; set; }
 }
 
 public static class AdoptedWorkspaceResultPolicy
@@ -638,6 +972,7 @@ public static class JobPhases
     public const string Repairing = "Repairing";
     public const string Publishing = "Publishing";
     public const string Monitoring = "Monitoring";
+    public const string RetryWaiting = "Retry waiting";
     public const string Blocked = "Blocked";
     public const string Done = "Done";
 }
@@ -661,8 +996,10 @@ public sealed class Journal
 
 public static class RecoveryPlanner
 {
-    public static IReadOnlyList<Job> JobsToRequeue(Journal journal) => journal.Jobs
+    public static IReadOnlyList<Job> JobsToRequeue(Journal journal, DateTime? nowUtc = null) => journal.Jobs
         .Where(job => job.Phase is not (JobPhases.Done or JobPhases.Blocked or JobPhases.Monitoring))
+        .Where(job => job.Phase != JobPhases.RetryWaiting
+            || (WorkerRetryPolicy.HasSafeMetadata(job) && (nowUtc is null || WorkerRetryPolicy.IsDue(job, nowUtc.Value))))
         .OrderBy(job => job.StartedUtc)
         .ToArray();
 
@@ -671,6 +1008,9 @@ public static class RecoveryPlanner
         JobPhases.Publishing when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
         JobPhases.Repairing => RecoveryMode.ResumeRepair,
         JobPhases.Implementing when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.RetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
+        JobPhases.RetryWaiting when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
+        JobPhases.RetryWaiting when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
         JobPhases.Publishing => RecoveryMode.UnrecoverablePublication,
         _ => RecoveryMode.Initial
     };
@@ -1143,6 +1483,11 @@ public static class BlockedWorkspaceAdoption
         candidate.BlockedReassessmentAttempted = false;
         candidate.AdoptedBlockedWorkspace = true;
         candidate.AdoptedResultReassessmentAttempted = false;
+        WorkerRetryPolicy.Clear(candidate);
+        candidate.LastBlockerKind = null;
+        candidate.LastBlockerSummary = null;
+        candidate.LastBlockerEvidence = [];
+        candidate.HumanReviewRequested = false;
         return candidate;
     }
 
