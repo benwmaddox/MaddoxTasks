@@ -534,6 +534,14 @@ public sealed class Job
     [System.Text.Json.Serialization.JsonIgnore]
     public bool TaskUpdateInFlight { get; set; }
     public bool BlockedReassessmentAttempted { get; set; }
+    public bool AdoptedBlockedWorkspace { get; set; }
+    public bool AdoptedResultReassessmentAttempted { get; set; }
+}
+
+public static class AdoptedWorkspaceResultPolicy
+{
+    public static bool ShouldReassess(bool adoptedBlockedWorkspace, bool reassessmentAttempted, bool reportedChanged, bool repositoryChanged)
+        => adoptedBlockedWorkspace && !reassessmentAttempted && !reportedChanged && repositoryChanged;
 }
 
 public static class TaskUpdatePolicy
@@ -1101,6 +1109,8 @@ public static class BlockedWorkspaceAdoption
         candidate.TaskUpdateWindowClosed = false;
         candidate.TaskUpdateInFlight = false;
         candidate.BlockedReassessmentAttempted = false;
+        candidate.AdoptedBlockedWorkspace = true;
+        candidate.AdoptedResultReassessmentAttempted = false;
         return candidate;
     }
 

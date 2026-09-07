@@ -946,6 +946,8 @@ public sealed class WorkerPolicyTests
         Assert.Equal("Refreshed title", adopted!.Task.Title);
         Assert.Equal(JobPhases.Claimed, adopted.Phase);
         Assert.Equal("new-prompt", adopted.Prompt);
+        Assert.True(adopted.AdoptedBlockedWorkspace);
+        Assert.False(adopted.AdoptedResultReassessmentAttempted);
         Assert.Single(journal.Jobs, job => job.Phase == JobPhases.Claimed);
         Assert.Equal(2, journal.Jobs.Count(job => job.Phase == JobPhases.Blocked));
     }
@@ -963,6 +965,22 @@ public sealed class WorkerPolicyTests
 
         Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [mismatch] }, claimed, directory.Path, DateTime.UtcNow));
         Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [noWorkspace] }, claimed, directory.Path, DateTime.UtcNow));
+    }
+
+    [Theory]
+    [InlineData(true, false, false, true, true)]
+    [InlineData(false, false, false, true, false)]
+    [InlineData(true, true, false, true, false)]
+    [InlineData(true, false, true, true, false)]
+    [InlineData(true, false, false, false, false)]
+    public void AdoptedWorkspaceResultPolicy_ReassessesOnlyOneUnreportedRetainedChange(
+        bool adopted,
+        bool attempted,
+        bool reportedChanged,
+        bool repositoryChanged,
+        bool expected)
+    {
+        Assert.Equal(expected, AdoptedWorkspaceResultPolicy.ShouldReassess(adopted, attempted, reportedChanged, repositoryChanged));
     }
 
     [Fact]
