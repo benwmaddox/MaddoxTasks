@@ -178,6 +178,53 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void RecoveryPlanner_SelectsAdoptedModeFromDurablePullRequestState()
+    {
+        var unfinished = CreateJob();
+        var monitoring = CreateJob();
+        monitoring.PullRequests.Add(new PullRequestState("https://github.com/example/Repo/pull/1", "Repo"));
+        var repairing = CreateJob();
+        repairing.PullRequests.Add(new PullRequestState("https://github.com/example/Repo/pull/2", "Repo"));
+        repairing.PendingCheckFailures.Add(new CheckState("build", "FAILURE", "fail", "check"));
+        var feedbackRepair = CreateJob();
+        feedbackRepair.PullRequests.Add(new PullRequestState("https://github.com/example/Repo/pull/3", "Repo"));
+        feedbackRepair.PendingFeedback.Add(new ReviewFeedback("thread", "comment", 1, "fix", "https://github.com/example/Repo/pull/3#discussion_r1"));
+
+        Assert.Equal(RecoveryMode.Initial, RecoveryPlanner.ModeForAdopted(unfinished));
+        Assert.Equal(RecoveryMode.Monitoring, RecoveryPlanner.ModeForAdopted(monitoring));
+        Assert.Equal(RecoveryMode.ResumeRepair, RecoveryPlanner.ModeForAdopted(repairing));
+        Assert.Equal(RecoveryMode.ResumeRepair, RecoveryPlanner.ModeForAdopted(feedbackRepair));
+    }
+
+    [Theory]
+    [InlineData("main", true)]
+    [InlineData("release/1.2", true)]
+    [InlineData("--upload-pack=bad", false)]
+    [InlineData("refs/heads/main..evil", false)]
+    [InlineData("feature branch", false)]
+    [InlineData("feature@{1}", false)]
+    [InlineData("release/.hidden", false)]
+    [InlineData("release/main.lock", false)]
+    public void MergeBasePolicy_RejectsUnsafeRefs(string baseRefName, bool expected)
+        => Assert.Equal(expected, MergeBasePolicy.IsValid(baseRefName));
+
+    [Fact]
+    public void RepairRetryPolicy_RearmsObservedChecksWithoutResettingAttemptBounds()
+    {
+        var job = CreateJob();
+        var failure = new CheckState("build", "FAILURE", "fail", "check");
+        job.PendingCheckFailures.Add(failure);
+        job.ProcessedCheckIds.Add(failure.Id);
+        job.RepairAttemptsByPullRequest["https://github.com/example/Repo/pull/1"] = 2;
+
+        RepairRetryPolicy.RearmChecks(job, [failure]);
+
+        Assert.Empty(job.PendingCheckFailures);
+        Assert.DoesNotContain(failure.Id, job.ProcessedCheckIds);
+        Assert.Equal(2, job.RepairAttemptsByPullRequest["https://github.com/example/Repo/pull/1"]);
+    }
+
+    [Fact]
     public void Journal_LoadsLegacyJobsWithoutTaskUpdateState()
     {
         using var directory = new TemporaryDirectory();
