@@ -1343,6 +1343,12 @@ public static class RepairRetryPolicy
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(payload))).ToLowerInvariant();
     }
 
+    public static string GenerationFingerprint(
+        PullRequestState pullRequest,
+        IEnumerable<CheckState> pendingChecks,
+        IEnumerable<ReviewFeedback> pendingFeedback)
+        => GenerationFingerprint(pullRequest.Url, pullRequest.HeadOid, pendingChecks, pendingFeedback);
+
     public static bool BeginGeneration(
         Job job,
         string pullRequestUrl,
@@ -1371,6 +1377,14 @@ public static class RepairRetryPolicy
         IEnumerable<ReviewFeedback> pendingFeedback,
         DateTime nowUtc)
         => BeginGeneration(job, pullRequestUrl, headOid, pendingChecks, pendingFeedback, nowUtc);
+
+    public static bool BeginGeneration(
+        Job job,
+        PullRequestState pullRequest,
+        IEnumerable<CheckState> pendingChecks,
+        IEnumerable<ReviewFeedback> pendingFeedback,
+        DateTime nowUtc)
+        => BeginGeneration(job, pullRequest.Url, pullRequest.HeadOid, pendingChecks, pendingFeedback, nowUtc);
 
     public static void RearmChecks(Job job, IEnumerable<CheckState> checks)
     {
