@@ -50,7 +50,8 @@ public sealed class WorkerHost
         var ct = linked.Token;
         Directory.CreateDirectory(config.Current.WorktreeRoot);
         await PreflightAsync(ct);
-        foreach (var job in RecoveryPlanner.JobsToRequeue(journal)) Enqueue(job, RecoveryPlanner.ModeFor(job));
+        await RecoverInvalidRetryMetadataAsync(ct);
+        foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
         var wakeReasons = SchedulerWakeReason.Timer;
@@ -67,13 +68,16 @@ public sealed class WorkerHost
                 if (refillRequested) cadence.RequestImmediateRefill(now);
                 var automaticDue = cadence.IsDue(now, config.Current);
                 var followup = !followups.IsEmpty;
-                if (automaticDue || followup)
+                var retryDue = EnqueueDueRetries(now);
+                if (automaticDue || followup || retryDue)
                 {
                     var outcome = await TickAsync(ct, automaticDue, allowResearch: true);
                     now = clock.UtcNow;
                     if (automaticDue) cadence.CompleteTick(outcome, now);
                 }
                 nextTickUtc = cadence.NextTickUtc(config.Current);
+                var nextRetry = NextRetryUtc();
+                if (nextRetry is { } retryAt && retryAt < nextTickUtc) nextTickUtc = retryAt;
                 await RenderAsync();
                 wakeReasons = await WaitForTickAsync(nextTickUtc - clock.UtcNow, ct);
             }
@@ -95,12 +99,20 @@ public sealed class WorkerHost
         if (TryGetCodexUnavailableUntil(out var unavailableUntilUtc))
         {
             log.Write("warning", "codex.usage.deferred", new { unavailableUntilUtc });
+            foreach (var job in SnapshotJobs(JobPhases.StatusSyncPending))
+            {
+                try { await SyncBlockedAsync(job, ct); }
+                catch (Exception exception) { log.Write("warning", "job.block.sync.deferred", new { job.Task.Sequence, error = exception.Message }); }
+            }
             return FreshClaimOutcome.Unavailable;
         }
         if (allowResearch && !paused)
         {
             await TryStartResearchAsync(ct);
         }
+        foreach (var job in SnapshotJobs(JobPhases.StatusSyncPending))
+            Enqueue(job, RecoveryMode.SyncBlocked);
+        EnqueueDueRetries(clock.UtcNow);
         DrainFollowups(ct);
         if (paused || !allowFreshClaim) return FreshClaimOutcome.NotAttempted;
         var freshClaim = new FreshClaimAllowance();
@@ -165,13 +177,70 @@ public sealed class WorkerHost
         return FreshClaimOutcome.NotAttempted;
     }
 
+    private bool EnqueueDueRetries(DateTime? nowUtc = null)
+    {
+        var now = nowUtc ?? clock.UtcNow;
+        var due = SnapshotJobs(job => WorkerRetryPolicy.IsDue(job, now));
+        foreach (var job in due) Enqueue(job, RecoveryPlanner.ModeFor(job));
+        return due.Length > 0;
+    }
+
+    private DateTime? NextRetryUtc()
+    {
+        lock (journalGate)
+            return journal.Jobs
+                .Where(job => WorkerRetryPolicy.HasSafeMetadata(job))
+                .Select(job => job.WorkerRetryNextUtc)
+                .Where(value => value is not null)
+                .Min();
+    }
+
+    private async Task RecoverInvalidRetryMetadataAsync(CancellationToken ct)
+    {
+        Job[] invalid;
+        lock (journalGate)
+            invalid = journal.Jobs
+                .Where(job => job.Phase == JobPhases.RetryWaiting && !WorkerRetryPolicy.HasSafeMetadata(job))
+                .ToArray();
+        foreach (var job in invalid)
+        {
+            if (!WorkerRetryPolicy.TryReconstruct(job, clock.UtcNow, config.Current, out var reconstruction)) continue;
+            await AddCommentAsync(job, "Worker recovered an interrupted retry: " + reconstruction.Reason, ct);
+            Save(job);
+        }
+    }
+
     private void DrainFollowups(CancellationToken ct)
     {
         while (capacity.TryReserve())
         {
             if (!followups.TryDequeue(out var item)) { capacity.Release(); return; }
+            MarkWorkItemDispatched(item);
             lock (queueGate) queued.Remove(item.Job.Task.IssueId);
             _ = RunReservedJobAsync(item.Job, item.Mode, ct);
+        }
+    }
+
+    private void MarkWorkItemDispatched(WorkItem item)
+    {
+        if (item.Mode is not (RecoveryMode.ResumeInitial or RecoveryMode.ResumeRepair or RecoveryMode.Initial)) return;
+        lock (journalGate)
+        {
+            // A due RetryWaiting item is still visible to the scheduler until
+            // ProcessJobAsync begins.  Marking it as dispatched before
+            // releasing queue ownership closes that duplicate-launch window;
+            // if the host crashes here, normal startup recovery sees the
+            // implementing/repairing phase and resumes the same work.
+            var phase = item.Mode == RecoveryMode.ResumeRepair ? JobPhases.Repairing : JobPhases.Implementing;
+            if (item.Job.Phase == JobPhases.RetryWaiting) item.Job.Phase = phase;
+            if (WorkerRetryPolicy.ShouldStartFreshSession(item.Job))
+            {
+                item.Job.ThreadId = null;
+                item.Job.ExactReservationOwnerRecorded = false;
+                item.Job.WorkerRetryFreshSession = false;
+            }
+            item.Job.PhaseChangedUtc = clock.UtcNow;
+            journal.Save(journalPath);
         }
     }
 
@@ -188,7 +257,8 @@ public sealed class WorkerHost
         try
         {
             var cooldown = settings.EffectiveResearchCooldown.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
-            var claim = await RunMaddoxCommandAsync(["research-claim", "--cooldown", cooldown], ct);
+            var failureCooldown = settings.EffectiveResearchFailureCooldown.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
+            var claim = await RunMaddoxCommandAsync(["research-claim", "--cooldown", cooldown, "--failure-cooldown", failureCooldown], ct);
             if (claim.ExitCode != 0)
             {
                 log.Write("warning", "research.claim.failed", new { error = claim.Error.Trim(), output = claim.Output.Trim() });
@@ -226,10 +296,10 @@ public sealed class WorkerHost
         {
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(settings.ClarificationTimeout);
-            var blockedTasks = await RunMaddoxCommandAsync(["issues", "--status", "Blocked"], ct);
-            if (blockedTasks.ExitCode != 0)
-                throw new InvalidOperationException("Could not load blocked-task research context: " + blockedTasks.Error.Trim());
-            await File.WriteAllTextAsync(snapshotPath, BuildResearchSnapshot(task, blockedTasks.Output), ct);
+            var tasks = await RunMaddoxCommandAsync(["issues"], ct);
+            if (tasks.ExitCode != 0)
+                throw new InvalidOperationException("Could not load task research context: " + tasks.Error.Trim());
+            await File.WriteAllTextAsync(snapshotPath, BuildResearchSnapshot(task, tasks.Output), ct);
             var prompt = BuildResearchPrompt(task, snapshotPath);
             var arguments = BuildResearchCodexArguments(settings, schema, prompt);
 
@@ -353,7 +423,7 @@ public sealed class WorkerHost
         try
         {
             await RunRequiredCommandAsync(
-                new { type = "AddComment", issueId = task.IssueId, comment = "Research worker could not complete: " + reason },
+                new { type = "AddComment", issueId = task.IssueId, comment = ResearchFailureMarkerPrefix + reason },
                 ResearchPlanPolicy.Actor,
                 ct);
         }
@@ -415,19 +485,20 @@ public sealed class WorkerHost
             "-m", settings.Model, "-c", $"model_reasoning_effort={settings.ReasoningEffort}",
             "--sandbox", "read-only", "--skip-git-repo-check", "-C", settings.RepoRoot, prompt];
 
-    public static string BuildResearchSnapshot(TaskDto sourceTask, string blockedTasksJson)
+    public static string BuildResearchSnapshot(TaskDto sourceTask, string tasksJson)
     {
-        using var blockedTasks = JsonDocument.Parse(blockedTasksJson);
-        if (blockedTasks.RootElement.ValueKind != JsonValueKind.Array)
-            throw new InvalidDataException("Blocked-task research context must be a JSON array.");
-        return JsonSerializer.Serialize(new { selectedTask = sourceTask, blockedTasks = blockedTasks.RootElement });
+        using var tasks = JsonDocument.Parse(tasksJson);
+        if (tasks.RootElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Task research context must be a JSON array.");
+        return JsonSerializer.Serialize(new { selectedTask = sourceTask, tasks = tasks.RootElement });
     }
 
     public static string BuildResearchPrompt(TaskDto sourceTask, string snapshotPath)
-        => "You are the Maddox blocked-task research worker. Investigate the selected source task identified below. Parse the worker-supplied snapshot locally to read its description and comments and identify the current blocker. The snapshot also contains the current Blocked task records so cross-task triage objectives can inspect and update relevant tasks. It is bounded task context, not direct database access. Read selected fields or recent comments in bounded chunks if histories are long; do not load the entire file into the prompt.\n\n"
-            + "Use the available live web search tools to investigate the blocker and find a concrete way to resolve it. Start with focused queries based on this task; open relevant results, prefer primary sources and current documentation, and cite source URLs in your findings. Distinguish verified facts from suggested next steps. If search cannot resolve the blocker or the search tools are unavailable, explain what is missing and leave the task blocked.\n\n"
-            + "This is a read-only investigation. You may perform read-only web or other external research when useful. Do not edit files, run commands that mutate state, use Git or GitHub for mutations, create branches, commit, push, open or merge pull requests, send messages, or perform any external mutation or other side effect. The worker process alone will apply the returned task-entry mutations through MaddoxTasks after validating them.\n\n"
-            + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to completed only when the source objective is fully satisfied by the proposed task-entry mutations and requires no repository implementation. Set outcome to unblocked when the proposed changes remove the blocker but the source still needs normal implementation. Otherwise set stillBlocked. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
+        => "You are the Maddox blocked-task recovery researcher. Investigate the selected source task identified below. Parse the worker-supplied snapshot locally to read its full description and comments and identify the current blocker. The snapshot contains all current task records, including parents, children, dependencies, and terminal work, so verify current state instead of trusting a stale blocker comment. Read selected fields or recent comments in bounded chunks if histories are long; do not load the entire file into the prompt.\n\n"
+            + "Use the available live web search tools for read-only web research, read-only local repository inspection, and read-only Git or GitHub CLI queries when useful. Check referenced pull requests, releases, workflows, prerequisite tasks, and available tooling directly. Prefer primary sources and current evidence, cite source URLs in findings, and distinguish verified facts from suggestions. A transient process, emulator, validation, usage-limit, stale-dependency, or prior worker-policy failure is not a true task blocker: establish the next executable attempt and return unblocked.\n\n"
+            + "This is a read-only investigation. Do not edit files, run commands that mutate state, use Git or GitHub for mutations, create branches, commit, push, open or merge pull requests, send messages, or perform any external mutation or other side effect. The worker process alone will apply the returned task-entry mutations through MaddoxTasks after validating them.\n\n"
+            + "Actively route dependency blockers. If an explicitly required prerequisite task is missing, you may propose one narrowly scoped CreateIssue with the correct repository and parent. If a prerequisite exists, use current task, release, workflow, and PR state to update or activate that prerequisite rather than repeatedly blocking the downstream source. A coordination parent whose objective is fully satisfied by terminal children may be completed. A source whose implementation PR is merged may be completed only when the source acceptance criteria are actually satisfied; do not invent visual, device, credential, or other acceptance requirements absent from the task.\n\n"
+            + "You may propose only these task-entry mutations: AddComment, UpdateDescription, ChangePriority, AddLabel, RemoveLabel, SetRepositoryLabels, ChangeStatus on an existing task other than the source task, and CreateIssue. You may include repository labels on a newly created issue; the worker will create it and then apply those labels. Never directly change the source task status. Set outcome to completed only when the source objective is fully satisfied by current evidence or the proposed task-entry mutations and requires no repository implementation. Set outcome to unblocked when the normal worker can now attempt or repair the source task; zero mutations are allowed when the research itself establishes that. Otherwise set stillBlocked, with concrete evidence of the exact unavailable user input, credential, hardware, or authorization and the smallest action that would unblock it. Every mutation object must include every schema field; set fields that do not apply to that mutation type to null. Return JSON matching the supplied schema, with concise findings explaining the evidence and next step.\n\n"
             + "SOURCE TASK:\n"
             + JsonSerializer.Serialize(new { sourceTask.Sequence, sourceTask.IssueId })
             + "\n\nRESEARCH SNAPSHOT JSON FILE (authoritative for this research run; read-only):\n"
@@ -439,7 +510,8 @@ public sealed class WorkerHost
         {
             await EnsureReservationAttributionAsync(job, ct);
             if (mode == RecoveryMode.Publish) await ResumePublishingAsync(job, ct);
-            else if (mode == RecoveryMode.UnrecoverablePublication) throw new InvalidDataException("Interrupted publication predates durable structured-result journaling; preserved workspace requires manual diagnosis.");
+            else if (mode == RecoveryMode.SyncBlocked) await SyncBlockedAsync(job, ct);
+            else if (mode == RecoveryMode.UnrecoverablePublication) await RecoverLegacyPublicationAsync(job, ct);
             else await ProcessJobAsync(job, mode, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
@@ -454,26 +526,75 @@ public sealed class WorkerHost
                 job.BlockReason = $"Codex usage unavailable until {retryUtc:O}.";
                 SetPhase(job, JobPhases.Blocked);
             }
-            catch (Exception deferException) { log.Write("error", "job.defer.failed", new { job.Task.Sequence, error = deferException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
+            catch (Exception deferException)
+            {
+                log.Write("error", "job.defer.failed", new { job.Task.Sequence, error = deferException.Message, originalError = exception.Message });
+                await HandleProcessingFailureAsync(job, exception, mode, ct);
+            }
         }
         catch (Exception exception)
         {
             log.Write("error", "job.failed", new { job.Task.Sequence, error = exception.Message });
+            if (job.Phase == JobPhases.StatusSyncPending)
+            {
+                log.Write("warning", "job.block.sync.deferred", new { job.Task.Sequence, error = exception.Message });
+                return;
+            }
             try
             {
-                if (job.Workspaces.Count == 0)
-                {
-                    await AddCommentAsync(job, "Worker retry scheduled after processing failure: " + exception.Message, ct);
-                    await ChangeStatusAsync(job, "Next", ct);
-                    job.BlockReason = null;
-                    SetPhase(job, JobPhases.Done);
-                }
-                else await BlockAsync(job, exception.Message, ct);
+                await HandleProcessingFailureAsync(job, exception, mode, ct);
             }
-            catch (Exception blockException) { log.Write("error", "job.block.failed", new { job.Task.Sequence, error = blockException.Message, originalError = exception.Message }); SetPhase(job, JobPhases.Blocked); }
+            catch (Exception blockException)
+            {
+                log.Write("error", "job.block.failed", new { job.Task.Sequence, error = blockException.Message, originalError = exception.Message });
+                if (job.Phase != JobPhases.StatusSyncPending) SetPhase(job, JobPhases.StatusSyncPending);
+            }
         }
         finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); await RenderAsync(); }
     }
+
+    private async Task HandleProcessingFailureAsync(Job job, Exception exception, RecoveryMode mode, CancellationToken ct)
+    {
+        var classification = WorkerFailurePolicy.Classify(exception, clock.UtcNow);
+        job.LastBlockerKind = classification.Kind;
+        job.LastBlockerSummary = classification.Summary;
+        job.LastBlockerEvidence = [classification.Summary];
+
+        // A repository-less claim has no retained worktree to reserve.  Put a
+        // retryable worker failure back in Next so the next claim can start
+        // cleanly; durable workspaces use RetryWaiting below instead.
+        if (classification.Retryable
+            && WorkerRetryPolicy.TrySchedule(job, classification.Kind, classification.Summary, clock.UtcNow, config.Current, classification.RetryAtUtc, out var delay))
+        {
+            job.BlockReason = $"{classification.Kind}: {classification.Summary}";
+            job.WorkerRetryMode = mode is RecoveryMode.ResumeRepair ? nameof(RecoveryMode.ResumeRepair) : nameof(RecoveryMode.ResumeInitial);
+            SetPhase(job, JobPhases.RetryWaiting);
+            await AddCommentAsync(job,
+                $"Worker retry scheduled ({FormatRetryAttempt(job, classification.Kind)}) for {FormatRetryTime(job, delay)}: {classification.Summary}",
+                ct);
+            Save(job);
+            return;
+        }
+
+        var reason = classification.Retryable
+            ? $"Worker retry limit exhausted after {job.WorkerRetryAttempts} attempt(s) for fingerprint {job.WorkerRetryFingerprint}: {classification.Summary}"
+            : $"{classification.Kind}: {classification.Summary}";
+        await BlockAsync(job, reason, ct, $"{job.Model} {job.Effort}");
+    }
+
+    private static string FormatDelay(TimeSpan delay) => delay.TotalHours >= 1
+        ? $"{Math.Ceiling(delay.TotalHours):0}h"
+        : delay.TotalMinutes >= 1
+            ? $"{Math.Ceiling(delay.TotalMinutes):0}m"
+            : $"{Math.Ceiling(delay.TotalSeconds):0}s";
+
+    private static string FormatRetryAttempt(Job job, string kind) => kind == WorkerBlockerKinds.TransientWorker
+        ? $"transient attempt {job.WorkerRetryAttempts}"
+        : $"attempt {job.WorkerRetryAttempts}";
+
+    private static string FormatRetryTime(Job job, TimeSpan delay) => job.WorkerRetryResetUtc is { } reset
+        ? $"service reset at {reset:O}"
+        : "retry in " + FormatDelay(delay);
 
     private bool TryGetCodexUnavailableUntil(out DateTime unavailableUntilUtc)
     {
@@ -536,19 +657,23 @@ public sealed class WorkerHost
 
         job.TaskUpdateWindowClosed = false;
         SetPhase(job, repair ? JobPhases.Repairing : JobPhases.Implementing);
+        var affectedPullRequests = Array.Empty<string>();
         if (repair)
         {
-            var affectedPullRequests = AffectedPullRequests(job);
+            affectedPullRequests = AffectedPullRequests(job);
             foreach (var url in affectedPullRequests)
             {
+                var pullRequest = job.PullRequests.FirstOrDefault(candidate => candidate.Url.Equals(url, StringComparison.OrdinalIgnoreCase));
+                var checks = job.PendingCheckFailures.Where(check => check.PullRequestUrl.Equals(url, StringComparison.OrdinalIgnoreCase));
+                IEnumerable<ReviewFeedback> feedback = pullRequest is null
+                    ? Array.Empty<ReviewFeedback>()
+                    : job.PendingFeedback.Where(item => item.Url.Contains($"/{pullRequest.Repository}/pull/", StringComparison.OrdinalIgnoreCase));
+                RepairRetryPolicy.BeginGeneration(job, url, pullRequest?.HeadOid, checks, feedback, clock.UtcNow);
                 job.RepairAttemptsByPullRequest.TryGetValue(url, out var attempts);
                 if (!job.RepairStartedUtcByPullRequest.TryGetValue(url, out var started)) job.RepairStartedUtcByPullRequest[url] = started = clock.UtcNow;
                 if (attempts >= config.Current.RepairMaxAttempts || clock.UtcNow - started >= config.Current.RepairMaxElapsed)
                 { await BlockAsync(job, $"Repair attempt or elapsed-time limit exhausted for {url}.", ct); return; }
-                job.RepairAttemptsByPullRequest[url] = attempts + 1;
             }
-            job.RepairStartedUtc ??= clock.UtcNow;
-            job.RepairAttempts++;
             Save(job);
         }
 
@@ -580,6 +705,21 @@ public sealed class WorkerHost
             run = await RunCodexAsync(job, arguments, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + ExecResultDiagnostics.Failure(run));
             resultJson = ExtractResult(run.Output);
+            // Fresh Codex turns must opt into the lifecycle contract.  This
+            // is intentionally strict here; only a persisted journal result
+            // gets the legacy compatibility path in ResumePublishingAsync.
+            _ = WorkerResultPolicy.Parse(resultJson);
+            if (repair)
+            {
+                foreach (var url in affectedPullRequests)
+                {
+                    job.RepairAttemptsByPullRequest.TryGetValue(url, out var attempts);
+                    job.RepairAttemptsByPullRequest[url] = attempts + 1;
+                }
+                job.RepairStartedUtc ??= clock.UtcNow;
+                job.RepairAttempts++;
+                Save(job);
+            }
             if (resumeBatch is not null)
             {
                 lock (journalGate)
@@ -617,45 +757,60 @@ public sealed class WorkerHost
         await CompleteResultAsync(job, resultDocument.RootElement, job.PendingResultIsRepair, ct);
     }
 
-    private async Task CompleteResultAsync(Job job, JsonElement result, bool repair, CancellationToken ct)
+    private async Task RecoverLegacyPublicationAsync(Job job, CancellationToken ct)
     {
-        var status = result.GetProperty("status").GetString();
-        if (BlockedReassessmentPolicy.ShouldReassess(job, status))
+        if (job.PullRequests.Count > 0)
         {
-            job.BlockedReassessmentAttempted = true;
-            Save(job);
-            await CleanIgnoredGeneratedOutputsAsync(job, ct);
-            await RefreshTaskUpdatesAsync(job, ct);
-            var schema = WriteSchema("result", ResultSchema);
-            var batch = TaskUpdatePolicy.Capture(job);
-            var update = BuildTaskUpdatePrompt(batch);
-            var prompt = "Reassess the blocked result after worker-owned best-effort ignored-output cleanup. Cleanup failures or ignored generated residue are warnings, not blockers. Return completed or noChanges unless another substantive implementation blocker remains."
-                + (string.IsNullOrWhiteSpace(update) ? string.Empty : "\n\nInclude this newly queued human task update in the reassessment:\n" + update)
-                + "\nReturn the normal required structured result schema.";
-            var applyingTaskUpdate = TaskUpdatePolicy.HasPending(job);
-            if (applyingTaskUpdate) TaskUpdatePolicy.BeginApplying(job);
-            string reassessedJson;
-            try
-            {
-                await RenderAsync();
-                var run = await RunContinuationAsync(job, schema, prompt, ct);
-                if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + ExecResultDiagnostics.Failure(run));
-                reassessedJson = ExtractResult(run.Output);
-                if (applyingTaskUpdate) TaskUpdatePolicy.MarkDelivered(job, batch);
-            }
-            finally
-            {
-                if (applyingTaskUpdate) TaskUpdatePolicy.EndApplying(job);
-                await RenderAsync();
-            }
-            job.PendingResultJson = reassessedJson;
-            Save(job);
-            await CleanIgnoredGeneratedOutputsAsync(job, ct);
-            using var reassessed = JsonDocument.Parse(reassessedJson);
-            await CompleteResultAsync(job, reassessed.RootElement, repair, ct);
+            job.PendingResultJson = null;
+            SetPhase(job, JobPhases.Monitoring);
+            await MonitorJobAsync(job, ct);
             return;
         }
-        if (status == "blocked") { await BlockAsync(job, result.GetProperty("summary").GetString() ?? "Codex reported blocked.", ct, $"{job.Model} {job.Effort}"); return; }
+
+        // Older journals could crash after creating task-owned commits but
+        // before persisting the structured publication manifest. Rebuild a
+        // conservative baseline from the retained branch's merge base so the
+        // normal changed-state validation can publish those commits safely.
+        job.AdoptedBlockedWorkspace = true;
+        foreach (var workspace in job.Workspaces)
+        {
+            var baseRef = string.IsNullOrWhiteSpace(workspace.BaseRef)
+                ? "origin/HEAD"
+                : workspace.BaseRef.StartsWith("origin/", StringComparison.OrdinalIgnoreCase) ? workspace.BaseRef : "origin/" + workspace.BaseRef;
+            var mergeBase = await RequireAsync("git", ["merge-base", "HEAD", baseRef], workspace.Directory, ct);
+            job.ExecutionStartHeads[workspace.Repository] = mergeBase.Output.Trim();
+        }
+        job.PendingResultJson = null;
+        Save(job);
+        await ProcessJobAsync(job, string.IsNullOrWhiteSpace(job.ThreadId) ? RecoveryMode.Initial : RecoveryMode.ResumeInitial, ct);
+    }
+
+    private async Task CompleteResultAsync(Job job, JsonElement result, bool repair, CancellationToken ct)
+    {
+        // ResumePublishingAsync may be replaying a result written by an older
+        // worker.  Its explicit compatibility path defaults missing lifecycle
+        // metadata conservatively; fresh Codex turns are parsed strictly in
+        // ProcessJobAsync and every continuation before they are journaled.
+        var structured = WorkerResultPolicy.Parse(result, allowLegacy: true);
+        var status = structured.Status;
+        job.LastBlockerKind = structured.Blocker.Kind;
+        job.LastBlockerSummary = structured.Blocker.Summary;
+        job.LastBlockerEvidence = structured.Blocker.Evidence;
+        job.HumanReviewRequested |= structured.Blocker.IsHumanReview;
+
+        // Keep the one-time legacy reassessment for journals produced before
+        // typed blockers existed.  New workerRepairable/transientWorker
+        // results use the bounded retained-workspace retry below instead.
+        if (structured.IsLegacy && status == "blocked" && BlockedReassessmentPolicy.ShouldReassess(job, status))
+        {
+            await ReassessLegacyBlockedResultAsync(job, repair, ct);
+            return;
+        }
+        if (status == "blocked")
+        {
+            await HandleBlockedResultAsync(job, structured.Blocker, repair, ct);
+            return;
+        }
         if (await ShouldReassessAdoptedWorkspaceResultAsync(job, result, ct))
         {
             job.AdoptedResultReassessmentAttempted = true;
@@ -666,6 +821,7 @@ public sealed class WorkerHost
             var run = await RunContinuationAsync(job, schema, prompt, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex retained-workspace result reassessment failed: " + ExecResultDiagnostics.Failure(run));
             var reassessedJson = ExtractResult(run.Output);
+            _ = WorkerResultPolicy.Parse(reassessedJson);
             job.PendingResultJson = reassessedJson;
             Save(job);
             using var reassessed = JsonDocument.Parse(reassessedJson);
@@ -675,7 +831,11 @@ public sealed class WorkerHost
         await ValidateResultAsync(job, result, ct);
         ValidateRepairDispositions(job, result, repair);
 
-        if (status == "noChanges" && !repair)
+        var reportedChanges = ResultRepositories(result).Values.Any(changed => changed);
+        var legacyReviewHandoff = structured.IsLegacy && job.PullRequests.Count > 0 && !reportedChanges;
+        var humanReview = structured.Blocker.IsHumanReview || legacyReviewHandoff;
+        job.HumanReviewRequested |= humanReview;
+        if (status == "noChanges" && !repair && !humanReview)
         {
             if (!job.CodexResultCommentRecorded)
             {
@@ -685,13 +845,27 @@ public sealed class WorkerHost
             }
             await ChangeStatusAsync(job, "Done", ct);
             job.PendingResultJson = null;
+            WorkerRetryPolicy.Clear(job);
             SetPhase(job, JobPhases.Done);
+            return;
+        }
+
+        // A humanReview result is a request to hand off an already-complete
+        // implementation.  A task with no known PR cannot remain Active on
+        // that claim forever, so fail it safely and leave an actionable record.
+        if (humanReview && job.PullRequests.Count == 0 && !reportedChanges)
+        {
+            await BlockAsync(job, "humanReview requested but no pull request is known; publish or identify the pull request before requesting review.", ct, $"{job.Model} {job.Effort}");
             return;
         }
 
         var repairingChecks = job.PendingCheckFailures.Count > 0;
         var checksBeforePublication = job.PendingCheckFailures.ToArray();
-        var changed = await PublishAsync(job, result, repair, ct);
+        // noChanges + humanReview deliberately retains the existing PR and
+        // skips publication.  This is the common reclaimed-workspace handoff.
+        var changed = humanReview && !reportedChanges
+            ? false
+            : await PublishAsync(job, result, repair, ct);
         if (repair && repairingChecks && !changed)
         {
             await ApplyReviewDispositionsAsync(job, result, ct);
@@ -699,7 +873,9 @@ public sealed class WorkerHost
             job.PendingResultJson = null;
             job.Publication.Clear();
             job.ExecutionStartHeads.Clear();
+            WorkerRetryPolicy.Clear(job);
             SetPhase(job, JobPhases.Monitoring);
+            if (humanReview) await MonitorJobAsync(job, ct);
             return;
         }
         if (!repair && !job.CodexResultCommentRecorded)
@@ -712,18 +888,82 @@ public sealed class WorkerHost
         job.PendingResultJson = null;
         job.Publication.Clear();
         job.ExecutionStartHeads.Clear();
+        WorkerRetryPolicy.Clear(job);
         SetPhase(job, JobPhases.Monitoring);
+        if (humanReview) await MonitorJobAsync(job, ct);
+    }
+
+    private async Task ReassessLegacyBlockedResultAsync(Job job, bool repair, CancellationToken ct)
+    {
+        job.BlockedReassessmentAttempted = true;
+        Save(job);
+        await CleanIgnoredGeneratedOutputsAsync(job, ct);
+        await RefreshTaskUpdatesAsync(job, ct);
+        var schema = WriteSchema("result", ResultSchema);
+        var batch = TaskUpdatePolicy.Capture(job);
+        var update = BuildTaskUpdatePrompt(batch);
+        var prompt = "Reassess the blocked result after worker-owned best-effort ignored-output cleanup. Cleanup failures or ignored generated residue are warnings, not blockers. Return completed or noChanges unless another substantive implementation blocker remains."
+            + (string.IsNullOrWhiteSpace(update) ? string.Empty : "\n\nInclude this newly queued human task update in the reassessment:\n" + update)
+            + "\nReturn the normal required structured result schema.";
+        var applyingTaskUpdate = TaskUpdatePolicy.HasPending(job);
+        if (applyingTaskUpdate) TaskUpdatePolicy.BeginApplying(job);
+        string reassessedJson;
+        try
+        {
+            await RenderAsync();
+            var run = await RunContinuationAsync(job, schema, prompt, ct);
+            if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + ExecResultDiagnostics.Failure(run));
+            reassessedJson = ExtractResult(run.Output);
+            _ = WorkerResultPolicy.Parse(reassessedJson);
+            if (applyingTaskUpdate) TaskUpdatePolicy.MarkDelivered(job, batch);
+        }
+        finally
+        {
+            if (applyingTaskUpdate) TaskUpdatePolicy.EndApplying(job);
+            await RenderAsync();
+        }
+        job.PendingResultJson = reassessedJson;
+        Save(job);
+        await CleanIgnoredGeneratedOutputsAsync(job, ct);
+        using var reassessed = JsonDocument.Parse(reassessedJson);
+        await CompleteResultAsync(job, reassessed.RootElement, repair, ct);
+    }
+
+    private async Task HandleBlockedResultAsync(Job job, WorkerBlocker blocker, bool repair, CancellationToken ct)
+    {
+        var evidence = blocker.Evidence.Length == 0 ? string.Empty : " Evidence: " + string.Join(" | ", blocker.Evidence);
+        if (blocker.IsRetryable
+            && WorkerRetryPolicy.TrySchedule(job, blocker, clock.UtcNow, config.Current, out var delay))
+        {
+            job.BlockReason = blocker.Kind + ": " + blocker.Summary + evidence;
+            job.PendingResultJson = null;
+            job.WorkerRetryMode = repair ? nameof(RecoveryMode.ResumeRepair) : nameof(RecoveryMode.ResumeInitial);
+            SetPhase(job, JobPhases.RetryWaiting);
+            await AddCommentAsync(job,
+                $"Worker retry scheduled ({FormatRetryAttempt(job, blocker.Kind)}) for {FormatRetryTime(job, delay)}: {blocker.Summary}{evidence}",
+                ct);
+            Save(job);
+            return;
+        }
+
+        var reason = blocker.IsRetryable
+            ? $"{blocker.Kind}: retry limit exhausted after {job.WorkerRetryAttempts} attempt(s) for fingerprint {job.WorkerRetryFingerprint}. {blocker.Summary}{evidence}"
+            : $"{blocker.Kind}: {blocker.Summary}{evidence}";
+        await BlockAsync(job, reason, ct, $"{job.Model} {job.Effort}");
     }
 
     private string BuildEnvelope(Job job, bool repair)
     {
         var repositoryless = job.Task.Repositories.Length == 0;
+        var lifecycle = "Return exactly one structured result with status, summary, validationEvidence, repositories, commitMessage, prTitle, prBody, checkDispositions, threadDispositions, workComplete, and blocker. blocker.kind must be one of none, transientWorker, workerRepairable, upstreamDependency, missingCredential, missingHardware, missingInput, userDecision, policyRestriction, or humanReview; every non-none blocker requires a concise summary and nonempty concrete evidence array. Use workComplete=true only when the task work is complete. Use humanReview only when completed work is waiting solely for a human decision on an already-published PR. This may include subjective or visual review of artifacts already produced on that PR, but not evidence capture, validation, deployment, credential entry, device work, or another action the worker still owns."
+            + " Treat usage limits, process/tool launch failures, timeouts, emulator boot failures, malformed structured output, stale dependency assertions, merge conflicts, and unavailable validation fallbacks as transientWorker or workerRepairable, not permanent gates. Before reporting another blocker, attempt the task-authorized fallback and cite the command, current dependency/task/PR state, or capability probe that proves it unavailable. completed/noChanges may use only none or humanReview; blocked must use a non-none blocker and may have workComplete=true when implementation is complete behind an external gate. Never invent an acceptance requirement absent from the task. Do not choose or report a Maddox task status: the worker owns status transitions.";
+        var capabilities = "TASK-SCOPED CAPABILITY CONTRACT: The task itself authorizes actions explicitly required by its title, description, or acceptance criteria. You may use already-authenticated noninteractive CLIs/APIs and task-owned applications against only the exact accounts/resources named by the task or supplied repository. For an external change, inspect current state, record a precondition and rollback path, apply the smallest change, verify the requested outcome, and summarize non-secret evidence. Never print or persist secret values. Create/rotate/revoke credentials or perform another irreversible external action only when the task explicitly requires it; install and verify a replacement before revocation. Interactive login, unavailable required physical hardware, or an unconfigured native-UI lane may be reported as a typed external blocker after a concrete capability probe. Maddox status/database operations and Git branch/commit/push/PR publication remain worker-owned and forbidden to Codex.";
         var basePrompt = repositoryless
-            ? "You are implementing one already-claimed Maddox task from the configured repository root. No repository was specified, so the impact scope is unknown: start from RepoRoot, inspect what the task requires, and make only changes required by the issue. If the objective is task management, use only the published MaddoxTasks executable and its agent JSON commands; never read or write the database directly. Do not change the source task status because the worker owns its lifecycle. Return blocked only when a substantive requirement in the task cannot be completed with the available context or environment. For a successfully completed task-management objective with no repository file changes, return noChanges."
-            : job.Prompt;
+            ? "You are implementing one already-claimed Maddox task from the configured repository root. No repository was specified, so the impact scope is unknown: start from RepoRoot, inspect what the task requires, and make only changes required by the issue. If the objective is task management, use only the published MaddoxTasks executable and its agent JSON commands; never read or write the database directly. Do not change the source task status because the worker owns its lifecycle. Return blocked only when a substantive requirement in the task cannot be completed with the available context or environment. For a successfully completed task-management objective with no repository file changes, return noChanges. " + lifecycle + "\n\n" + capabilities
+            : job.Prompt + "\n\nWORKER LIFECYCLE CONTRACT:\n" + lifecycle + "\n\n" + capabilities;
         var restrictions = repositoryless
             ? "Do not claim another task, change the source task status, edit the Maddox database directly, create branches, commit, push, create/merge PRs, or reconcile reviews."
-            : "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews.";
+            : "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews. Task-explicit external actions outside Git and Maddox are allowed only under the capability contract above.";
         var repairContext = repair ? $"\nFAILING CHECKS:\n{JsonSerializer.Serialize(job.PendingCheckFailures)}\nACTIONABLE REVIEW THREADS:\n{JsonSerializer.Serialize(job.PendingFeedback)}\nReturn one checkDispositions item for every failing check ID and one threadDispositions item for every review thread ID. Mark review feedback addressed only when the requested change is complete and include the reply to post." : string.Empty;
         var executionRoot = repositoryless ? $"\nREPO ROOT:\n{config.Current.RepoRoot}" : string.Empty;
         var adoptedContext = job.AdoptedBlockedWorkspace
@@ -793,6 +1033,7 @@ public sealed class WorkerHost
                 var run = await RunContinuationAsync(job, schema, prompt, ct);
                 if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + ExecResultDiagnostics.Failure(run));
                 resultJson = ExtractResult(run.Output);
+                _ = WorkerResultPolicy.Parse(resultJson);
                 lock (journalGate)
                 {
                     TaskUpdatePolicy.MarkDelivered(job, batch);
@@ -1211,17 +1452,48 @@ public sealed class WorkerHost
 
     private async Task MonitorJobAsync(Job job, CancellationToken ct)
     {
-        var allGreen = true;
+        var allGreen = job.PullRequests.Count > 0;
+        var allReviewReady = job.PullRequests.Count > 0;
         var newFeedback = false;
         var snapshots = new List<PullRequestSnapshot>();
-        foreach (var pullRequest in job.PullRequests)
+        for (var pullRequestIndex = 0; pullRequestIndex < job.PullRequests.Count; pullRequestIndex++)
         {
+            var pullRequest = job.PullRequests[pullRequestIndex];
             var snapshot = await github.InspectAsync(pullRequest.Url, includeFeedback: true, ct);
             snapshots.Add(snapshot);
+            if (!string.IsNullOrWhiteSpace(snapshot.HeadOid) && !snapshot.HeadOid.Equals(pullRequest.HeadOid, StringComparison.OrdinalIgnoreCase))
+            {
+                pullRequest = pullRequest with { HeadOid = snapshot.HeadOid };
+                job.PullRequests[pullRequestIndex] = pullRequest;
+            }
             if (snapshot.Merged) continue;
-            var failures = snapshot.Failures(config.Current.IgnoredChecks);
-            allGreen &= snapshot.IsGreen(config.Current.IgnoredChecks) && !snapshot.MergeabilityPending && !snapshot.HasMergeConflict;
-            foreach (var failure in failures.Where(failure => job.ProcessedCheckIds.Add(failure.Id))) job.PendingCheckFailures.Add(failure with { PullRequestUrl = pullRequest.Url });
+            if (snapshot.InspectionComplete && !snapshot.IsOpen)
+            {
+                await BlockAsync(job, $"userDecision: Pull request {pullRequest.Url} was closed without merge. Reopen it or explicitly authorize a replacement before review can continue.", ct);
+                return;
+            }
+
+            var codeFailures = snapshot.CodeRepairs(config.Current.IgnoredChecks);
+            var transientFailures = snapshot.TransientFailures(config.Current.IgnoredChecks);
+            var humanGates = snapshot.HumanGates(config.Current.IgnoredChecks);
+            allGreen &= snapshot.IsGreen(config.Current.IgnoredChecks);
+            allReviewReady &= snapshot.IsReviewReady(config.Current.IgnoredChecks);
+            foreach (var failure in codeFailures.Where(failure => job.ProcessedCheckIds.Add(failure.Id)))
+                job.PendingCheckFailures.Add(failure with { PullRequestUrl = pullRequest.Url });
+            foreach (var transient in transientFailures)
+            {
+                if (job.TransientCheckRerunUtc.TryGetValue(transient.Id, out var lastRerun)
+                    && clock.UtcNow - lastRerun < TimeSpan.FromMinutes(5)) continue;
+                await github.RerunAsync(transient.Link, ct);
+                job.TransientCheckRerunUtc[transient.Id] = clock.UtcNow;
+                await AddCommentAsync(job, $"Worker reran transient check {transient.Name} after state {transient.State}: {transient.Link}", ct);
+            }
+            foreach (var humanGate in humanGates)
+            {
+                if (job.ProcessedCheckIds.Contains(humanGate.Id)) continue;
+                await AddCommentAsync(job, $"Ready for review; GitHub check {humanGate.Name} is waiting for human approval: {humanGate.Link}", ct);
+                job.ProcessedCheckIds.Add(humanGate.Id);
+            }
             if (snapshot.HasMergeConflict)
             {
                 var conflict = new CheckState(
@@ -1256,8 +1528,9 @@ public sealed class WorkerHost
             Enqueue(job, RecoveryMode.ResumeRepair);
         }
 
+        var openPullRequests = snapshots.Any(snapshot => !snapshot.Merged);
         var quietPeriodElapsed = job.ReviewWindow.Update(allGreen, newFeedback, clock.UtcNow, config.Current.ReviewQuietPeriod);
-        var clearToReview = allGreen && job.PendingFeedback.Count == 0 && job.PendingCheckFailures.Count == 0;
+        var clearToReview = openPullRequests && allReviewReady && job.PendingFeedback.Count == 0 && job.PendingCheckFailures.Count == 0;
         if (clearToReview)
         {
             if (!job.ReadyForReviewRecorded)
@@ -1266,7 +1539,7 @@ public sealed class WorkerHost
                 job.ReadyForReviewRecorded = true;
                 Save(job);
             }
-            if (IsAutoMergeAllowed(job) && quietPeriodElapsed)
+            if (IsAutoMergeAllowed(job) && allGreen && quietPeriodElapsed)
             {
                 foreach (var pullRequest in job.PullRequests) await github.MergeAsync(pullRequest.Url, ct);
                 await ReconcileAsync(ct);
@@ -1447,9 +1720,23 @@ public sealed class WorkerHost
     private async Task BlockAsync(Job job, string reason, CancellationToken ct, string actor = "maddox-worker")
     {
         job.BlockReason = reason;
-        SetPhase(job, JobPhases.Blocked);
-        await AddCommentAsync(job, "Worker blocked: " + reason, actor, ct);
+        job.BlockCommentRecorded = false;
+        job.BlockActor = actor;
+        SetPhase(job, JobPhases.StatusSyncPending);
+        await SyncBlockedAsync(job, ct);
+    }
+    private async Task SyncBlockedAsync(Job job, CancellationToken ct)
+    {
+        if (job.Phase != JobPhases.StatusSyncPending) return;
+        if (!job.BlockCommentRecorded)
+        {
+            await AddCommentAsync(job, "Worker blocked: " + job.BlockReason, job.BlockActor ?? "maddox-worker", ct);
+            job.BlockCommentRecorded = true;
+            Save(job);
+        }
         await ChangeStatusAsync(job, "Blocked", ct);
+        WorkerRetryPolicy.Clear(job);
+        SetPhase(job, JobPhases.Blocked);
     }
     private Task<ExecResult> AddCommentAsync(Job job, string comment, CancellationToken ct) => AddCommentAsync(job, comment, "maddox-worker", ct);
     private Task<ExecResult> AddCommentAsync(Job job, string comment, string actor, CancellationToken ct) => RunRequiredCommandAsync(new { type = "AddComment", issueId = job.Task.IssueId, comment }, actor, ct);
@@ -1472,15 +1759,24 @@ public sealed class WorkerHost
     private async Task PreflightAsync(CancellationToken ct)
     {
         var settings = config.Current;
-        var checks = new[]
-        {
-            processes.RunAsync(settings.MaddoxExe, ["agent", "issues"], Path.GetDirectoryName(configPath)!, ct),
-            processes.RunAsync(settings.CodexExe, ["--version"], settings.RepoRoot, ct),
-            processes.RunAsync(settings.GhExe, ["auth", "status"], settings.RepoRoot, ct)
-        };
-        var results = await Task.WhenAll(checks);
-        if (results.Any(result => result.ExitCode != 0)) throw new InvalidOperationException("Startup preflight failed; verify MaddoxTasks, Codex, and GitHub CLI installation/authentication. No task was claimed.");
+        var ledger = await processes.RunAsync(settings.MaddoxExe, ["agent", "issues"], Path.GetDirectoryName(configPath)!, ct);
+        if (ledger.ExitCode != 0)
+            throw new InvalidOperationException("Startup preflight failed: MaddoxTasks ledger access is required before work can be claimed.");
+
+        await Task.WhenAll(
+            ProbeOptionalAsync(settings.CodexExe, ["--version"], settings.RepoRoot, "preflight.codex.unavailable", ct),
+            ProbeOptionalAsync(settings.GhExe, ["auth", "status"], settings.RepoRoot, "preflight.github.unavailable", ct));
         log.Write("info", "preflight.succeeded");
+    }
+    private async Task ProbeOptionalAsync(string fileName, IReadOnlyList<string> arguments, string workingDirectory, string eventName, CancellationToken ct)
+    {
+        try
+        {
+            var result = await processes.RunAsync(fileName, arguments, workingDirectory, ct);
+            if (result.ExitCode != 0) log.Write("warning", eventName, new { error = ExecResultDiagnostics.Failure(result) });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (Exception exception) { log.Write("warning", eventName, new { error = exception.Message }); }
     }
     private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct, IReadOnlyDictionary<string, string>? environment = null) { var result = await processes.RunAsync(executable, arguments, cwd, ct, environment: environment); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
     private static bool TryReadSuccess(string output) { try { using var document = JsonDocument.Parse(output); return document.RootElement.GetProperty("success").GetBoolean(); } catch { return false; } }
@@ -1549,16 +1845,15 @@ public sealed class WorkerHost
             {
                 using var document = JsonDocument.Parse(line);
                 var root = document.RootElement;
-                if (root.TryGetProperty("result", out var result)) return result.ValueKind == JsonValueKind.String ? result.GetString()! : result.GetRawText();
-                if (root.TryGetProperty("status", out _) && root.TryGetProperty("summary", out _)) return root.GetRawText();
+                if (root.TryGetProperty("result", out var result) && TryKnownResult(result, out var direct)) return direct;
+                if (TryKnownResult(root, out var rootResult)) return rootResult;
                 if (root.TryGetProperty("type", out var eventType) && eventType.GetString() == "event_msg"
                     && root.TryGetProperty("payload", out var payload) && payload.ValueKind == JsonValueKind.Object
                     && payload.TryGetProperty("type", out var payloadType) && payloadType.GetString() == "task_complete"
                     && payload.TryGetProperty("last_agent_message", out var lastMessage) && lastMessage.ValueKind == JsonValueKind.String)
                 {
                     var candidate = lastMessage.GetString()!;
-                    using var structured = JsonDocument.Parse(candidate);
-                    if (structured.RootElement.ValueKind == JsonValueKind.Object) return candidate;
+                    if (TryKnownResult(lastMessage, out var structured)) return structured;
                 }
                 if (root.TryGetProperty("item", out var item)
                     && item.ValueKind == JsonValueKind.Object
@@ -1568,18 +1863,50 @@ public sealed class WorkerHost
                     && text.ValueKind == JsonValueKind.String)
                 {
                     var candidate = text.GetString()!;
-                    using var structured = JsonDocument.Parse(candidate);
-                    if (structured.RootElement.ValueKind == JsonValueKind.Object) return candidate;
+                    if (TryKnownResult(text, out var structured)) return structured;
                 }
             }
             catch (JsonException) { }
         }
         throw new InvalidDataException("Codex emitted no structured result.");
     }
+    private static bool TryKnownResult(JsonElement candidate, out string json)
+    {
+        json = string.Empty;
+        if (candidate.ValueKind == JsonValueKind.String)
+        {
+            try
+            {
+                using var parsed = JsonDocument.Parse(candidate.GetString() ?? string.Empty);
+                return TryKnownResult(parsed.RootElement, out json);
+            }
+            catch (JsonException) { return false; }
+        }
+        if (candidate.ValueKind != JsonValueKind.Object) return false;
+        var worker = candidate.TryGetProperty("status", out var status) && status.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("summary", out var workerSummary) && workerSummary.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("workComplete", out var workComplete) && workComplete.ValueKind is JsonValueKind.True or JsonValueKind.False
+            && candidate.TryGetProperty("blocker", out var blocker) && blocker.ValueKind == JsonValueKind.Object
+            && candidate.TryGetProperty("repositories", out var repositories) && repositories.ValueKind == JsonValueKind.Array;
+        var research = candidate.TryGetProperty("outcome", out var outcome) && outcome.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("summary", out var researchSummary) && researchSummary.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("findings", out var findings) && findings.ValueKind == JsonValueKind.Array
+            && candidate.TryGetProperty("mutations", out var mutations) && mutations.ValueKind == JsonValueKind.Array;
+        var clarification = candidate.TryGetProperty("action", out var action) && action.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("repositories", out var clarificationRepositories) && clarificationRepositories.ValueKind == JsonValueKind.Array
+            && candidate.TryGetProperty("children", out var children) && children.ValueKind == JsonValueKind.Array
+            && candidate.TryGetProperty("rationale", out var rationale) && rationale.ValueKind == JsonValueKind.String
+            && candidate.TryGetProperty("confidence", out var confidence) && confidence.ValueKind == JsonValueKind.Number
+            && candidate.TryGetProperty("ambiguous", out var ambiguous) && ambiguous.ValueKind is JsonValueKind.True or JsonValueKind.False;
+        if (!worker && !research && !clarification) return false;
+        json = candidate.GetRawText();
+        return true;
+    }
     private static string WriteSchema(string name, string body) { var path = Path.Combine(Path.GetTempPath(), $"maddox-{name}-schema.json"); File.WriteAllText(path, body); return path; }
     private sealed record WorkItem(Job Job, RecoveryMode Mode);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
+    private const string ResearchFailureMarkerPrefix = "Research worker could not complete: ";
     private const string ClarifySchema = """{"type":"object","properties":{"action":{"enum":["assign","split"]},"repositories":{"type":"array","items":{"type":"string"}},"children":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"},"repository":{"type":"string"},"rationale":{"type":"string"}},"required":["title","description","repository","rationale"],"additionalProperties":false}},"rationale":{"type":"string"},"confidence":{"type":"number","minimum":0,"maximum":1},"ambiguous":{"type":"boolean"}},"required":["action","repositories","children","rationale","confidence","ambiguous"],"additionalProperties":false}""";
-    private const string ResultSchema = """{"type":"object","properties":{"status":{"enum":["completed","noChanges","blocked"]},"summary":{"type":"string"},"validationEvidence":{"type":"array","items":{"type":"string"}},"repositories":{"type":"array","items":{"type":"object","properties":{"repository":{"type":"string"},"changed":{"type":"boolean"}},"required":["repository","changed"],"additionalProperties":false}},"commitMessage":{"type":"string"},"prTitle":{"type":"string"},"prBody":{"type":"string"},"checkDispositions":{"type":"array","items":{"type":"object","properties":{"checkId":{"type":"string"},"addressed":{"type":"boolean"},"summary":{"type":"string"}},"required":["checkId","addressed","summary"],"additionalProperties":false}},"threadDispositions":{"type":"array","items":{"type":"object","properties":{"threadId":{"type":"string"},"addressed":{"type":"boolean"},"replyBody":{"type":"string"}},"required":["threadId","addressed","replyBody"],"additionalProperties":false}}},"required":["status","summary","validationEvidence","repositories","commitMessage","prTitle","prBody","checkDispositions","threadDispositions"],"additionalProperties":false}""";
-    private const string ResearchResultSchema = """{"type":"object","properties":{"outcome":{"enum":["completed","unblocked","stillBlocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"mutations":{"type":"array","items":{"type":"object","properties":{"type":{"enum":["AddComment","UpdateDescription","ChangePriority","AddLabel","RemoveLabel","SetRepositoryLabels","ChangeStatus","CreateIssue"]},"issueId":{"type":"string"},"comment":{"type":"string"},"description":{"type":"string"},"newPriority":{"type":"integer","minimum":1,"maximum":5},"label":{"type":"string"},"newStatus":{"enum":["Backlog","Next","Active","Blocked","ReadyForReview","Done","Rejected"]},"repositories":{"type":"array","items":{"type":"string"}},"title":{"type":"string"},"priority":{"type":"integer","minimum":1,"maximum":5},"status":{"enum":["Next","Backlog"]},"parentId":{"type":"string"}},"required":["type"],"additionalProperties":false}}},"required":["outcome","summary","findings","mutations"],"additionalProperties":false}""";
+    private const string ResultSchema = """{"type":"object","properties":{"status":{"enum":["completed","noChanges","blocked"]},"summary":{"type":"string"},"validationEvidence":{"type":"array","items":{"type":"string"}},"repositories":{"type":"array","items":{"type":"object","properties":{"repository":{"type":"string"},"changed":{"type":"boolean"}},"required":["repository","changed"],"additionalProperties":false}},"commitMessage":{"type":"string"},"prTitle":{"type":"string"},"prBody":{"type":"string"},"checkDispositions":{"type":"array","items":{"type":"object","properties":{"checkId":{"type":"string"},"addressed":{"type":"boolean"},"summary":{"type":"string"}},"required":["checkId","addressed","summary"],"additionalProperties":false}},"threadDispositions":{"type":"array","items":{"type":"object","properties":{"threadId":{"type":"string"},"addressed":{"type":"boolean"},"replyBody":{"type":"string"}},"required":["threadId","addressed","replyBody"],"additionalProperties":false}},"workComplete":{"type":"boolean"},"blocker":{"type":"object","properties":{"kind":{"enum":["none","transientWorker","workerRepairable","upstreamDependency","missingCredential","missingHardware","missingInput","userDecision","policyRestriction","humanReview"]},"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"retryAtUtc":{"type":["string","null"]}},"required":["kind","summary","evidence","retryAtUtc"],"additionalProperties":false}},"required":["status","summary","validationEvidence","repositories","commitMessage","prTitle","prBody","checkDispositions","threadDispositions","workComplete","blocker"],"additionalProperties":false}""";
+    private const string ResearchResultSchema = """{"type":"object","properties":{"outcome":{"enum":["completed","unblocked","stillBlocked"]},"summary":{"type":"string"},"findings":{"type":"array","items":{"type":"string"}},"mutations":{"type":"array","items":{"type":"object","properties":{"type":{"enum":["AddComment","UpdateDescription","ChangePriority","AddLabel","RemoveLabel","SetRepositoryLabels","ChangeStatus","CreateIssue"]},"issueId":{"type":["string","null"]},"comment":{"type":["string","null"]},"description":{"type":["string","null"]},"newPriority":{"type":["integer","null"],"minimum":1,"maximum":5},"label":{"type":["string","null"]},"newStatus":{"enum":["Backlog","Next","Active","Blocked","ReadyForReview","Done","Rejected",null]},"repositories":{"type":["array","null"],"items":{"type":"string"}},"title":{"type":["string","null"]},"priority":{"type":["integer","null"],"minimum":1,"maximum":5},"status":{"enum":["Next","Backlog",null]},"parentId":{"type":["string","null"]}},"required":["type","issueId","comment","description","newPriority","label","newStatus","repositories","title","priority","status","parentId"],"additionalProperties":false}}},"required":["outcome","summary","findings","mutations"],"additionalProperties":false}""";
 }

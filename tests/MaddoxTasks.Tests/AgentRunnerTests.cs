@@ -169,6 +169,46 @@ public sealed class AgentRunnerTests
     }
 
     [Fact]
+    public void ExecuteCommandJson_ResearchClaimSupportsFailureCooldown()
+    {
+        var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var store = new InMemoryEventStoreForAgentTests();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp.AddHours(-2), "Blocked", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddHours(-1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddMinutes(-30), ResearchClaimPolicy.FailureMarkerPrefix + "usage limit", ResearchClaimPolicy.Actor));
+        var engine = new IssueEngine(store, new FrozenClockForAgentTests(timestamp));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"research-claim","cooldown":"30.00:00:00","failureCooldown":"00:15:00","dryRun":true}"""));
+
+        Assert.True(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.True(response.RootElement.GetProperty("dryRun").GetBoolean());
+        Assert.Equal(issueId.ToString(), response.RootElement.GetProperty("task").GetProperty("issueId").GetString());
+        Assert.Equal(3, engine.GetEventLog().Count);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("\"00:00:00\"")]
+    [InlineData("\"invalid\"")]
+    public void ExecuteCommandJson_ResearchClaimRejectsInvalidFailureCooldown(string failureCooldownJson)
+    {
+        var engine = new IssueEngine(
+            new InMemoryEventStoreForAgentTests(),
+            new FrozenClockForAgentTests(new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc)));
+
+        using var response = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"research-claim","failureCooldown":{{failureCooldownJson}}}"""));
+
+        Assert.False(response.RootElement.GetProperty("success").GetBoolean());
+        Assert.Contains("failureCooldown must be", response.RootElement.GetProperty("message").GetString());
+        Assert.Empty(engine.GetEventLog());
+    }
+
+    [Fact]
     public void ExecuteCommandJson_CompleteResearchDoesNotOverwriteHumanStatusChange()
     {
         var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);

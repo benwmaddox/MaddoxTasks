@@ -841,6 +841,80 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
+    public void ResearchClaim_FailedAttemptUsesFailureCooldownBoundaryAndDryRunDoesNotWrite()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var failureCutoff = now.AddHours(-1);
+        var eligible = IssueId.New();
+        var tooRecent = IssueId.New();
+        var store = new InMemoryEventStore();
+        store.Append(new IssueCreated(Guid.NewGuid(), eligible, now.AddHours(-3), "Failure at boundary", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), eligible, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), eligible, failureCutoff, ResearchClaimPolicy.FailureMarkerPrefix + "usage limit", ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, now.AddHours(-3), "Failure too recent", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, failureCutoff.AddTicks(1), ResearchClaimPolicy.FailureMarkerPrefix + "network unavailable", ResearchClaimPolicy.Actor));
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        var before = store.LoadAll().Count;
+
+        var preview = engine.ResearchClaimBlocked(dryRun: true);
+
+        Assert.Equal(eligible, preview.Task!.Issue.Id);
+        Assert.Equal(before, store.LoadAll().Count);
+
+        Assert.Equal(eligible, engine.ResearchClaimBlocked().Task!.Issue.Id);
+        Assert.Null(engine.ResearchClaimBlocked().Task);
+    }
+
+    [Fact]
+    public void ResearchClaim_NonFailureAndFailureBeforeLatestAttemptKeepLongCooldown()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var stillBlocked = IssueId.New();
+        var retriedThenBlocked = IssueId.New();
+        var store = new InMemoryEventStore();
+        store.Append(new IssueCreated(Guid.NewGuid(), stillBlocked, now.AddHours(-4), "Still blocked", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), stillBlocked, now.AddHours(-3), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), stillBlocked, now.AddHours(-2), "Research findings: blocker remains.", ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-4), "Latest attempt did not fail", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-3), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-2), ResearchClaimPolicy.FailureMarkerPrefix + "launch failed", ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+
+        Assert.Null(new IssueEngine(store, new FrozenClock(now)).ResearchClaimBlocked().Task);
+        Assert.Equal(
+            stillBlocked,
+            new IssueEngine(store, new FrozenClock(now.AddDays(14).AddHours(-3))).ResearchClaimBlocked(dryRun: true).Task!.Issue.Id);
+    }
+
+    [Fact]
+    public void ResearchClaim_RejectsSpoofedFailureActorAndPrefix()
+    {
+        var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
+        var spoofedActor = IssueId.New();
+        var spoofedPrefix = IssueId.New();
+        var realFailure = IssueId.New();
+        var store = new InMemoryEventStore();
+        foreach (var (id, title, priority) in new[]
+        {
+            (spoofedActor, "Spoofed actor", 1),
+            (spoofedPrefix, "Spoofed prefix", 2),
+            (realFailure, "Real failure", 3)
+        })
+        {
+            store.Append(new IssueCreated(Guid.NewGuid(), id, now.AddHours(-3), title, null, Status.Blocked, Priority.From(priority), null, null));
+            store.Append(new CommentAdded(Guid.NewGuid(), id, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        }
+        store.Append(new CommentAdded(Guid.NewGuid(), spoofedActor, now.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "network", "human"));
+        store.Append(new CommentAdded(Guid.NewGuid(), spoofedPrefix, now.AddHours(-1), "Research worker could not complete network", ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), realFailure, now.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "network", ResearchClaimPolicy.Actor));
+
+        var claim = new IssueEngine(store, new FrozenClock(now)).ResearchClaimBlocked();
+
+        Assert.Equal(realFailure, claim.Task!.Issue.Id);
+    }
+
+    [Fact]
     public async Task ResearchClaim_ConcurrentSqliteClaimsCannotDuplicateTheMarker()
     {
         var directory = Path.Combine(Path.GetTempPath(), "maddox-research-tests-" + Guid.NewGuid().ToString("N"));
@@ -852,6 +926,8 @@ public sealed class IssueEngineTests
             var setup = new SqliteEventStore(databasePath);
             var issueId = IssueId.New();
             setup.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+            setup.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+            setup.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "launch failed", ResearchClaimPolicy.Actor));
             var firstEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
             var secondEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
 
@@ -862,7 +938,10 @@ public sealed class IssueEngineTests
             Assert.Single(results, result => result.Task is not null);
             Assert.Single(results, result => result.Task is null);
             var finalEvents = new SqliteEventStore(databasePath).LoadAll();
-            Assert.Single(finalEvents.OfType<CommentAdded>(), comment => comment.Actor == ResearchClaimPolicy.Actor);
+            Assert.Equal(
+                2,
+                finalEvents.OfType<CommentAdded>().Count(comment =>
+                    ResearchClaimPolicy.IsAttempt(new IssueComment(comment.Timestamp, comment.Comment, comment.Actor))));
         }
         finally
         {

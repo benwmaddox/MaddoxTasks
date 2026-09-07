@@ -42,6 +42,32 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void ShippedWorkerPrompt_ConstrainsExternalRecoveryAndInteractiveBlockers()
+    {
+        var prompt = File.ReadAllText(FindWorkerAsset("worker-prompt.md"));
+
+        Assert.Contains("already-authenticated, noninteractive tool", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("exact resource and account", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("inspect the target", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("preconditions", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("rollback or replacement plan", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("verify the result", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Never print, copy, commit, or include secrets", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("irreversible revoke or delete", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("replacement is verified healthy", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Do not invent acceptance gates", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("visual or hardware gates", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("configured execution lane", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Do not claim CUA or any interactive capability is available", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("missingCredential", prompt, StringComparison.Ordinal);
+        Assert.Contains("missingHardware", prompt, StringComparison.Ordinal);
+        Assert.Contains("subjective or visual decision about already-produced PR artifacts", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("still needs to generate evidence", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("do not use MaddoxTasks commands", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("worker-owned Git publication", prompt, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void WorkspaceCleanupPolicy_RequiresExactOwnedRootAndTaskBranch()
     {
         using var directory = new TemporaryDirectory();
@@ -458,17 +484,18 @@ public sealed class WorkerPolicyTests
     {
         var tracker = new CodexTerminalEventTracker();
         Assert.False(tracker.Observe("{\"type\":\"turn.completed\"}"));
-        Assert.False(tracker.Observe("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"done\\\"}\"}}"));
+        Assert.False(tracker.Observe(JsonSerializer.Serialize(new { type = "item.completed", item = new { type = "agent_message", text = WorkerResultJson("completed") } })));
         Assert.True(tracker.Observe("{\"type\":\"turn.completed\"}"));
 
         var legacy = new CodexTerminalEventTracker();
-        Assert.True(legacy.Observe("{\"type\":\"task_complete\",\"status\":\"blocked\",\"summary\":\"needs input\"}"));
+        Assert.False(legacy.Observe("{\"type\":\"task_complete\",\"status\":\"blocked\",\"summary\":\"needs input\"}"));
 
         var session = new CodexTerminalEventTracker();
-        Assert.True(session.Observe("{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"{\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"done\\\"}\"}}"));
+        Assert.True(session.Observe(JsonSerializer.Serialize(new { type = "event_msg", payload = new { type = "task_complete", last_agent_message = WorkerResultJson("completed") } })));
 
         var clarification = new CodexTerminalEventTracker();
-        Assert.False(clarification.Observe("{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"repositories\\\":[\\\"StasisLang\\\"],\\\"ambiguous\\\":false}\"}}"));
+        var clarificationResult = JsonSerializer.Serialize(new { action = "assign", repositories = new[] { "StasisLang" }, children = Array.Empty<object>(), rationale = "matched", confidence = 1.0, ambiguous = false });
+        Assert.False(clarification.Observe(JsonSerializer.Serialize(new { type = "item.completed", item = new { type = "agent_message", text = clarificationResult } })));
         Assert.True(clarification.Observe("{\"type\":\"turn.completed\"}"));
     }
 
@@ -586,7 +613,9 @@ public sealed class WorkerPolicyTests
     [Fact]
     public void ExtractResult_ReadsCodexJsonlAgentMessage()
     {
-        var output = "{\"type\":\"thread.started\",\"thread_id\":\"t\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"{\\\"status\\\":\\\"completed\\\"}\"}}\n{\"type\":\"turn.completed\"}";
+        var output = JsonSerializer.Serialize(new { type = "thread.started", thread_id = "t" }) + "\n"
+            + JsonSerializer.Serialize(new { type = "item.completed", item = new { type = "agent_message", text = WorkerResultJson("completed") } }) + "\n"
+            + JsonSerializer.Serialize(new { type = "turn.completed" });
         using var result = JsonDocument.Parse(WorkerHost.ExtractResult(output));
         Assert.Equal("completed", result.RootElement.GetProperty("status").GetString());
     }
@@ -594,7 +623,7 @@ public sealed class WorkerPolicyTests
     [Fact]
     public void ExtractResult_ReadsNestedSessionTaskComplete()
     {
-        var output = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"{\\\"status\\\":\\\"noChanges\\\",\\\"summary\\\":\\\"already done\\\"}\"}}";
+        var output = JsonSerializer.Serialize(new { type = "event_msg", payload = new { type = "task_complete", last_agent_message = WorkerResultJson("noChanges") } });
         using var result = JsonDocument.Parse(WorkerHost.ExtractResult(output));
         Assert.Equal("noChanges", result.RootElement.GetProperty("status").GetString());
     }
@@ -702,6 +731,8 @@ public sealed class WorkerPolicyTests
         Assert.Contains("external mutation", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("call external services", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Do not edit files", prompt, StringComparison.Ordinal);
+        Assert.Contains("zero mutations are allowed", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("set fields that do not apply", prompt, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -765,12 +796,12 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void WorkerConfig_DefaultsResearchCooldownToFourteenDaysAndRejectsNonPositiveValues()
+    public void WorkerConfig_DefaultsResearchCooldownToOneDayAndRejectsNonPositiveValues()
     {
         using var directory = new TemporaryDirectory();
         var path = Path.Combine(directory.Path, "worker.json");
         WriteConfig(path, directory.Path, 2, "model");
-        Assert.Equal(TimeSpan.FromDays(14), WorkerConfig.Load(path).EffectiveResearchCooldown);
+        Assert.Equal(TimeSpan.FromDays(1), WorkerConfig.Load(path).EffectiveResearchCooldown);
 
         WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:00:00");
         Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
@@ -781,6 +812,21 @@ public sealed class WorkerPolicyTests
         WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:03:00");
         Assert.True(state.TryReload(path, out var error), error);
         Assert.Equal(TimeSpan.FromMinutes(3), state.Current.EffectiveResearchCooldown);
+    }
+
+    [Fact]
+    public void WorkerConfig_DefaultsResearchFailureCooldownToOneHourAndRejectsNonPositiveValues()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "worker.json");
+        WriteConfig(path, directory.Path, 2, "model");
+        Assert.Equal(TimeSpan.FromHours(1), WorkerConfig.Load(path).EffectiveResearchFailureCooldown);
+
+        WriteConfig(path, directory.Path, 2, "model", researchFailureCooldown: "00:00:00");
+        Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
+
+        WriteConfig(path, directory.Path, 2, "model", researchFailureCooldown: "00:15:00");
+        Assert.Equal(TimeSpan.FromMinutes(15), WorkerConfig.Load(path).EffectiveResearchFailureCooldown);
     }
 
     [Fact]
@@ -1157,6 +1203,21 @@ public sealed class WorkerPolicyTests
         PhaseChangedUtc = started ?? DateTime.UnixEpoch
     };
 
+    private static string WorkerResultJson(string status) => JsonSerializer.Serialize(new
+    {
+        status,
+        summary = "done",
+        validationEvidence = Array.Empty<string>(),
+        repositories = Array.Empty<object>(),
+        commitMessage = "commit",
+        prTitle = "title",
+        prBody = "body",
+        checkDispositions = Array.Empty<object>(),
+        threadDispositions = Array.Empty<object>(),
+        workComplete = true,
+        blocker = new { kind = "none", summary = "done", evidence = Array.Empty<string>(), retryAtUtc = (string?)null }
+    });
+
     private static Job OwnedBlockedJob(string issueId, string worktreeRoot, string marker, DateTime started) => new()
     {
         Task = new TaskDto(482, issueId, "Blocked task", "Description", ["Repo"]),
@@ -1170,14 +1231,14 @@ public sealed class WorkerPolicyTests
 
     private static Job WithSnapshot(Job job, string model) { job.Model = model; return job; }
 
-    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null, string? researchCooldown = null)
+    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null, string? researchCooldown = null, string? researchFailureCooldown = null)
     {
         File.WriteAllText(path, JsonSerializer.Serialize(new
         {
             schemaVersion = 1, claimInterval = "00:15:00", maxConcurrentCodexProcesses = cap, prPollInterval = "00:01:00",
             clarificationTimeout = "00:10:00", promptFile = "worker-prompt.md", model, reasoningEffort = "medium",
             repairMaxAttempts = 3, repairMaxElapsed = "02:00:00", reviewQuietPeriod = "00:30:00", ignoredChecks = Array.Empty<string>(),
-            blockedDisplayDuration, researchCooldown,
+            blockedDisplayDuration, researchCooldown, researchFailureCooldown,
             autoMergeRepositories = new[] { "benwmaddox/StasisLang" }, autoMergeMethod = "squash", maddoxExe = "MaddoxTasks.exe",
             codexExe = "codex", ghExe = "gh", repoRoot = root, worktreeRoot = Path.Combine(root, "worktrees")
         }));

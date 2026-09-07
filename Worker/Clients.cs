@@ -2,11 +2,42 @@ using System.Text.Json;
 
 namespace MaddoxTasks.Worker;
 
+public enum CheckClassification
+{
+    Passing,
+    CodeRepair,
+    TransientRerun,
+    HumanGate,
+    Pending,
+    Unknown
+}
+
 public sealed record CheckState(string Name, string State, string Bucket, string Link, string PullRequestUrl = "", string Details = "", string BaseRefName = "")
 {
     public string Id => $"{Name}|{State}|{Link}";
-    public bool IsFailure => Bucket.Equals("fail", StringComparison.OrdinalIgnoreCase) || State is "FAILURE" or "CANCELLED" or "TIMED_OUT" or "ACTION_REQUIRED";
-    public bool IsPending => Bucket.Equals("pending", StringComparison.OrdinalIgnoreCase) || State is "PENDING" or "QUEUED" or "IN_PROGRESS" or "EXPECTED" or "WAITING" or "REQUESTED";
+
+    public CheckClassification Classification
+    {
+        get
+        {
+            var state = State.Trim().ToUpperInvariant();
+            var bucket = Bucket.Trim().ToLowerInvariant();
+            if (state == "ACTION_REQUIRED") return CheckClassification.HumanGate;
+            if (state is "STARTUP_FAILURE" or "CANCELLED" or "TIMED_OUT") return CheckClassification.TransientRerun;
+            if (state == "FAILURE" || bucket == "fail") return CheckClassification.CodeRepair;
+            if (bucket == "pending" || state is "PENDING" or "QUEUED" or "IN_PROGRESS" or "EXPECTED" or "WAITING" or "REQUESTED")
+                return CheckClassification.Pending;
+            if (state is "SUCCESS" or "NEUTRAL" or "SKIPPED" || bucket is "pass" or "skipping")
+                return CheckClassification.Passing;
+            return CheckClassification.Unknown;
+        }
+    }
+
+    public bool IsCodeRepair => Classification == CheckClassification.CodeRepair;
+    public bool IsTransient => Classification == CheckClassification.TransientRerun;
+    public bool NeedsHumanApproval => Classification == CheckClassification.HumanGate;
+    public bool IsFailure => Classification is CheckClassification.CodeRepair or CheckClassification.TransientRerun or CheckClassification.HumanGate;
+    public bool IsPending => Classification is CheckClassification.Pending or CheckClassification.Unknown;
 }
 
 public sealed record PullRequestSnapshot(
@@ -16,18 +47,42 @@ public sealed record PullRequestSnapshot(
     string Mergeable = "MERGEABLE",
     string MergeStateStatus = "CLEAN",
     string HeadOid = "",
-    string BaseRefName = "")
+    string BaseRefName = "",
+    string State = "OPEN",
+    bool InspectionComplete = true,
+    string InspectionError = "")
 {
+    public bool IsOpen => State.Equals("OPEN", StringComparison.OrdinalIgnoreCase);
+    public bool Open => IsOpen;
     public bool MergeabilityPending => !Merged && Mergeable.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase);
     public bool HasMergeConflict => !Merged && (Mergeable.Equals("CONFLICTING", StringComparison.OrdinalIgnoreCase)
         || MergeStateStatus.Equals("DIRTY", StringComparison.OrdinalIgnoreCase));
 
     public bool IsGreen(IReadOnlyCollection<string> ignoredChecks)
     {
+        if (Merged || !IsOpen || !InspectionComplete) return false;
         var relevant = Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase)).ToArray();
-        return relevant.All(check => !check.IsFailure && !check.IsPending);
+        return relevant.All(check => check.Classification == CheckClassification.Passing);
     }
-    public IReadOnlyList<CheckState> Failures(IReadOnlyCollection<string> ignoredChecks) => Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.IsFailure).ToArray();
+
+    public bool IsReviewReady(IReadOnlyCollection<string> ignoredChecks)
+    {
+        if (Merged || !IsOpen || !InspectionComplete || MergeabilityPending || HasMergeConflict) return false;
+        var relevant = Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase)).ToArray();
+        return relevant.All(check => check.Classification is CheckClassification.Passing or CheckClassification.HumanGate);
+    }
+
+    public IReadOnlyList<CheckState> Failures(IReadOnlyCollection<string> ignoredChecks) =>
+        Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.IsFailure).ToArray();
+
+    public IReadOnlyList<CheckState> CodeRepairs(IReadOnlyCollection<string> ignoredChecks) =>
+        Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.IsCodeRepair).ToArray();
+
+    public IReadOnlyList<CheckState> TransientFailures(IReadOnlyCollection<string> ignoredChecks) =>
+        Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.IsTransient).ToArray();
+
+    public IReadOnlyList<CheckState> HumanGates(IReadOnlyCollection<string> ignoredChecks) =>
+        Checks.Where(check => !ignoredChecks.Contains(check.Name, StringComparer.OrdinalIgnoreCase) && check.NeedsHumanApproval).ToArray();
 }
 
 public interface IGitHubClient
@@ -36,6 +91,10 @@ public interface IGitHubClient
     Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken);
     Task ResolveAsync(string pullRequestUrl, string threadId, CancellationToken cancellationToken);
     Task MergeAsync(string pullRequestUrl, CancellationToken cancellationToken);
+
+    Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken);
+
+    Task RerunWorkflowAsync(string actionsRunUrl, CancellationToken cancellationToken) => RerunAsync(actionsRunUrl, cancellationToken);
 }
 
 public sealed class GitHubClient : IGitHubClient
@@ -49,21 +108,60 @@ public sealed class GitHubClient : IGitHubClient
     {
         var id = Parse(pullRequestUrl);
         var settings = config();
-        var view = await Require(settings.GhExe, ["pr", "view", pullRequestUrl, "--json", "mergedAt,mergeable,mergeStateStatus,headRefOid,baseRefName"], settings.RepoRoot, cancellationToken);
-        using var viewJson = JsonDocument.Parse(view.Output);
-        var merged = viewJson.RootElement.TryGetProperty("mergedAt", out var mergedAt) && mergedAt.ValueKind == JsonValueKind.String;
-        if (merged) return new PullRequestSnapshot(true, [], []);
-        var mergeable = viewJson.RootElement.GetProperty("mergeable").GetString() ?? "UNKNOWN";
-        var mergeStateStatus = viewJson.RootElement.GetProperty("mergeStateStatus").GetString() ?? "UNKNOWN";
-        var headOid = viewJson.RootElement.GetProperty("headRefOid").GetString() ?? string.Empty;
-        var baseRefName = viewJson.RootElement.GetProperty("baseRefName").GetString() ?? string.Empty;
+        var view = await processes.RunAsync(settings.GhExe, ["pr", "view", pullRequestUrl, "--json", "state,mergedAt,mergeable,mergeStateStatus,headRefOid,baseRefName"], settings.RepoRoot, cancellationToken);
+        if (view.ExitCode != 0)
+            return IncompleteSnapshot(view, "pull-request inspection failed");
+
+        if (!TryParsePullRequestView(view.Output, out var merged, out var state, out var mergeable, out var mergeStateStatus, out var headOid, out var baseRefName, out var viewError))
+            return IncompleteSnapshot(viewError ?? "pull-request inspection returned malformed JSON");
+
+        // A merged PR is terminal and does not need a checks query. Retain the
+        // state from GitHub so a closed-but-unmerged PR cannot look reviewable.
+        if (merged)
+        {
+            var mergedSnapshot = new PullRequestSnapshot(true, [], [], mergeable, mergeStateStatus, headOid, baseRefName, state, true);
+            log.Write("info", "github.inspect", new { pullRequestUrl, checks = 0, feedback = 0, state, inspectionComplete = true });
+            return mergedSnapshot;
+        }
 
         var checkResult = await processes.RunAsync(settings.GhExe, ["pr", "checks", pullRequestUrl, "--json", "name,state,bucket,link"], settings.RepoRoot, cancellationToken);
-        var checks = await AddFailureLogsAsync(ParseChecks(checkResult.Output), id, settings, cancellationToken);
-        var feedback = includeFeedback ? await GetFeedback(id, settings, cancellationToken) : [];
-        log.Write("info", "github.inspect", new { pullRequestUrl, checks = checks.Count, feedback = feedback.Count });
-        return new PullRequestSnapshot(false, checks, feedback, mergeable, mergeStateStatus, headOid, baseRefName);
+        var checkParse = ParseChecks(checkResult);
+        var checks = await AddFailureLogsAsync(checkParse.Checks, id, settings, cancellationToken);
+        var complete = checkParse.Complete;
+        var errors = checkParse.Error;
+        IReadOnlyList<ReviewFeedback> feedback = [];
+        if (includeFeedback)
+        {
+            try
+            {
+                feedback = await GetFeedback(id, settings, cancellationToken);
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                complete = false;
+                errors = AppendError(errors, "review feedback inspection timed out");
+            }
+            catch (Exception exception)
+            {
+                complete = false;
+                errors = AppendError(errors, "review feedback inspection failed: " + Limit(exception.Message, 500));
+            }
+        }
+
+        log.Write("info", "github.inspect", new { pullRequestUrl, checks = checks.Count, feedback = feedback.Count, state, inspectionComplete = complete, error = errors });
+        return new PullRequestSnapshot(false, checks, feedback, mergeable, mergeStateStatus, headOid, baseRefName, state, complete, errors ?? string.Empty);
     }
+
+    public async Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken)
+    {
+        if (!TryParseActionsRun(actionsRunUrl, out var owner, out var repository, out var runId))
+            throw new InvalidDataException($"Not a canonical GitHub Actions run URL: {actionsRunUrl}");
+        var settings = config();
+        await Require(settings.GhExe, ["run", "rerun", runId, "--repo", $"{owner}/{repository}"], settings.RepoRoot, cancellationToken);
+        log.Write("info", "github.check.rerun", new { actionsRunUrl, runId, repository = $"{owner}/{repository}" });
+    }
+
+    public Task RerunWorkflowAsync(string actionsRunUrl, CancellationToken cancellationToken) => RerunAsync(actionsRunUrl, cancellationToken);
 
     public async Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken)
     {
@@ -109,23 +207,188 @@ public sealed class GitHubClient : IGitHubClient
         return feedback;
     }
 
-    private static List<CheckState> ParseChecks(string output)
+    private static CheckParseResult ParseChecks(ExecResult result)
     {
-        if (string.IsNullOrWhiteSpace(output)) return [];
-        using var document = JsonDocument.Parse(output);
-        return document.RootElement.EnumerateArray().Select(item => new CheckState(
-            item.GetProperty("name").GetString() ?? string.Empty,
-            item.TryGetProperty("state", out var state) ? state.GetString() ?? string.Empty : string.Empty,
-            item.TryGetProperty("bucket", out var bucket) ? bucket.GetString() ?? string.Empty : string.Empty,
-            item.TryGetProperty("link", out var link) ? link.GetString() ?? string.Empty : string.Empty)).ToList();
+        var output = result.Output.Trim();
+        var error = result.Error.Trim();
+        if (TryParseCheckArray(output, out var checks, out var parseError))
+        {
+            // gh uses exit code 8 for pending checks. A valid JSON array is
+            // still a complete inspection in that case; the individual
+            // pending states keep the snapshot non-green.
+            return (result.ExitCode is 0 or 8) && !ContainsFailureSignal(error)
+                ? new CheckParseResult(checks, true, null)
+                : new CheckParseResult([], false, "pull-request checks inspection failed: " + Limit(ExecResultDiagnostics.Failure(result), 1_000));
+        }
+
+        if (IsNoChecksResponse(output, error)) return new CheckParseResult([], true, null);
+
+        var processFailure = ExecResultDiagnostics.Failure(result);
+        var detail = string.Join("; ", new[] { parseError, processFailure }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Distinct(StringComparer.Ordinal));
+        return new CheckParseResult([], false, "pull-request checks inspection incomplete: " + Limit(detail, 1_000));
     }
+
+    private static bool TryParseCheckArray(string output, out List<CheckState> checks, out string? error)
+    {
+        checks = [];
+        error = null;
+        if (string.IsNullOrWhiteSpace(output))
+        {
+            error = "gh pr checks returned no JSON output";
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                error = "gh pr checks JSON root was not an array";
+                return false;
+            }
+
+            foreach (var item in document.RootElement.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object
+                    || !TryGetRequiredString(item, "name", out var name)
+                    || !TryGetRequiredString(item, "state", out var state))
+                {
+                    checks = [];
+                    error = "gh pr checks JSON contained a malformed check entry";
+                    return false;
+                }
+
+                checks.Add(new CheckState(
+                    name,
+                    state,
+                    TryGetOptionalString(item, "bucket"),
+                    TryGetOptionalString(item, "link")));
+            }
+
+            return true;
+        }
+        catch (JsonException exception)
+        {
+            error = "gh pr checks returned malformed JSON: " + exception.Message;
+            return false;
+        }
+    }
+
+    private static bool IsNoChecksResponse(string output, string error)
+    {
+        // `gh pr checks --json ...` normally emits [] for this case. Some gh
+        // versions instead print a human-readable no-checks notice and may
+        // use a non-zero status. Accept only that explicit notice; blank,
+        // auth, and network failures remain incomplete.
+        if (output == "[]" && !ContainsFailureSignal(error)) return true;
+        if (ContainsFailureSignal(error) || ContainsFailureSignal(output)) return false;
+        var text = string.IsNullOrWhiteSpace(output) ? error : output;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        var normalized = text.Trim().ToLowerInvariant();
+        return normalized.Contains("no checks", StringComparison.Ordinal)
+            && (normalized.Contains("reported", StringComparison.Ordinal)
+                || normalized.Contains("found", StringComparison.Ordinal)
+                || normalized.Contains("available", StringComparison.Ordinal)
+                || normalized.Contains("configured", StringComparison.Ordinal));
+    }
+
+    private static bool ContainsFailureSignal(string value)
+    {
+        var normalized = value.ToLowerInvariant();
+        return normalized.Contains("authentication", StringComparison.Ordinal)
+            || normalized.Contains("bad credentials", StringComparison.Ordinal)
+            || normalized.Contains("http 401", StringComparison.Ordinal)
+            || normalized.Contains("http 403", StringComparison.Ordinal)
+            || normalized.Contains("not logged in", StringComparison.Ordinal)
+            || normalized.Contains("login required", StringComparison.Ordinal)
+            || normalized.Contains("unauthorized", StringComparison.Ordinal)
+            || normalized.Contains("forbidden", StringComparison.Ordinal)
+            || normalized.Contains("not found", StringComparison.Ordinal)
+            || normalized.Contains("network", StringComparison.Ordinal)
+            || normalized.Contains("timed out", StringComparison.Ordinal)
+            || normalized.Contains("timeout", StringComparison.Ordinal)
+            || normalized.Contains("connection", StringComparison.Ordinal)
+            || normalized.Contains("unable to access", StringComparison.Ordinal)
+            || normalized.Contains("failed to connect", StringComparison.Ordinal)
+            || normalized.Contains("could not resolve", StringComparison.Ordinal)
+            || normalized.Contains("api request failed", StringComparison.Ordinal)
+            || normalized.Contains("error", StringComparison.Ordinal);
+    }
+
+    private static bool TryParsePullRequestView(string output, out bool merged, out string state, out string mergeable, out string mergeStateStatus, out string headOid, out string baseRefName, out string? error)
+    {
+        merged = false;
+        state = "UNKNOWN";
+        mergeable = "UNKNOWN";
+        mergeStateStatus = "UNKNOWN";
+        headOid = string.Empty;
+        baseRefName = string.Empty;
+        error = null;
+        try
+        {
+            using var document = JsonDocument.Parse(output);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                error = "gh pr view JSON root was not an object";
+                return false;
+            }
+
+            var root = document.RootElement;
+            merged = root.TryGetProperty("mergedAt", out var mergedAt) && mergedAt.ValueKind == JsonValueKind.String && !string.IsNullOrWhiteSpace(mergedAt.GetString());
+            state = TryGetOptionalString(root, "state");
+            if (string.IsNullOrWhiteSpace(state)) state = merged ? "CLOSED" : "OPEN";
+            mergeable = TryGetOptionalString(root, "mergeable");
+            mergeStateStatus = TryGetOptionalString(root, "mergeStateStatus");
+            headOid = TryGetOptionalString(root, "headRefOid");
+            baseRefName = TryGetOptionalString(root, "baseRefName");
+            if (state == "UNKNOWN" || string.IsNullOrWhiteSpace(mergeable) || string.IsNullOrWhiteSpace(mergeStateStatus))
+            {
+                error = "gh pr view JSON omitted required pull-request state or mergeability fields";
+                return false;
+            }
+            return true;
+        }
+        catch (JsonException exception)
+        {
+            error = "gh pr view returned malformed JSON: " + exception.Message;
+            return false;
+        }
+    }
+
+    private static bool TryGetRequiredString(JsonElement root, string name, out string value)
+    {
+        value = string.Empty;
+        if (!root.TryGetProperty(name, out var property) || property.ValueKind != JsonValueKind.String) return false;
+        value = property.GetString() ?? string.Empty;
+        return !string.IsNullOrWhiteSpace(value);
+    }
+
+    private static string TryGetOptionalString(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var property) || property.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return string.Empty;
+        return property.ValueKind == JsonValueKind.String ? property.GetString() ?? string.Empty : string.Empty;
+    }
+
+    private static PullRequestSnapshot IncompleteSnapshot(ExecResult result, string prefix)
+    {
+        var detail = ExecResultDiagnostics.Failure(result);
+        return IncompleteSnapshot(prefix + ": " + Limit(detail, 1_000));
+    }
+
+    private static PullRequestSnapshot IncompleteSnapshot(string error) =>
+        new(false, [], [], "UNKNOWN", "UNKNOWN", "", "", "UNKNOWN", false, error);
+
+    private static string AppendError(string? current, string addition) => string.IsNullOrWhiteSpace(current) ? addition : current + " | " + addition;
+    private static string Limit(string value, int maxLength) => value.Length <= maxLength ? value : value[..maxLength] + "...";
 
     private async Task<List<CheckState>> AddFailureLogsAsync(List<CheckState> checks, PullRequestId pullRequest, WorkerConfig settings, CancellationToken cancellationToken)
     {
         for (var index = 0; index < checks.Count; index++)
         {
             var check = checks[index];
-            if (!check.IsFailure || !TryGetActionsRunId(check.Link, out var runId)) continue;
+            if (!check.IsCodeRepair || !TryGetActionsRunId(check.Link, out var runId)) continue;
             var logs = await processes.RunAsync(settings.GhExe, ["run", "view", runId, "--log-failed", "--repo", $"{pullRequest.Owner}/{pullRequest.Repository}"], settings.RepoRoot, cancellationToken);
             var text = logs.ExitCode == 0 ? logs.Output : logs.Error;
             if (text.Length > 16_000) text = text[^16_000..];
@@ -136,14 +399,32 @@ public sealed class GitHubClient : IGitHubClient
 
     private static bool TryGetActionsRunId(string link, out string runId)
     {
-        runId = string.Empty;
-        if (!Uri.TryCreate(link, UriKind.Absolute, out var uri)) return false;
-        var parts = uri.AbsolutePath.Trim('/').Split('/');
-        var marker = Array.FindIndex(parts, part => part.Equals("runs", StringComparison.OrdinalIgnoreCase));
-        if (!uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase) || marker < 0 || marker + 1 >= parts.Length) return false;
-        runId = parts[marker + 1];
-        return runId.All(char.IsDigit);
+        return TryParseActionsRun(link, out _, out _, out runId);
     }
+
+    private static bool TryParseActionsRun(string link, out string owner, out string repository, out string runId)
+    {
+        owner = string.Empty;
+        repository = string.Empty;
+        runId = string.Empty;
+        if (!Uri.TryCreate(link, UriKind.Absolute, out var uri)
+            || !uri.Host.Equals("github.com", StringComparison.OrdinalIgnoreCase)) return false;
+        var parts = uri.AbsolutePath.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 5
+            || !parts[2].Equals("actions", StringComparison.OrdinalIgnoreCase)
+            || !parts[3].Equals("runs", StringComparison.OrdinalIgnoreCase)
+            || !parts[0].All(IsValidPathCharacter)
+            || !parts[1].All(IsValidPathCharacter)) return false;
+        runId = parts[4];
+        if (string.IsNullOrWhiteSpace(runId) || !runId.All(char.IsDigit)) return false;
+        owner = parts[0];
+        repository = parts[1];
+        return true;
+    }
+
+    private static bool IsValidPathCharacter(char value) => char.IsLetterOrDigit(value) || value is '-' or '_' or '.';
+
+    private sealed record CheckParseResult(List<CheckState> Checks, bool Complete, string? Error);
 
     private async Task<ExecResult> Require(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken)
     {
