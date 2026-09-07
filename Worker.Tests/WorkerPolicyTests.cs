@@ -5,6 +5,16 @@ namespace MaddoxTasks.Worker.Tests;
 
 public sealed class WorkerPolicyTests
 {
+    [Theory]
+    [InlineData("The 'gpt-6-astra' model requires a newer version of Codex")]
+    [InlineData("failed to load models cache: missing field supports_parallel_tool_calls")]
+    [InlineData("Failed to install system skills: Access denied")]
+    public void CodexClientFailurePolicy_RecognizesWorkerWideClientFailures(string diagnostic)
+    {
+        Assert.True(CodexClientFailurePolicy.IsWorkerWide(diagnostic));
+        Assert.False(CodexClientFailurePolicy.IsWorkerWide("Task-specific validation failed."));
+    }
+
     [Fact]
     public void CodexUsageLimitPolicy_ParsesRetryTimeAndFallsBackOnlyForQuotaDiagnostics()
     {

@@ -49,6 +49,17 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task MergedPullRequest_EnsuresTaskIsDoneBeforeCleanup()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(true));
+
+        await fixture.MonitorAsync();
+
+        Assert.Equal(JobPhases.Done, fixture.Job.Phase);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("Done"));
+    }
+
+    [Fact]
     public async Task GreenCi_RecordsReadyForReviewImmediatelyForManualRepository()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
