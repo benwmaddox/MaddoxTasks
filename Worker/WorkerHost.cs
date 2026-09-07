@@ -1510,7 +1510,9 @@ public sealed class WorkerHost
                     pullRequest.Url,
                     $"GitHub reports mergeable={snapshot.Mergeable}, mergeStateStatus={snapshot.MergeStateStatus}. Merge the latest base branch into the task branch, resolve conflicts without discarding task work, rerun relevant validation, and push the repaired branch.",
                     snapshot.BaseRefName);
-                if (job.ProcessedCheckIds.Add(conflict.Id)) job.PendingCheckFailures.Add(conflict);
+                job.ProcessedCheckIds.Add(conflict.Id);
+                if (!job.PendingCheckFailures.Any(failure => failure.Id.Equals(conflict.Id, StringComparison.Ordinal)))
+                    job.PendingCheckFailures.Add(conflict);
             }
             var additions = FeedbackPolicy.AddNew(job, snapshot.Feedback);
             newFeedback |= additions.Count > 0;

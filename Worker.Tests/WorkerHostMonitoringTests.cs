@@ -156,6 +156,20 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task PersistedProcessedConflict_RearmsRepairWhenNoFailureIsPending()
+    {
+        var conflict = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", HeadOid = "abc123", BaseRefName = "main" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, conflict);
+        fixture.Job.ProcessedCheckIds.Add("pull-request-mergeability|CONFLICTING|https://github.com/example/Repo/pull/1#head-abc123");
+
+        await fixture.MonitorAsync();
+
+        var failure = Assert.Single(fixture.Job.PendingCheckFailures);
+        Assert.Equal("pull-request-mergeability", failure.Name);
+        Assert.Equal("abc123", fixture.Job.PullRequests[0].HeadOid);
+    }
+
+    [Fact]
     public async Task IncompleteInspectionAndClosedPullRequest_CannotBecomeReadyForReview()
     {
         using (var incomplete = HostFixture.Create(autoMergeAllowed: false, Snapshot(false) with { InspectionComplete = false, InspectionError = "network" }))
