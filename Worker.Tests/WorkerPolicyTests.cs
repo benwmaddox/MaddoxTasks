@@ -6,6 +6,19 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class WorkerPolicyTests
 {
     [Fact]
+    public void CodexUsageLimitPolicy_ParsesRetryTimeAndFallsBackOnlyForQuotaDiagnostics()
+    {
+        var zone = TimeZoneInfo.CreateCustomTimeZone("Worker test zone", TimeSpan.FromHours(-4), "Worker test zone", "Worker test zone");
+        var now = new DateTime(2026, 9, 7, 1, 0, 0, DateTimeKind.Utc);
+
+        Assert.True(CodexUsageLimitPolicy.TryGetRetryUtc("You've hit your usage limit. Try again at Sep 10th, 2026 3:14 PM.", now, zone, out var parsed));
+        Assert.Equal(new DateTime(2026, 9, 10, 19, 14, 0, DateTimeKind.Utc), parsed);
+        Assert.True(CodexUsageLimitPolicy.TryGetRetryUtc("You've hit your usage limit.", now, zone, out var fallback));
+        Assert.Equal(now.AddHours(1), fallback);
+        Assert.False(CodexUsageLimitPolicy.TryGetRetryUtc("Codex failed for another reason.", now, zone, out _));
+    }
+
+    [Fact]
     public void ShippedWorkerConfig_UsesAstraWithLowReasoningByDefault()
     {
         var configPath = FindWorkerAsset("worker.json");

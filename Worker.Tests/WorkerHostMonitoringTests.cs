@@ -7,6 +7,34 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class WorkerHostMonitoringTests
 {
     [Fact]
+    public async Task ActiveUsageLimitCooldown_SkipsResearchFollowupsAndFreshClaims()
+    {
+        using var fixture = HostFixture.CreateThrottled(new DateTime(2026, 9, 10, 19, 14, 0, DateTimeKind.Utc));
+
+        var outcome = await fixture.TickAsync();
+
+        Assert.Equal(FreshClaimOutcome.Unavailable, outcome);
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Executable == "codex");
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("claim"));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("research-claim"));
+    }
+
+    [Fact]
+    public async Task ActiveUsageLimitCooldown_StillPublishesPendingBlockedStatus()
+    {
+        using var fixture = HostFixture.CreateThrottled(new DateTime(2026, 9, 10, 19, 14, 0, DateTimeKind.Utc));
+        fixture.Job.Phase = JobPhases.StatusSyncPending;
+        fixture.Job.BlockReason = "missingInput: exact test fixture is absent";
+
+        var outcome = await fixture.TickAsync();
+
+        Assert.Equal(FreshClaimOutcome.Unavailable, outcome);
+        Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("Blocked"));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Executable == "codex");
+    }
+
+    [Fact]
     public async Task GreenCi_RecordsReadyForReviewBeforeAutoMergeQuietPeriod()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(false));
@@ -283,7 +311,7 @@ public sealed class WorkerHostMonitoringTests
     {
         private readonly TemporaryDirectory directory = new();
 
-        private HostFixture(bool autoMergeAllowed, params PullRequestSnapshot[] snapshots)
+        private HostFixture(bool autoMergeAllowed, DateTime? unavailableUntilUtc, params PullRequestSnapshot[] snapshots)
         {
             var configPath = Path.Combine(directory.Path, "worker.json");
             var statePath = Path.Combine(directory.Path, "state");
@@ -331,7 +359,7 @@ public sealed class WorkerHostMonitoringTests
                 Workspaces = [new Workspace("Repo", Path.Combine(directory.Path, "worktree"), "codex/task-1-fix", "https://github.com/example/Repo.git")],
                 PullRequests = [new PullRequestState("https://github.com/example/Repo/pull/1", "Repo")]
             };
-            new Journal { Jobs = [job] }.Save(Path.Combine(statePath, "worker-journal.json"));
+            new Journal { Jobs = [job], CodexUnavailableUntilUtc = unavailableUntilUtc }.Save(Path.Combine(statePath, "worker-journal.json"));
 
             Host = new WorkerHost(configPath, statePath, Clock, Processes, new NullLog(), GitHub);
             var journal = (Journal)typeof(WorkerHost).GetField("journal", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(Host)!;
@@ -347,12 +375,21 @@ public sealed class WorkerHostMonitoringTests
         public TimeSpan QuietPeriod { get; }
 
         public static HostFixture Create(bool autoMergeAllowed, params PullRequestSnapshot[] snapshots)
-            => new(autoMergeAllowed, snapshots);
+            => new(autoMergeAllowed, null, snapshots);
+
+        public static HostFixture CreateThrottled(DateTime unavailableUntilUtc)
+            => new(false, unavailableUntilUtc, Snapshot(false));
 
         public async Task MonitorAsync()
         {
             var method = typeof(WorkerHost).GetMethod("MonitorJobAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
+        }
+
+        public async Task<FreshClaimOutcome> TickAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("TickAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            return await (Task<FreshClaimOutcome>)method.Invoke(Host, [CancellationToken.None, true, true])!;
         }
 
         public async Task ContinueAsync()

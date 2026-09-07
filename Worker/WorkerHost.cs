@@ -96,6 +96,16 @@ public sealed class WorkerHost
     {
         log.Write("info", "scheduler.tick", new { active = capacity.Active, queued = followups.Count, paused });
         await ReconcileAsync(ct);
+        if (TryGetCodexUnavailableUntil(out var unavailableUntilUtc))
+        {
+            log.Write("warning", "codex.usage.deferred", new { unavailableUntilUtc });
+            foreach (var job in SnapshotJobs(JobPhases.StatusSyncPending))
+            {
+                try { await SyncBlockedAsync(job, ct); }
+                catch (Exception exception) { log.Write("warning", "job.block.sync.deferred", new { job.Task.Sequence, error = exception.Message }); }
+            }
+            return FreshClaimOutcome.Unavailable;
+        }
         if (allowResearch && !paused)
         {
             await TryStartResearchAsync(ct);
@@ -308,6 +318,11 @@ public sealed class WorkerHost
         {
             // Shutdown leaves the source task Blocked with its durable marker.
         }
+        catch (Exception exception) when (CodexUsageLimitPolicy.TryGetRetryUtc(exception.Message, clock.UtcNow, TimeZoneInfo.Local, out var retryUtc))
+        {
+            RecordCodexUnavailable(retryUtc);
+            log.Write("warning", "research.usage.deferred", new { task.Sequence, retryUtc });
+        }
         catch (Exception exception)
         {
             log.Write("error", "research.failed", new { task.Sequence, error = exception.Message });
@@ -500,6 +515,23 @@ public sealed class WorkerHost
             else await ProcessJobAsync(job, mode, ct);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+        catch (Exception exception) when (CodexUsageLimitPolicy.TryGetRetryUtc(exception.Message, clock.UtcNow, TimeZoneInfo.Local, out var retryUtc))
+        {
+            RecordCodexUnavailable(retryUtc);
+            log.Write("warning", "job.usage.deferred", new { job.Task.Sequence, retryUtc });
+            try
+            {
+                await AddCommentAsync(job, $"Worker deferred after the account-wide Codex usage limit was reached. Retry is scheduled after {retryUtc:O}; retained workspace and task state were preserved.", ct);
+                await ChangeStatusAsync(job, "Next", ct);
+                job.BlockReason = $"Codex usage unavailable until {retryUtc:O}.";
+                SetPhase(job, JobPhases.Blocked);
+            }
+            catch (Exception deferException)
+            {
+                log.Write("error", "job.defer.failed", new { job.Task.Sequence, error = deferException.Message, originalError = exception.Message });
+                await HandleProcessingFailureAsync(job, exception, mode, ct);
+            }
+        }
         catch (Exception exception)
         {
             log.Write("error", "job.failed", new { job.Task.Sequence, error = exception.Message });
@@ -563,6 +595,25 @@ public sealed class WorkerHost
     private static string FormatRetryTime(Job job, TimeSpan delay) => job.WorkerRetryResetUtc is { } reset
         ? $"service reset at {reset:O}"
         : "retry in " + FormatDelay(delay);
+
+    private bool TryGetCodexUnavailableUntil(out DateTime unavailableUntilUtc)
+    {
+        lock (journalGate)
+        {
+            unavailableUntilUtc = journal.CodexUnavailableUntilUtc ?? default;
+            return unavailableUntilUtc > clock.UtcNow;
+        }
+    }
+
+    private void RecordCodexUnavailable(DateTime retryUtc)
+    {
+        lock (journalGate)
+        {
+            if (journal.CodexUnavailableUntilUtc is null || retryUtc > journal.CodexUnavailableUntilUtc)
+                journal.CodexUnavailableUntilUtc = retryUtc;
+            journal.Save(journalPath);
+        }
+    }
 
     private async Task EnsureReservationAttributionAsync(Job job, CancellationToken ct)
     {
@@ -1676,6 +1727,7 @@ public sealed class WorkerHost
     }
     private async Task SyncBlockedAsync(Job job, CancellationToken ct)
     {
+        if (job.Phase != JobPhases.StatusSyncPending) return;
         if (!job.BlockCommentRecorded)
         {
             await AddCommentAsync(job, "Worker blocked: " + job.BlockReason, job.BlockActor ?? "maddox-worker", ct);
