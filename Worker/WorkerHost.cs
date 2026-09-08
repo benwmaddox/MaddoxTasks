@@ -816,15 +816,22 @@ public sealed class WorkerHost
         }
         if (status == "blocked")
         {
-            if (repair && ResultRepositories(result).Values.Any(changed => changed))
+            var repairManifest = repair ? ValidateResultManifest(job, result) : null;
+            if (repairManifest?.Values.Any(changed => changed) == true)
             {
-                await ValidateResultAsync(job, result, ct);
                 ValidateRepairDispositions(job, result, repair: true);
-                await PublishAsync(job, result, repair: true, ct);
-                await ApplyReviewDispositionsAsync(job, result, ct);
-                job.Publication.Clear();
-                job.ExecutionStartHeads.Clear();
-                Save(job);
+                var actualChanges = new List<bool>();
+                foreach (var workspace in job.Workspaces)
+                    actualChanges.Add(await HasExecutionChangesAsync(job, workspace, ct));
+                if (actualChanges.Any(changed => changed))
+                {
+                    await ValidateResultAsync(job, result, ct);
+                    await PublishAsync(job, result, repair: true, ct);
+                    await ApplyReviewDispositionsAsync(job, result, ct);
+                    job.Publication.Clear();
+                    job.ExecutionStartHeads.Clear();
+                    Save(job);
+                }
             }
             await HandleBlockedResultAsync(job, structured.Blocker, repair, ct);
             return;
@@ -984,7 +991,9 @@ public sealed class WorkerHost
             : "Do not claim tasks, mutate Maddox state, create branches, commit, push, create/merge PRs, or reconcile reviews. Task-explicit external actions outside Git and Maddox are allowed only under the capability contract above.";
         var repairContext = repair ? $"\nFAILING CHECKS:\n{JsonSerializer.Serialize(job.PendingCheckFailures)}\nACTIONABLE REVIEW THREADS:\n{JsonSerializer.Serialize(job.PendingFeedback)}\nReturn one checkDispositions item for every failing check ID and one threadDispositions item for every review thread ID. Mark review feedback addressed only when the requested change is complete and include the reply to post." : string.Empty;
         var executionRoot = repositoryless ? $"\nREPO ROOT:\n{config.Current.RepoRoot}" : string.Empty;
-        var adoptedContext = job.AdoptedBlockedWorkspace
+        var adoptedContext = job.AdoptedBlockedWorkspace && repair
+            ? "\nRETAINED WORKSPACE:\nThis worker-owned workspace was retained from a previous blocked attempt. Existing task-branch commits already published on the retained pull request are task-owned context, but are not new repair changes. Inspect and preserve them. Report changed:true only for staged, unstaged, untracked, or committed changes created after this repair execution began."
+            : job.AdoptedBlockedWorkspace
             ? "\nRETAINED WORKSPACE:\nThis worker-owned workspace was retained from a previous blocked attempt. Treat its existing staged, unstaged, untracked, and task-branch commit changes as task-owned work: inspect and preserve them, finish and validate the task, and report changed:true when they remain for publication."
             : string.Empty;
         return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}{adoptedContext}\nRESTRICTIONS:\n{restrictions}{repairContext}";
@@ -1296,15 +1305,21 @@ public sealed class WorkerHost
 
     private async Task ValidateResultAsync(Job job, JsonElement result, CancellationToken ct)
     {
-        var reported = ResultRepositories(result);
-        if (reported.Count != job.Workspaces.Count || job.Workspaces.Any(workspace => !reported.ContainsKey(workspace.Repository)))
-            throw new InvalidDataException("Codex result repository manifest does not match assigned workspaces.");
+        var reported = ValidateResultManifest(job, result);
         foreach (var workspace in job.Workspaces)
         {
             var hasChanges = await HasExecutionChangesAsync(job, workspace, ct);
             if (reported[workspace.Repository] != hasChanges)
                 throw new InvalidDataException($"Codex result change flag does not match repository state for {workspace.Repository}.");
         }
+    }
+
+    private static Dictionary<string, bool> ValidateResultManifest(Job job, JsonElement result)
+    {
+        var reported = ResultRepositories(result);
+        if (reported.Count != job.Workspaces.Count || job.Workspaces.Any(workspace => !reported.ContainsKey(workspace.Repository)))
+            throw new InvalidDataException("Codex result repository manifest does not match assigned workspaces.");
+        return reported;
     }
 
     private static Dictionary<string, bool> ResultRepositories(JsonElement result) => result.GetProperty("repositories").EnumerateArray().ToDictionary(

@@ -375,6 +375,44 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task BlockedRepair_PreservesExternalBlockWhenPublishedCommitsAreOverreported()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var failure = new CheckState("windows-signing-policy", "FAILURE", "fail", "check", fixture.Job.PullRequests[0].Url);
+        fixture.Job.PendingCheckFailures.Add(failure);
+        fixture.Job.AdoptedBlockedWorkspace = true;
+        fixture.Job.ExecutionStartHeads["Repo"] = "published-head";
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["status", "--porcelain"])
+            ? new ExecResult(0, "", "")
+            : call.Arguments.SequenceEqual(["rev-parse", "HEAD"])
+                ? new ExecResult(0, "published-head\n", "")
+                : call.Arguments.Contains("command", StringComparer.Ordinal)
+                    ? new ExecResult(0, "{\"success\":true}", "")
+                    : new ExecResult(0, "", "");
+        var result = JsonSerializer.Serialize(new
+        {
+            status = "blocked",
+            summary = "published repair is waiting for signing credentials",
+            validationEvidence = new[] { "policy tests passed" },
+            repositories = new[] { new { repository = "Repo", changed = true } },
+            commitMessage = "existing commit",
+            prTitle = "existing pull request",
+            prBody = "existing pull request",
+            checkDispositions = new[] { new { checkId = failure.Id, addressed = false, summary = "unsigned release remains" } },
+            threadDispositions = Array.Empty<object>(),
+            workComplete = true,
+            blocker = new { kind = "missingCredential", summary = "production signing credential required", evidence = new[] { "repository secret inventory is empty" }, retryAtUtc = (string?)null }
+        });
+
+        await fixture.CompleteAsync(result, repair: true);
+
+        Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.Contains("missingCredential", fixture.Job.BlockReason);
+        Assert.DoesNotContain(fixture.Processes.Commands, call => call.Arguments.FirstOrDefault() is "commit" or "push");
+        Assert.Contains(fixture.Processes.Commands, call => call.IsStatus("Blocked"));
+    }
+
+    [Fact]
     public async Task UnknownMergeability_WaitsWithoutQueuingRepairOrAutoMerge()
     {
         var pending = Snapshot(false) with { Mergeable = "UNKNOWN", MergeStateStatus = "UNKNOWN" };
