@@ -1684,6 +1684,39 @@ public static class DashboardSummary
     }
 }
 
+public sealed class BufferedRefresh(IClock clock, TimeSpan minimumInterval, Func<Task> refresh)
+{
+    private readonly SemaphoreSlim signal = new(0, 1);
+    private int pending;
+    private DateTime? lastRefreshUtc;
+
+    public void Request()
+    {
+        Interlocked.Exchange(ref pending, 1);
+        try { signal.Release(); } catch (SemaphoreFullException) { }
+    }
+
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            await signal.WaitAsync(cancellationToken);
+            if (Interlocked.Exchange(ref pending, 0) == 0) continue;
+
+            if (lastRefreshUtc is { } previous)
+            {
+                var remaining = minimumInterval - (clock.UtcNow - previous);
+                if (remaining > TimeSpan.Zero) await clock.Delay(remaining, cancellationToken);
+            }
+
+            // The upcoming refresh includes every request received while buffering.
+            Interlocked.Exchange(ref pending, 0);
+            await refresh();
+            lastRefreshUtc = clock.UtcNow;
+        }
+    }
+}
+
 public sealed class FreshClaimAllowance
 {
     private bool used;

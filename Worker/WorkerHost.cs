@@ -21,6 +21,7 @@ public sealed class WorkerHost
     private readonly object wakeGate = new();
     private readonly SemaphoreSlim wakeScheduler = new(0, 1);
     private readonly SemaphoreSlim renderLock = new(1, 1);
+    private readonly BufferedRefresh dashboardRefresh;
     private readonly CancellationTokenSource stop = new();
     private readonly ConcurrencyGate capacity;
     private readonly ResearchAdmission researchAdmission = new();
@@ -41,6 +42,7 @@ public sealed class WorkerHost
         journal = Journal.Load(journalPath);
         this.processes = processes ?? new ProcessRunner(ChildProcessContainmentFactory.Create(OperatingSystem.IsWindows()), this.log);
         this.github = github ?? new GitHubClient(this.processes, () => config.Current, this.log);
+        dashboardRefresh = new BufferedRefresh(this.clock, TimeSpan.FromSeconds(15), TryRenderDashboardAsync);
         this.log.Write("info", "worker.initialized", new { jobs = journal.Jobs.Count });
     }
 
@@ -52,7 +54,7 @@ public sealed class WorkerHost
         await PreflightAsync(ct);
         await RecoverInvalidRetryMetadataAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
-        var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct) };
+        var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct), dashboardRefresh.RunAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
         var wakeReasons = SchedulerWakeReason.Timer;
         _ = TakeSchedulerWakeReasons();
@@ -78,7 +80,7 @@ public sealed class WorkerHost
                 nextTickUtc = cadence.NextTickUtc(config.Current);
                 var nextRetry = NextRetryUtc();
                 if (nextRetry is { } retryAt && retryAt < nextTickUtc) nextTickUtc = retryAt;
-                await RenderAsync();
+                RequestDashboardRefresh();
                 wakeReasons = await WaitForTickAsync(nextTickUtc - clock.UtcNow, ct);
             }
         }
@@ -124,7 +126,7 @@ public sealed class WorkerHost
                 configError = "Cannot claim: " + promptError;
                 log.Write("error", "claim.prompt.rejected", new { error = promptError });
                 capacity.Release();
-                await RenderAsync();
+                RequestDashboardRefresh();
                 return FreshClaimOutcome.Unavailable;
             }
             ExecResult claim;
@@ -556,7 +558,7 @@ public sealed class WorkerHost
                 if (job.Phase != JobPhases.StatusSyncPending) SetPhase(job, JobPhases.StatusSyncPending);
             }
         }
-        finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); await RenderAsync(); }
+        finally { capacity.Release(); SignalScheduler(SchedulerWakeReason.CapacityChanged); RequestDashboardRefresh(); }
     }
 
     private async Task HandleProcessingFailureAsync(Job job, Exception exception, RecoveryMode mode, CancellationToken ct)
@@ -707,7 +709,7 @@ public sealed class WorkerHost
         if (resumeBatch is not null) TaskUpdatePolicy.BeginApplying(job);
         try
         {
-            await RenderAsync();
+            RequestDashboardRefresh();
             run = await RunCodexAsync(job, arguments, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex failed: " + ExecResultDiagnostics.Failure(run));
             resultJson = ExtractResult(run.Output);
@@ -738,7 +740,7 @@ public sealed class WorkerHost
         finally
         {
             if (resumeBatch is not null) TaskUpdatePolicy.EndApplying(job);
-            await RenderAsync();
+            RequestDashboardRefresh();
         }
         if (!job.ExactReservationOwnerRecorded && job.ThreadId is not null)
         {
@@ -833,7 +835,7 @@ public sealed class WorkerHost
             Save(job);
             var schema = WriteSchema("result", ResultSchema);
             const string prompt = "Reassess the structured result for this retained worker-owned workspace. Existing staged, unstaged, untracked, or committed changes in the supplied worktree are task-owned work from the previous attempt, not unrelated user changes. Inspect and preserve them, finish and validate the task, and report changed:true for each repository containing that retained task work so the worker can commit and publish it. Return changed:false only when the repository is clean and contains no task-owned commit after the execution start. Return the normal required structured result schema.";
-            await RenderAsync();
+            RequestDashboardRefresh();
             var run = await RunContinuationAsync(job, schema, prompt, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex retained-workspace result reassessment failed: " + ExecResultDiagnostics.Failure(run));
             var reassessedJson = ExtractResult(run.Output);
@@ -926,7 +928,7 @@ public sealed class WorkerHost
         string reassessedJson;
         try
         {
-            await RenderAsync();
+            RequestDashboardRefresh();
             var run = await RunContinuationAsync(job, schema, prompt, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex blocked-result reassessment failed: " + ExecResultDiagnostics.Failure(run));
             reassessedJson = ExtractResult(run.Output);
@@ -936,7 +938,7 @@ public sealed class WorkerHost
         finally
         {
             if (applyingTaskUpdate) TaskUpdatePolicy.EndApplying(job);
-            await RenderAsync();
+            RequestDashboardRefresh();
         }
         job.PendingResultJson = reassessedJson;
         Save(job);
@@ -1070,7 +1072,7 @@ public sealed class WorkerHost
             TaskUpdatePolicy.BeginApplying(job);
             try
             {
-                await RenderAsync();
+                RequestDashboardRefresh();
                 var run = await RunContinuationAsync(job, schema, prompt, ct);
                 if (run.ExitCode != 0) throw new InvalidOperationException("Codex task-update continuation failed: " + ExecResultDiagnostics.Failure(run));
                 resultJson = ExtractResult(run.Output);
@@ -1084,7 +1086,7 @@ public sealed class WorkerHost
             finally
             {
                 TaskUpdatePolicy.EndApplying(job);
-                await RenderAsync();
+                RequestDashboardRefresh();
             }
         }
     }
@@ -1474,7 +1476,7 @@ public sealed class WorkerHost
             }
             if (changed) journal.Save(journalPath);
         }
-        await RenderAsync();
+        RequestDashboardRefresh();
     }
 
     private async Task RefreshTaskUpdatesAsync(Job job, CancellationToken ct)
@@ -1700,8 +1702,8 @@ public sealed class WorkerHost
             {
                 await clock.Delay(TimeSpan.FromMilliseconds(250), ct);
                 configStamp = newConfigStamp;
-                if (config.TryReload(configPath, out var error)) { configError = null; log.Write("info", "config.reloaded"); promptPath = ResolvePromptPath(config.Current); SignalScheduler(SchedulerWakeReason.ConfigurationChanged); }
-                else { configError = error; log.Write("error", "config.reload.rejected", new { error }); await RenderAsync(); }
+                if (config.TryReload(configPath, out var error)) { configError = null; log.Write("info", "config.reloaded"); promptPath = ResolvePromptPath(config.Current); SignalScheduler(SchedulerWakeReason.ConfigurationChanged); RequestDashboardRefresh(); }
+                else { configError = error; log.Write("error", "config.reload.rejected", new { error }); RequestDashboardRefresh(); }
             }
             var newPromptStamp = File.Exists(promptPath) ? File.GetLastWriteTimeUtc(promptPath) : DateTime.MinValue;
             if (newPromptStamp != promptStamp)
@@ -1709,7 +1711,7 @@ public sealed class WorkerHost
                 promptStamp = newPromptStamp;
                 if (ClaimAdmission.TrySnapshot(config.Current, configPath, out _, out var promptError)) { configError = null; log.Write("info", "prompt.changed", new { promptPath }); }
                 else { configError = "Cannot claim: " + promptError; log.Write("error", "prompt.reload.rejected", new { error = promptError }); }
-                await RenderAsync();
+                RequestDashboardRefresh();
             }
         }
     }
@@ -1723,7 +1725,7 @@ public sealed class WorkerHost
             if (!Console.KeyAvailable) { await clock.Delay(TimeSpan.FromMilliseconds(100), ct); continue; }
             switch (Console.ReadKey(true).Key)
             {
-                case ConsoleKey.P: paused = !paused; log.Write("info", paused ? "claims.paused" : "claims.resumed"); if (!paused) SignalScheduler(SchedulerWakeReason.ConfigurationChanged); break;
+                case ConsoleKey.P: paused = !paused; log.Write("info", paused ? "claims.paused" : "claims.resumed"); if (!paused) SignalScheduler(SchedulerWakeReason.ConfigurationChanged); RequestDashboardRefresh(); break;
                 case ConsoleKey.R: SignalScheduler(SchedulerWakeReason.Manual); break;
                 case ConsoleKey.Q: RequestStop(); return;
             }
@@ -1850,11 +1852,22 @@ public sealed class WorkerHost
         log.Write("info", "job.phase", new { job.Task.Sequence, phase });
         Save(job);
     }
-    private void Save(Job job) { lock (journalGate) journal.Save(journalPath); _ = RenderAsync(); }
+    private void Save(Job job) { lock (journalGate) journal.Save(journalPath); RequestDashboardRefresh(); }
     private Job[] SnapshotJobs(string phase) { lock (journalGate) return journal.Jobs.Where(job => job.Phase == phase).ToArray(); }
     private Job[] SnapshotJobs(Func<Job, bool> predicate) { lock (journalGate) return journal.Jobs.Where(predicate).ToArray(); }
     private Job[] SnapshotCleanupPending() { lock (journalGate) return WorkspaceCleanupPolicy.Pending(journal.Jobs).ToArray(); }
-    private async Task RenderAsync()
+    private void RequestDashboardRefresh()
+    {
+        if (!Console.IsOutputRedirected) dashboardRefresh.Request();
+    }
+
+    private async Task TryRenderDashboardAsync()
+    {
+        try { await RenderDashboardAsync(); }
+        catch (Exception exception) { log.Write("warning", "dashboard.refresh.failed", new { error = exception.Message }); }
+    }
+
+    private async Task RenderDashboardAsync()
     {
         if (Console.IsOutputRedirected) return;
         await renderLock.WaitAsync();
@@ -1867,7 +1880,9 @@ public sealed class WorkerHost
                 : paused ? "claims paused by keyboard" : $"next {nextTickUtc.ToLocalTime():T}";
             ConsoleSegmentWriter.WriteLine([new ConsoleSegment($"Maddox Worker | active {capacity.Active}/{config.Current.MaxConcurrentCodexProcesses} | follow-ups {followups.Count} | {scheduleStatus}", DashboardSegments.Structural)]);
             if (configError is not null) ConsoleSegmentWriter.WriteLine([new ConsoleSegment(DashboardFormatter.Truncate("Configuration error: " + configError, Math.Max(10, Console.WindowWidth - 1)), DashboardSegments.Detail)]);
-            foreach (var job in DashboardPolicy.VisibleJobs(journal.Jobs, clock.UtcNow, config.Current.EffectiveBlockedDisplayDuration))
+            Job[] jobs;
+            lock (journalGate) jobs = journal.Jobs.ToArray();
+            foreach (var job in DashboardPolicy.VisibleJobs(jobs, clock.UtcNow, config.Current.EffectiveBlockedDisplayDuration))
             {
                 var width = Math.Max(10, Console.WindowWidth - 1);
                 var phase = job.Phase switch
