@@ -54,8 +54,34 @@ public sealed class ProcessInputTests
         Assert.Equal(prompt.Replace("\n", Environment.NewLine), result.Output);
     }
 
+    [Fact]
+    public async Task ProcessOutputDrain_AbandonsInheritedPipesAfterParentExit()
+    {
+        using var outputReadStop = new CancellationTokenSource();
+        var outputTask = Task.Delay(Timeout.InfiniteTimeSpan, outputReadStop.Token);
+        var errorTask = Task.Delay(Timeout.InfiniteTimeSpan, outputReadStop.Token);
+        var log = new RecordingLog();
+        var abandoned = false;
+
+        var method = typeof(ProcessRunner).GetMethod("DrainOutputAfterExitAsync",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)!;
+        var drain = (Task)method.Invoke(null, [outputTask, errorTask, outputReadStop,
+            (Action)(() => abandoned = true), "codex.exe", TimeSpan.FromMilliseconds(20), CancellationToken.None, log])!;
+        await drain;
+
+        Assert.True(outputReadStop.IsCancellationRequested);
+        Assert.True(abandoned);
+        Assert.Contains(log.Events, item => item.Message == "process.output-drain.abandoned");
+    }
+
     private sealed class NullLog : IRollingLog
     {
         public void Write(string level, string message, object? data = null) { }
+    }
+
+    private sealed class RecordingLog : IRollingLog
+    {
+        public List<(string Level, string Message)> Events { get; } = [];
+        public void Write(string level, string message, object? data = null) => Events.Add((level, message));
     }
 }

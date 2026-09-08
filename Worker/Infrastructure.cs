@@ -52,6 +52,7 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
         process.Start();
         containment.Add(process);
         using var registration = cancellationToken.Register(() => { try { process.Kill(true); } catch { } });
+        using var outputReadStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var output = new StringBuilder();
         var error = new StringBuilder();
         var terminal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -64,8 +65,8 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
                 terminalObserved = true;
                 terminal.TrySetResult();
             }
-        });
-        var errorTask = ReadAsync(process.StandardError, error, null);
+        }, outputReadStop.Token);
+        var errorTask = ReadAsync(process.StandardError, error, null, outputReadStop.Token);
         var inputTask = WriteInputAsync(process, standardInput, cancellationToken);
         var exitTask = process.WaitForExitAsync(cancellationToken);
         if (terminalOutput is null) await exitTask;
@@ -81,7 +82,11 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
             }
         }
         else await exitTask;
-        await Task.WhenAll(outputTask, errorTask);
+        await DrainOutputAfterExitAsync(outputTask, errorTask, outputReadStop, () =>
+        {
+            process.StandardOutput.Dispose();
+            process.StandardError.Dispose();
+        }, Path.GetFileName(executable), TimeSpan.FromSeconds(2), cancellationToken, log);
         try { await inputTask; }
         catch (IOException) when (process.ExitCode != 0 || terminalObserved) { /* Preserve the child failure when it closes stdin early. */ }
         var result = new ExecResult(terminalObserved ? 0 : process.ExitCode, output.ToString(), error.ToString());
@@ -108,7 +113,24 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
         StandardErrorEncoding = Encoding.UTF8,
         CreateNoWindow = true
     };
-    private static async Task ReadAsync(StreamReader reader, StringBuilder target, Action<string>? callback) { while (await reader.ReadLineAsync() is { } line) { target.AppendLine(line); callback?.Invoke(line); } }
+    internal static async Task DrainOutputAfterExitAsync(Task outputTask, Task errorTask, CancellationTokenSource outputReadStop, Action abandonReaders, string executable, TimeSpan timeout, CancellationToken cancellationToken, IRollingLog log)
+    {
+        var readers = Task.WhenAll(outputTask, errorTask);
+        if (await Task.WhenAny(readers, Task.Delay(timeout, cancellationToken)) == readers)
+        {
+            await readers;
+            return;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        log.Write("warning", "process.output-drain.abandoned", new { executable, timeout });
+        outputReadStop.Cancel();
+        abandonReaders();
+        try { await readers; }
+        catch (Exception exception) when (outputReadStop.IsCancellationRequested && exception is OperationCanceledException or IOException or ObjectDisposedException) { }
+    }
+
+    private static async Task ReadAsync(StreamReader reader, StringBuilder target, Action<string>? callback, CancellationToken cancellationToken) { while (await reader.ReadLineAsync(cancellationToken) is { } line) { target.AppendLine(line); callback?.Invoke(line); } }
     private static string SafeError(string error) => error.Length > 1000 ? error[..1000] : error;
 }
 
