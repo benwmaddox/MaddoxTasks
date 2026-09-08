@@ -245,7 +245,7 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
-    public async Task MergeabilityRepair_ResumesResolvedMergeOnlyForExactCurrentBase()
+    public async Task MergeabilityRepair_ResumesExactMergeAndReplacesStaleMergeBase()
     {
         using var resumed = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
         resumed.Job.PendingCheckFailures.Add(new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", resumed.Job.PullRequests[0].Url, "details", "main"));
@@ -268,7 +268,11 @@ public sealed class WorkerHostMonitoringTests
                 ? new ExecResult(0, "current-base\n", "")
                 : new ExecResult(0, "", "");
 
-        await Assert.ThrowsAsync<InvalidOperationException>(mismatched.PrepareMergeabilityAsync);
+        await mismatched.PrepareMergeabilityAsync();
+
+        Assert.Contains(mismatched.Processes.Commands, call => call.Arguments.SequenceEqual(["merge", "--abort"]));
+        Assert.Contains(mismatched.Processes.Commands, call => call.Arguments.SequenceEqual(["merge", "--no-commit", "--no-ff", "--", "origin/main"]));
+        Assert.Contains("aborted that merge and prepared the current exact base current-base", mismatched.Job.PendingCheckFailures[0].Details);
     }
 
     [Fact]
