@@ -152,10 +152,12 @@ public sealed class WorkerLifecycleTests
     public void WorkerResultPolicy_RequiresEvidenceForEveryNonNoneBlocker()
     {
         Assert.Throws<InvalidDataException>(() => WorkerResultPolicy.Parse(Result("blocked", false, "missingInput", "input is absent", [])));
+        Assert.Throws<InvalidDataException>(() => WorkerResultPolicy.Parse(Result("blocked", false, "missingInput", "", ["input is absent"])));
         Assert.Throws<InvalidDataException>(() => WorkerResultPolicy.ValidateCombination(
             "blocked", false, new WorkerBlocker(WorkerBlockerKinds.UpstreamDependency, "dependency", [])));
-        var none = WorkerResultPolicy.Parse(Result("completed", true, WorkerBlockerKinds.None, "done", []));
+        var none = WorkerResultPolicy.Parse(Result("completed", true, WorkerBlockerKinds.None, "", []));
         Assert.Empty(none.Blocker.Evidence);
+        Assert.Equal("result", none.Blocker.Summary);
 
         var legacy = WorkerResultPolicy.Parse("{\"status\":\"blocked\",\"summary\":\"old blocker\"}", allowLegacy: true);
         Assert.NotEmpty(legacy.Blocker.Evidence);
