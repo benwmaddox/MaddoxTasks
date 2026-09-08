@@ -1012,20 +1012,28 @@ public sealed class WorkerHost
             var remoteBase = $"origin/{preparedConflict.BaseRefName}";
             var preparation = $"Worker fetched and prepared the exact pull request base {remoteBase} before repair.";
             var mergeHead = await processes.RunAsync("git", ["rev-parse", "--verify", "-q", "MERGE_HEAD"], workspace.Directory, ct);
+            var startMerge = mergeHead.ExitCode != 0;
             if (mergeHead.ExitCode == 0)
             {
                 var expectedBase = await RequireAsync("git", ["rev-parse", remoteBase], workspace.Directory, ct);
                 if (!mergeHead.Output.Trim().Equals(expectedBase.Output.Trim(), StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException($"Retained merge state targets {mergeHead.Output.Trim()}, not the current exact base {expectedBase.Output.Trim()}.");
-                var unresolved = await processes.RunAsync("git", ["diff", "--name-only", "--diff-filter=U"], workspace.Directory, ct);
-                if (unresolved.ExitCode != 0)
-                    throw new InvalidOperationException("Could not inspect retained merge conflicts: " + unresolved.Error.Trim());
-                preparation += string.IsNullOrWhiteSpace(unresolved.Output)
-                    ? " The retained merge already targets that exact base and all conflicts are resolved and staged; validate and publish it without restarting the merge."
-                    : " The retained merge already targets that exact base. Unresolved merge paths are present for Codex to resolve: "
-                        + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+                {
+                    await RequireAsync("git", ["merge", "--abort"], workspace.Directory, ct);
+                    startMerge = true;
+                    preparation += $" The retained merge targeted stale base {mergeHead.Output.Trim()}, so the worker aborted that merge and prepared the current exact base {expectedBase.Output.Trim()}.";
+                }
+                else
+                {
+                    var unresolved = await processes.RunAsync("git", ["diff", "--name-only", "--diff-filter=U"], workspace.Directory, ct);
+                    if (unresolved.ExitCode != 0)
+                        throw new InvalidOperationException("Could not inspect retained merge conflicts: " + unresolved.Error.Trim());
+                    preparation += string.IsNullOrWhiteSpace(unresolved.Output)
+                        ? " The retained merge already targets that exact base and all conflicts are resolved and staged; validate and publish it without restarting the merge."
+                        : " The retained merge already targets that exact base. Unresolved merge paths are present for Codex to resolve: "
+                            + string.Join(", ", ChangedPaths(unresolved.Output)) + ".";
+                }
             }
-            else
+            if (startMerge)
             {
                 var merge = await processes.RunAsync("git", ["merge", "--no-commit", "--no-ff", "--", remoteBase], workspace.Directory, ct);
                 if (merge.ExitCode != 0)
