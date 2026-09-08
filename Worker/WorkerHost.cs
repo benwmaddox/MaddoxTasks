@@ -814,6 +814,16 @@ public sealed class WorkerHost
         }
         if (status == "blocked")
         {
+            if (repair && ResultRepositories(result).Values.Any(changed => changed))
+            {
+                await ValidateResultAsync(job, result, ct);
+                ValidateRepairDispositions(job, result, repair: true);
+                await PublishAsync(job, result, repair: true, ct);
+                await ApplyReviewDispositionsAsync(job, result, ct);
+                job.Publication.Clear();
+                job.ExecutionStartHeads.Clear();
+                Save(job);
+            }
             await HandleBlockedResultAsync(job, structured.Blocker, repair, ct);
             return;
         }

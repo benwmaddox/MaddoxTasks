@@ -332,6 +332,45 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task BlockedRepair_PublishesAddressedRepositoryChangesBeforeExternalBlock()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var failure = new CheckState("pull-request-mergeability", "CONFLICTING", "fail", "conflict", fixture.Job.PullRequests[0].Url);
+        fixture.Job.PendingCheckFailures.Add(failure);
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["status", "--porcelain"])
+            ? new ExecResult(0, "M src/file.cs\n", "")
+            : call.Arguments.SequenceEqual(["rev-parse", "HEAD"])
+                ? new ExecResult(0, "local-head\n", "")
+                : call.Arguments.FirstOrDefault() == "ls-remote"
+                    ? new ExecResult(0, "", "")
+                    : call.Arguments.Contains("command", StringComparer.Ordinal)
+                        ? new ExecResult(0, "{\"success\":true}", "")
+                        : new ExecResult(0, "", "");
+        var result = JsonSerializer.Serialize(new
+        {
+            status = "blocked",
+            summary = "repair complete; credentialed acceptance remains",
+            validationEvidence = new[] { "focused tests passed" },
+            repositories = new[] { new { repository = "Repo", changed = true } },
+            commitMessage = "repair conflict",
+            prTitle = "repair conflict",
+            prBody = "repair conflict",
+            checkDispositions = new[] { new { checkId = failure.Id, addressed = true, summary = "resolved" } },
+            threadDispositions = Array.Empty<object>(),
+            workComplete = false,
+            blocker = new { kind = "missingCredential", summary = "credential required", evidence = new[] { "TOKEN is absent" }, retryAtUtc = (string?)null }
+        });
+
+        await fixture.CompleteAsync(result, repair: true);
+
+        Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.FirstOrDefault() == "commit");
+        Assert.Contains(fixture.Processes.Commands, call => call.Arguments.FirstOrDefault() == "push");
+        Assert.Contains(fixture.Processes.Commands, call => call.IsStatus("Blocked"));
+    }
+
+    [Fact]
     public async Task UnknownMergeability_WaitsWithoutQueuingRepairOrAutoMerge()
     {
         var pending = Snapshot(false) with { Mergeable = "UNKNOWN", MergeStateStatus = "UNKNOWN" };
@@ -482,6 +521,13 @@ public sealed class WorkerHostMonitoringTests
             """);
             var method = typeof(WorkerHost).GetMethod("CompleteResultAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task)method.Invoke(Host, [Job, result.RootElement, true, CancellationToken.None])!;
+        }
+
+        public async Task CompleteAsync(string resultJson, bool repair)
+        {
+            using var result = JsonDocument.Parse(resultJson);
+            var method = typeof(WorkerHost).GetMethod("CompleteResultAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [Job, result.RootElement, repair, CancellationToken.None])!;
         }
 
         public void Dispose() => directory.Dispose();
