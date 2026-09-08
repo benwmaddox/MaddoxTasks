@@ -456,6 +456,17 @@ public sealed class WorkerHostMonitoringTests
         Assert.Equal("-", command.Arguments[^1]);
     }
 
+    [Fact]
+    public void WorkerEnvelope_TreatsWorkerOwnedPublicationAsExpectedHandoff()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+
+        var envelope = fixture.BuildEnvelope(repair: false);
+
+        Assert.Contains("commit, push, and pull-request publication are the expected handoff", envelope);
+        Assert.Contains("return completed with changed:true and blocker none", envelope);
+    }
+
     private static PullRequestSnapshot Snapshot(bool merged, IReadOnlyList<CheckState>? checks = null, IReadOnlyList<ReviewFeedback>? feedback = null)
         => new(merged, checks ?? [new CheckState("build", "SUCCESS", "pass", "")], feedback ?? []);
 
@@ -548,6 +559,12 @@ public sealed class WorkerHostMonitoringTests
         {
             var method = typeof(WorkerHost).GetMethod("RunContinuationAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task<ExecResult>)method.Invoke(Host, [Job, "schema.json", "continue", CancellationToken.None])!;
+        }
+
+        public string BuildEnvelope(bool repair)
+        {
+            var method = typeof(WorkerHost).GetMethod("BuildEnvelope", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            return (string)method.Invoke(Host, [Job, repair])!;
         }
 
         public async Task PrepareMergeabilityAsync()
