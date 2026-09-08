@@ -71,7 +71,7 @@ public sealed class WorkerLifecycleTests
     }
 
     [Fact]
-    public void WorkerRetryPolicy_NewRepairableFingerprintGetsFreshElapsedBudget()
+    public void WorkerRetryPolicy_ChangingRepairableSummaryKeepsEpisodeBudget()
     {
         using var directory = new TemporaryDirectory();
         var config = TestConfig(directory.Path, maxAttempts: 2, maxElapsed: TimeSpan.FromHours(1));
@@ -79,7 +79,13 @@ public sealed class WorkerLifecycleTests
         var job = CreateJob(JobPhases.RetryWaiting);
 
         Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "first failure", started, config, out _));
-        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "different failure", started.AddHours(2), config, out _));
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "different wording", started.AddMinutes(1), config, out _));
+        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "another paraphrase", started.AddMinutes(2), config, out _));
+        Assert.Equal(2, job.WorkerRetryAttempts);
+        Assert.Equal(started, job.WorkerRetryStartedUtc);
+
+        WorkerRetryPolicy.Clear(job);
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "later independent failure", started.AddHours(2), config, out _));
         Assert.Equal(1, job.WorkerRetryAttempts);
         Assert.Equal(started.AddHours(2), job.WorkerRetryStartedUtc);
     }

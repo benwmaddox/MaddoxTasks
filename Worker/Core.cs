@@ -837,7 +837,11 @@ public static class WorkerRetryPolicy
 
         var fingerprint = Fingerprint(kind, summary);
         var same = string.Equals(job.WorkerRetryFingerprint, fingerprint, StringComparison.Ordinal);
-        if (!same)
+        var continuingRepairEpisode = kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase)
+            && job.WorkerRetryLastKind?.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase) == true
+            && job.WorkerRetryAttempts > 0
+            && IsUsableTimestamp(job.WorkerRetryStartedUtc);
+        if (!same && !continuingRepairEpisode)
         {
             job.WorkerRetryAttempts = 0;
             job.WorkerRetryStartedUtc = nowUtc;
@@ -847,8 +851,10 @@ public static class WorkerRetryPolicy
         // Service/transient failures are temporal gates.  They must continue
         // to be retried after a long outage or usage-limit reset; the delay is
         // capped to keep malformed or unbounded diagnostics from creating a
-        // single effectively permanent sleep.  workerRepairable remains
-        // bounded by the configured attempt and elapsed-time budget.
+        // single effectively permanent sleep.  A workerRepairable episode is
+        // bounded across changing summaries because model paraphrases must not
+        // reset its configured attempt and elapsed-time budget.  Clear() marks
+        // genuine progress and starts a fresh episode for a later failure.
         if (kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase))
         {
             if (nowUtc - job.WorkerRetryStartedUtc.Value >= config.EffectiveWorkerRetryMaxElapsed) return false;
