@@ -413,6 +413,41 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public async Task BufferedRefresh_CoalescesBurstAndWaitsForMinimumInterval()
+    {
+        var clock = new ControlledRefreshClock(new DateTime(2026, 9, 4, 13, 17, 0, DateTimeKind.Utc));
+        var firstRefresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var secondRefresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var refreshCount = 0;
+        var buffer = new BufferedRefresh(clock, TimeSpan.FromSeconds(15), () =>
+        {
+            var count = Interlocked.Increment(ref refreshCount);
+            if (count == 1) firstRefresh.TrySetResult();
+            if (count == 2) secondRefresh.TrySetResult();
+            return Task.CompletedTask;
+        });
+        using var stop = new CancellationTokenSource();
+        var run = buffer.RunAsync(stop.Token);
+
+        buffer.Request();
+        await firstRefresh.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        buffer.Request();
+        buffer.Request();
+        buffer.Request();
+        var requestedDelay = await clock.DelayRequested.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(TimeSpan.FromSeconds(15), requestedDelay);
+        Assert.Equal(1, Volatile.Read(ref refreshCount));
+
+        clock.CompleteDelay();
+        await secondRefresh.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, Volatile.Read(ref refreshCount));
+
+        stop.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+    }
+
+    [Fact]
     public void DashboardSegments_FormatsAndColorsUpdateTimestamp()
     {
         var local = new DateTimeOffset(2026, 9, 4, 21, 7, 0, TimeSpan.FromHours(-4));
@@ -1266,6 +1301,41 @@ public sealed class WorkerPolicyTests
     {
         public DateTime UtcNow { get; } = now;
         public Task Delay(TimeSpan delay, CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class ControlledRefreshClock(DateTime now) : IClock
+    {
+        private readonly object gate = new();
+        private TaskCompletionSource? pendingDelay;
+        private TimeSpan delay;
+
+        public DateTime UtcNow { get; private set; } = now;
+        public TaskCompletionSource<TimeSpan> DelayRequested { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Delay(TimeSpan delay, CancellationToken cancellationToken)
+        {
+            lock (gate)
+            {
+                this.delay = delay;
+                var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                pendingDelay = completion;
+                cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
+                DelayRequested.TrySetResult(delay);
+                return completion.Task;
+            }
+        }
+
+        public void CompleteDelay()
+        {
+            TaskCompletionSource completion;
+            lock (gate)
+            {
+                UtcNow += delay;
+                completion = pendingDelay ?? throw new InvalidOperationException("No refresh delay is pending.");
+                pendingDelay = null;
+            }
+            completion.TrySetResult();
+        }
     }
     private sealed class TemporaryDirectory : IDisposable
     {
