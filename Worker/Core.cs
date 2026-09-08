@@ -644,9 +644,11 @@ public static class WorkerResultPolicy
         if (property.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException("Worker result blocker must be an object.");
         var kindValue = OptionalString(property, "kind");
+        var summaryProperty = FindProperty(property, "summary");
         var summary = OptionalString(property, "summary");
         var evidenceProperty = FindProperty(property, "evidence");
-        var complete = !string.IsNullOrWhiteSpace(kindValue) && !string.IsNullOrWhiteSpace(summary)
+        var complete = !string.IsNullOrWhiteSpace(kindValue)
+            && summaryProperty is { } summaryElement && summaryElement.ValueKind == JsonValueKind.String
             && evidenceProperty is { } evidenceElement && evidenceElement.ValueKind == JsonValueKind.Array;
         if (!complete && !allowLegacy)
             throw new InvalidDataException("Worker result blocker requires kind, summary, and evidence.");
@@ -659,6 +661,8 @@ public static class WorkerResultPolicy
 
         var kind = WorkerBlockerKinds.All.FirstOrDefault(value => value.Equals(kindValue!.Trim(), StringComparison.OrdinalIgnoreCase));
         if (kind is null) throw new InvalidDataException($"Worker blocker kind '{kindValue}' is not allowed.");
+        if (kind != WorkerBlockerKinds.None && string.IsNullOrWhiteSpace(summary))
+            throw new InvalidDataException("Non-none worker blockers require a non-empty summary.");
         if (evidenceProperty!.Value.ValueKind != JsonValueKind.Array)
             throw new InvalidDataException("Worker blocker evidence must be an array of strings.");
         var evidence = evidenceProperty.Value.EnumerateArray().Select(item =>
@@ -667,8 +671,9 @@ public static class WorkerResultPolicy
                 throw new InvalidDataException("Worker blocker evidence must contain only non-empty strings.");
             return item.GetString()!.Trim();
         }).ToArray();
-        var retryAtUtc = ParseRetryAt(property, summary!);
-        return new WorkerBlocker(kind, summary!.Trim(), evidence, retryAtUtc);
+        var normalizedSummary = string.IsNullOrWhiteSpace(summary) ? resultSummary : summary.Trim();
+        var retryAtUtc = ParseRetryAt(property, normalizedSummary);
+        return new WorkerBlocker(kind, normalizedSummary, evidence, retryAtUtc);
     }
 
     private static WorkerBlocker LegacyBlocker(string status, string summary) => status == "blocked"
