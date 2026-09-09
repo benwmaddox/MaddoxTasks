@@ -1695,6 +1695,23 @@ public static class DashboardSummary
     }
 }
 
+public static class DashboardBanner
+{
+    public const string ShortcutLegend = "[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker";
+
+    public static string[] Lines(int active, int capacity, int followups, bool paused, DateTime nextRunLocal)
+    {
+        var scheduleStatus = capacity == 0
+            ? "paused by concurrency cap"
+            : paused ? "claims paused by keyboard" : $"next {nextRunLocal:T}";
+        return
+        [
+            $"Maddox Worker | active {active}/{capacity} | follow-ups {followups} | {scheduleStatus}",
+            ShortcutLegend
+        ];
+    }
+}
+
 public sealed class BufferedRefresh(IClock clock, TimeSpan minimumInterval, Func<Task> refresh)
 {
     private readonly SemaphoreSlim signal = new(0, 1);
