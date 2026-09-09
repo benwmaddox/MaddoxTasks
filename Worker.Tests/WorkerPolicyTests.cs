@@ -29,13 +29,13 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void ShippedWorkerConfig_UsesAstraWithLowReasoningByDefault()
+    public void ShippedWorkerConfig_UsesSolWithMediumReasoningByDefault()
     {
         var configPath = FindWorkerAsset("worker.json");
         using var config = JsonDocument.Parse(File.ReadAllText(configPath));
 
-        Assert.Equal("gpt-6-astra", config.RootElement.GetProperty("model").GetString());
-        Assert.Equal("low", config.RootElement.GetProperty("reasoningEffort").GetString());
+        Assert.Equal("gpt-5.6-sol", config.RootElement.GetProperty("model").GetString());
+        Assert.Equal("medium", config.RootElement.GetProperty("reasoningEffort").GetString());
     }
 
     [Fact]
