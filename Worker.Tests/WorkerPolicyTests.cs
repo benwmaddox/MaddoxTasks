@@ -342,6 +342,26 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void DashboardBanner_RenderIncludesShortcutLegendAndResumedState()
+    {
+        var nextRun = new DateTime(2026, 9, 9, 14, 30, 0);
+
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: false, nextRun);
+
+        Assert.Equal($"Maddox Worker | active 2/4 | follow-ups 1 | next {nextRun:T}", lines[0]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
+    }
+
+    [Fact]
+    public void DashboardBanner_RenderIncludesShortcutLegendAndPausedState()
+    {
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: true, new DateTime(2026, 9, 9, 14, 30, 0));
+
+        Assert.Equal("Maddox Worker | active 2/4 | follow-ups 1 | claims paused by keyboard", lines[0]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
+    }
+
+    [Fact]
     public void Dashboard_HumanizesKnownStructuredCodexResults()
     {
         var result = DashboardFormatter.LatestLines("""{"status":"completed","summary":"Implemented the fix","repositories":[{"repository":"MaddoxTasks","changed":true}]}""");

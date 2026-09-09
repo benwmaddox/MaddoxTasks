@@ -1891,10 +1891,8 @@ public sealed class WorkerHost
         try
         {
             Console.Clear();
-            var scheduleStatus = config.Current.MaxConcurrentCodexProcesses == 0
-                ? "paused by concurrency cap"
-                : paused ? "claims paused by keyboard" : $"next {nextTickUtc.ToLocalTime():T}";
-            ConsoleSegmentWriter.WriteLine([new ConsoleSegment($"Maddox Worker | active {capacity.Active}/{config.Current.MaxConcurrentCodexProcesses} | follow-ups {followups.Count} | {scheduleStatus}", DashboardSegments.Structural)]);
+            foreach (var line in DashboardBanner.Lines(capacity.Active, config.Current.MaxConcurrentCodexProcesses, followups.Count, paused, nextTickUtc.ToLocalTime()))
+                ConsoleSegmentWriter.WriteLine([new ConsoleSegment(line, DashboardSegments.Structural)]);
             if (configError is not null) ConsoleSegmentWriter.WriteLine([new ConsoleSegment(DashboardFormatter.Truncate("Configuration error: " + configError, Math.Max(10, Console.WindowWidth - 1)), DashboardSegments.Detail)]);
             Job[] jobs;
             lock (journalGate) jobs = journal.Jobs.ToArray();
