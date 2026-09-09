@@ -1073,10 +1073,16 @@ public static class RepositoryPathPolicy
 
 public static class WorkspaceProcessEnvironment
 {
-    public static IReadOnlyDictionary<string, string> IsolatedBuild() => new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    public static IReadOnlyDictionary<string, string?> IsolatedBuild() => new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
     {
         ["CARGO_TARGET_DIR"] = "target",
-        ["CARGO_INCREMENTAL"] = "0"
+        ["CARGO_INCREMENTAL"] = "0",
+        // Legacy developer hooks are machine/session-specific and can select a
+        // different certificate than the repository's explicit signing policy.
+        // Worker-owned Codex and Git processes must resolve signing from the
+        // workspace configuration instead of inheriting ambient overrides.
+        ["STASIS_AOT_SIGN_TOOL"] = null,
+        ["STASIS_COMPILER_ANALYSIS_SIGN_TOOL"] = null
     };
 }
 public sealed record ReviewFeedback(string ThreadId, string CommentNodeId, long CommentDatabaseId, string Body, string Url);

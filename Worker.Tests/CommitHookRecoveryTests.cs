@@ -7,6 +7,51 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class CommitHookRecoveryTests
 {
     [Fact]
+    public async Task Commit_DoesNotInheritLegacyStasisSigningHooks()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "maddox-worker-signing-environment-" + Guid.NewGuid().ToString("N"));
+        var previousAotHook = Environment.GetEnvironmentVariable("STASIS_AOT_SIGN_TOOL");
+        var previousAnalysisHook = Environment.GetEnvironmentVariable("STASIS_COMPILER_ANALYSIS_SIGN_TOOL");
+        Directory.CreateDirectory(directory);
+        try
+        {
+            Environment.SetEnvironmentVariable("STASIS_AOT_SIGN_TOOL", "legacy-aot-signer");
+            Environment.SetEnvironmentVariable("STASIS_COMPILER_ANALYSIS_SIGN_TOOL", "legacy-analysis-signer");
+            using var runner = new ProcessRunner(new NoopContainment(), new NullLog());
+            await Git(runner, directory, "init", "-b", "main");
+            await Git(runner, directory, "config", "user.name", "Maddox Worker Test");
+            await Git(runner, directory, "config", "user.email", "worker@example.invalid");
+            await File.WriteAllTextAsync(Path.Combine(directory, "task.txt"), "baseline\n");
+            await Git(runner, directory, "add", "-A");
+            await Git(runner, directory, "commit", "--no-verify", "-m", "baseline");
+
+            var hook = await Git(runner, directory, "rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-commit");
+            await File.WriteAllTextAsync(hook.Output.Trim(), """
+                #!/bin/sh
+                if printenv STASIS_AOT_SIGN_TOOL >/dev/null 2>&1 || printenv STASIS_COMPILER_ANALYSIS_SIGN_TOOL >/dev/null 2>&1; then
+                    echo 'legacy Stasis signing hook leaked into worker publication' >&2
+                    exit 1
+                fi
+                """);
+            await File.WriteAllTextAsync(Path.Combine(directory, "task.txt"), "task change\n");
+            await Git(runner, directory, "add", "-A");
+
+            var host = await CreateHost(directory, runner);
+            await InvokeCommit(host, directory);
+
+            Assert.Equal(string.Empty, (await Git(runner, directory, "status", "--porcelain")).Output);
+            Assert.Equal("task commit", (await Git(runner, directory, "log", "-1", "--format=%s")).Output.Trim());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("STASIS_AOT_SIGN_TOOL", previousAotHook);
+            Environment.SetEnvironmentVariable("STASIS_COMPILER_ANALYSIS_SIGN_TOOL", previousAnalysisHook);
+            foreach (var file in Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)) File.SetAttributes(file, FileAttributes.Normal);
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Commit_RestagesEnforcedStasisFormattingAndRetriesVerifiedHook()
     {
         var directory = Path.Combine(Path.GetTempPath(), "maddox-worker-format-" + Guid.NewGuid().ToString("N"));

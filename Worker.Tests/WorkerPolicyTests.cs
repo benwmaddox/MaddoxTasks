@@ -1211,6 +1211,10 @@ public sealed class WorkerPolicyTests
 
         Assert.Equal("target", environment["CARGO_TARGET_DIR"]);
         Assert.Equal("0", environment["CARGO_INCREMENTAL"]);
+        Assert.Null(environment["STASIS_AOT_SIGN_TOOL"]);
+        Assert.Null(environment["STASIS_COMPILER_ANALYSIS_SIGN_TOOL"]);
+        Assert.DoesNotContain("STASIS_SIGNING_CERTIFICATE", environment.Keys);
+        Assert.DoesNotContain("STASIS_SIGNING_CERT_THUMBPRINT", environment.Keys);
     }
 
     [Fact]
