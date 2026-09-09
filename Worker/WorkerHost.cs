@@ -455,7 +455,8 @@ public sealed class WorkerHost
     {
         var terminal = new CodexTerminalEventTracker();
         var input = ProcessArguments.WithPromptOnStandardInput(arguments);
-        return await processes.RunAsync(settings.CodexExe, input.Arguments, settings.RepoRoot, ct, terminalOutput: new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput);
+        return await processes.RunAsync(settings.CodexExe, input.Arguments, settings.RepoRoot, ct, terminalOutput: new TerminalOutputDirective(terminal.Observe, TimeSpan.FromSeconds(2)), standardInput: input.StandardInput,
+            environment: WorkspaceProcessEnvironment.IsolatedBuild());
     }
 
     private Task<ExecResult> RunMaddoxCommandAsync(IEnumerable<string> command, CancellationToken ct)
@@ -1858,7 +1859,7 @@ public sealed class WorkerHost
         }
         catch (JsonException) { return false; }
     }
-    private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct, IReadOnlyDictionary<string, string>? environment = null) { var result = await processes.RunAsync(executable, arguments, cwd, ct, environment: environment); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
+    private async Task<ExecResult> RequireAsync(string executable, IEnumerable<string> arguments, string cwd, CancellationToken ct, IReadOnlyDictionary<string, string?>? environment = null) { var result = await processes.RunAsync(executable, arguments, cwd, ct, environment: environment); if (result.ExitCode != 0) throw new InvalidOperationException($"{Path.GetFileName(executable)} failed: {result.Error.Trim()}"); return result; }
     private static bool TryReadSuccess(string output) { try { using var document = JsonDocument.Parse(output); return document.RootElement.GetProperty("success").GetBoolean(); } catch { return false; } }
 
     private void SetPhase(Job job, string phase)

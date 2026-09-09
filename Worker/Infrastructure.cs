@@ -22,7 +22,7 @@ public sealed record TerminalOutputDirective(Func<string, bool> IsTerminal, Time
 
 public interface IProcessRunner
 {
-    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null);
+    Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string?>? environment = null);
 }
 
 public interface IChildProcessContainment : IDisposable { void Add(Process process); }
@@ -39,13 +39,15 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
     private readonly IRollingLog log;
     public ProcessRunner(IChildProcessContainment containment, IRollingLog log) { this.containment = containment; this.log = log; }
 
-    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
+    public async Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string?>? environment = null)
     {
         var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
         log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, standardInputLength = standardInput?.Length ?? 0, workingDirectory });
         using var process = new Process { StartInfo = CreateStartInfo(executable, workingDirectory) };
         if (environment is not null)
-            foreach (var (name, value) in environment) process.StartInfo.Environment[name] = value;
+            foreach (var (name, value) in environment)
+                if (value is null) process.StartInfo.Environment.Remove(name);
+                else process.StartInfo.Environment[name] = value;
         process.StartInfo.RedirectStandardInput = standardInput is not null;
         if (standardInput is not null) process.StartInfo.StandardInputEncoding = new UTF8Encoding(false);
         foreach (var argument in argumentList) process.StartInfo.ArgumentList.Add(argument);

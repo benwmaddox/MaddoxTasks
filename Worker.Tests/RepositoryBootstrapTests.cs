@@ -121,7 +121,7 @@ public sealed class RepositoryBootstrapTests : IDisposable
         public bool EmptyRemote { get; init; }
         public bool Unborn { get; init; }
         public List<string> Calls { get; } = [];
-        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
+        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string?>? environment = null)
         {
             var command = executable + " " + string.Join(' ', arguments);
             Calls.Add(command);

@@ -199,7 +199,7 @@ public sealed class GitHubInspectionTests
         private readonly Queue<ExecResult> remaining = new(responses);
         public List<Call> Calls { get; } = [];
 
-        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string>? environment = null)
+        public Task<ExecResult> RunAsync(string executable, IEnumerable<string> arguments, string workingDirectory, CancellationToken cancellationToken, Action<string>? outputLine = null, TerminalOutputDirective? terminalOutput = null, string? standardInput = null, IReadOnlyDictionary<string, string?>? environment = null)
         {
             var call = new Call(executable, arguments.ToArray());
             Calls.Add(call);
