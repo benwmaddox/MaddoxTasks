@@ -82,6 +82,11 @@ are forbidden. A validated result may change only Maddox task entries (including
 findings are recorded, the worker uses its internal `CompleteResearch` command, which requires the marker and moves
 the source from `Blocked` to `Next`, or to `Done` when the ledger-only objective is complete, only if it is still `Blocked`.
 
+Research-created work is grouped by verified root cause: prefer one upstream owner task and create consumer work only
+for proven repository-owned migrations. New tasks always start in `Next`, are capped at three per result, and receive
+an enforced minimal-repair envelope covering allowed scope, exclusions, cheapest-first validation, and the stop
+condition. Larger proposed fan-outs are recorded as findings for human review instead of being applied.
+
 Repository labels are canonicalized as lowercase `repo:<name>` identities and compared case-insensitively. With no repository labels, Active and `ReadyForReview` tasks reserve the synthetic `missing` identity; an explicit `repo:missing` collides with it. Status and label changes are rejected when their resulting reservation keys conflict. The scheduled runner starts a repository-less claim from normalized `RepoRoot`, passes no `--add-dir`, and warns that no repository was specified and the impact scope is unknown.
 
 The scheduled runner checks `ReadyForReview` tasks after work. Only canonical `https://github.com/<owner>/<repo>/pull/<number>` URLs in descriptions/comments are associated. It closes a task only when all associated PRs have non-null `mergedAt`; no-PR, open, closed-unmerged, and lookup-error tasks remain unchanged.

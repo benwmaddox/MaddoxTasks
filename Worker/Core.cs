@@ -138,6 +138,17 @@ public static class ResearchPlanPolicy
     public const string Completed = "completed";
     public const string Unblocked = "unblocked";
     public const string StillBlocked = "stillBlocked";
+    public const int MaximumCreatedIssues = 3;
+
+    private const string MinimalRepairEnvelope = """
+
+Research-created task scope:
+- Make only the smallest change or take only the smallest action necessary to resolve the stated issue while preserving behavior outside that issue.
+- Keep changes within the files, symbols, systems, and repository named above. Do not refactor, clean up, or modernize adjacent code.
+- Treat generated dependency or vendor updates as mechanical changes only; do not hand-edit generated content or broaden the dependency upgrade.
+- Validate in escalating cost order, starting with the cheapest focused check that can reproduce the issue before running broader suites or builds.
+- If validation reveals an independent failure, record or route it separately and stop. Validation does not expand this task's implementation scope.
+""";
 
     private static readonly HashSet<string> ExistingMutationTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -177,6 +188,8 @@ public static class ResearchPlanPolicy
         var mutations = mutationsElement.EnumerateArray()
             .Select(element => ParseMutation(element, sourceIssueId, sourceSequence))
             .ToArray();
+        if (mutations.Count(mutation => mutation.Type == "CreateIssue") > MaximumCreatedIssues)
+            throw new InvalidDataException($"Research result may create at most {MaximumCreatedIssues} issues; record a larger proposed fan-out in findings for human review.");
 
         return new ResearchPlan(outcome, summary, findings, mutations);
     }
@@ -207,13 +220,13 @@ public static class ResearchPlanPolicy
             var priority = OptionalInt(element, "priority") ?? 3;
             if (priority is < 1 or > 5) throw new InvalidDataException("CreateIssue priority must be between 1 and 5.");
             var status = OptionalString(element, "status") ?? "Next";
-            if (!status.Equals("Next", StringComparison.OrdinalIgnoreCase) && !status.Equals("Backlog", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidDataException("CreateIssue status must be 'Next' or 'Backlog'.");
+            if (!status.Equals("Next", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidDataException("Research-created issues must start in 'Next'.");
             var parentId = OptionalString(element, "parentId");
             if (parentId is not null && !Guid.TryParse(parentId, out _)) throw new InvalidDataException("CreateIssue parentId must be a valid issue id GUID.");
             var repositories = OptionalStringArray(element, "repositories", allowEmpty: true);
             ValidateRepositories(repositories);
-            return new ResearchMutation(canonicalType, Title: title, Description: description, Priority: priority, Status: status, ParentId: parentId, Repositories: repositories);
+            return new ResearchMutation(canonicalType, Title: title, Description: ScopeCreatedIssueDescription(description), Priority: priority, Status: "Next", ParentId: parentId, Repositories: repositories);
         }
 
         var issueId = RequiredString(element, "issueId");
@@ -242,6 +255,13 @@ public static class ResearchPlanPolicy
         if (IsSourceStatusMutation(new ResearchMutation(canonicalType, IssueId: issueId), sourceIssueId, sourceSequence))
             throw new InvalidDataException("Research mutations may not directly change the source task status.");
         return new ResearchMutation(canonicalType, IssueId: issueId, NewStatus: parsedStatus.ToString());
+    }
+
+    public static string ScopeCreatedIssueDescription(string description)
+    {
+        var trimmed = description.Trim();
+        if (trimmed.Contains("Research-created task scope:", StringComparison.Ordinal)) return trimmed;
+        return trimmed + Environment.NewLine + MinimalRepairEnvelope;
     }
 
     private static void ValidateRepositories(string[]? repositories)

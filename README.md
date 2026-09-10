@@ -292,6 +292,15 @@ atomic `CompleteResearch` transition that changes the original task from `Blocke
 or to `Done` when ledger-only research completed the objective, if it is still `Blocked`. If it is still blocked, the findings remain on the task and its
 status remains unchanged.
 
+Before creating work, research clusters failures by verified root cause and prefers one upstream
+owner task for a shared defect. Consumer tasks are created only for proven repository-owned
+migrations. Research-created tasks always start in `Next`, include an enforced minimal-repair
+scope envelope, and are limited to three per research result. A larger proposed fan-out is recorded
+in findings for human review rather than applied. Each task must name the observed failure, smallest
+required change, allowed scope, exclusions, cheapest first validation, and stop condition.
+Independent failures discovered during validation are routed separately; validation does not
+broaden the implementation scope.
+
 After its claim/work loop, the hourly runner checks `ReadyForReview` tasks using only PR URLs found in their descriptions and comments. A review task with no PR URL stays open. A task closes automatically only when every associated PR reports a non-null `mergedAt` from `gh pr view`; open, closed-unmerged, lookup-error, and ambiguous cases remain `ReadyForReview` with a warning. Preview mode reports intended checks without calling `gh` or mutating tasks.
 
 The deterministic reconciliation can also be run directly as machine-readable JSON:
