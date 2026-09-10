@@ -43,6 +43,8 @@ public sealed class WorkerPolicyTests
     {
         var prompt = File.ReadAllText(FindWorkerAsset("worker-prompt.md"));
 
+        Assert.Contains("Create sub-agents only when the task scope warrants independent execution or review", prompt);
+        Assert.Contains("handle routine work directly", prompt);
         Assert.Contains("read and apply the applicable user-level AGENTS.md", prompt);
         Assert.Contains("gpt-6-astra with low reasoning", prompt);
         Assert.Contains("gpt-5.6-luna with max reasoning", prompt);
