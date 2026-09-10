@@ -1,5 +1,4 @@
 using System.CommandLine;
-using System.Globalization;
 using CliCommand = System.CommandLine.Command;
 using DomainCommand = MaddoxTasks.Application.Command;
 using IssueStatus = MaddoxTasks.Domain.Status;
@@ -455,28 +454,13 @@ public static class CliRunner
     private static CliCommand BuildAgentResearchClaimCommand(Option<string> dbOption)
     {
         var dryRunOption = new Option<bool>("--dry-run", "Select without recording a research-attempt marker.");
-        var cooldownOption = new Option<string>("--cooldown", () => "14.00:00:00", "Research cooldown as a TimeSpan (default: 14 days).");
-        var failureCooldownOption = new Option<string>("--failure-cooldown", () => "01:00:00", "Cooldown after a recorded research failure (default: 1 hour).");
         var command = new CliCommand("research-claim", "Atomically claim one eligible Blocked task for read-only research.");
         command.AddOption(dryRunOption);
-        command.AddOption(cooldownOption);
-        command.AddOption(failureCooldownOption);
-        command.SetHandler((string dbPath, bool dryRun, string cooldownText, string failureCooldownText) =>
+        command.SetHandler((string dbPath, bool dryRun) =>
         {
-            if (!TimeSpan.TryParse(cooldownText, CultureInfo.InvariantCulture, out var cooldown) || cooldown <= TimeSpan.Zero)
-            {
-                Console.Error.WriteLine("--cooldown must be a positive TimeSpan such as 14.00:00:00.");
-                return;
-            }
-            if (!TimeSpan.TryParse(failureCooldownText, CultureInfo.InvariantCulture, out var failureCooldown) || failureCooldown <= TimeSpan.Zero)
-            {
-                Console.Error.WriteLine("--failure-cooldown must be a positive TimeSpan such as 01:00:00.");
-                return;
-            }
-
             var engine = CreateEngine(dbPath);
-            Console.WriteLine(AgentRunner.GetResearchClaimJson(engine, dryRun, cooldown, failureCooldown));
-        }, dbOption, dryRunOption, cooldownOption, failureCooldownOption);
+            Console.WriteLine(AgentRunner.GetResearchClaimJson(engine, dryRun));
+        }, dbOption, dryRunOption);
         return command;
     }
 

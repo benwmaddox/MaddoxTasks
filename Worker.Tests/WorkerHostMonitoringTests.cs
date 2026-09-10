@@ -35,6 +35,41 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task EmptyFreshClaim_IsFollowedByResearchClaim()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["agent", "claim"])
+            ? new ExecResult(0, "null", "")
+            : call.Arguments.SequenceEqual(["agent", "research-claim"])
+                ? new ExecResult(0, "{\"success\":true,\"task\":null}", "")
+                : new ExecResult(0, "", "");
+
+        await fixture.TickAsync();
+
+        var claimIndex = fixture.Processes.Commands.FindIndex(command => command.Arguments.SequenceEqual(["agent", "claim"]));
+        var researchIndex = fixture.Processes.Commands.FindIndex(command => command.Arguments.SequenceEqual(["agent", "research-claim"]));
+        Assert.True(claimIndex >= 0);
+        Assert.True(researchIndex > claimIndex);
+    }
+
+    [Fact]
+    public async Task NonemptyFreshClaim_DoesNotStartBlockedResearch()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var task = new TaskDto(42, Guid.NewGuid().ToString(), "Claimed", "Description", ["Repo"]);
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["agent", "claim"])
+            ? new ExecResult(0, JsonSerializer.Serialize(task), "")
+            : call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
+
+        await fixture.TickAsync();
+
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["agent", "claim"]));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("research-claim"));
+    }
+
+    [Fact]
     public async Task GreenCi_RecordsReadyForReviewBeforeAutoMergeQuietPeriod()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(false));
@@ -484,7 +519,6 @@ public sealed class WorkerHostMonitoringTests
             {
                 schemaVersion = 1,
                 claimInterval = "00:15:00",
-                researchCooldown = "14.00:00:00",
                 maxConcurrentCodexProcesses = 1,
                 prPollInterval = "00:01:00",
                 clarificationTimeout = "00:10:00",

@@ -39,23 +39,19 @@ public sealed record WorkerConfig(
     string RepoRoot,
     string WorktreeRoot,
     TimeSpan? BlockedDisplayDuration = null,
-    TimeSpan? ResearchCooldown = null,
     string? PrivateRepositoryOwner = null,
     int? WorkerRetryMaxAttempts = null,
     TimeSpan? WorkerRetryMaxElapsed = null,
-    TimeSpan? WorkerRetryBaseDelay = null,
-    TimeSpan? ResearchFailureCooldown = null)
+    TimeSpan? WorkerRetryBaseDelay = null)
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
-    public TimeSpan EffectiveResearchCooldown => ResearchCooldown ?? TimeSpan.FromDays(1);
     // Worker retries have their own bounds.  They intentionally do not reuse
     // the pull-request repair budget: a transient worker failure is a
     // different failure domain from a repeatedly failing review check.
     public int EffectiveWorkerRetryMaxAttempts => WorkerRetryMaxAttempts ?? 3;
     public TimeSpan EffectiveWorkerRetryMaxElapsed => WorkerRetryMaxElapsed ?? TimeSpan.FromHours(2);
     public TimeSpan EffectiveWorkerRetryBaseDelay => WorkerRetryBaseDelay ?? TimeSpan.FromMinutes(5);
-    public TimeSpan EffectiveResearchFailureCooldown => ResearchFailureCooldown ?? TimeSpan.FromHours(1);
 
     public static WorkerConfig Load(string path)
     {
@@ -75,11 +71,9 @@ public sealed record WorkerConfig(
         if (RepairMaxAttempts < 1 || RepairMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("Repair bounds must be positive.");
         if (ReviewQuietPeriod <= TimeSpan.Zero) throw new InvalidDataException("reviewQuietPeriod must be positive.");
         if (BlockedDisplayDuration is { } blockedDisplayDuration && blockedDisplayDuration <= TimeSpan.Zero) throw new InvalidDataException("blockedDisplayDuration must be positive.");
-        if (ResearchCooldown is { } researchCooldown && researchCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchCooldown must be positive.");
         if (WorkerRetryMaxAttempts is { } workerRetryMaxAttempts && workerRetryMaxAttempts < 1) throw new InvalidDataException("workerRetryMaxAttempts must be positive.");
         if (WorkerRetryMaxElapsed is { } workerRetryMaxElapsed && workerRetryMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("workerRetryMaxElapsed must be positive.");
         if (WorkerRetryBaseDelay is { } workerRetryBaseDelay && workerRetryBaseDelay <= TimeSpan.Zero) throw new InvalidDataException("workerRetryBaseDelay must be positive.");
-        if (ResearchFailureCooldown is { } researchFailureCooldown && researchFailureCooldown <= TimeSpan.Zero) throw new InvalidDataException("researchFailureCooldown must be positive.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");

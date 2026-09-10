@@ -179,7 +179,6 @@ Windows:
 .\MaddoxTasks.exe agent claim --dry-run
 .\MaddoxTasks.exe agent research-claim
 .\MaddoxTasks.exe agent research-claim --dry-run
-.\MaddoxTasks.exe agent research-claim --failure-cooldown 01:00:00
 .\MaddoxTasks.exe agent command --file cmd.json
 .\MaddoxTasks.exe agent command --actor gpt-5.2 --file cmd.json
 ```
@@ -193,7 +192,6 @@ Linux/macOS:
 ./MaddoxTasks agent claim --dry-run
 ./MaddoxTasks agent research-claim
 ./MaddoxTasks agent research-claim --dry-run
-./MaddoxTasks agent research-claim --failure-cooldown 01:00:00
 ./MaddoxTasks agent command --file cmd.json
 ./MaddoxTasks agent command --actor gpt-5.2 --file cmd.json
 ```
@@ -258,14 +256,10 @@ Requeue every currently `Blocked` issue to `Next` in one atomic command:
 `dryRun` is an optional boolean that defaults to `false`. Preview and apply both return `changedIssueIds` (the Blocked issues that would change or changed) and `skippedIssueIds` (every other issue in the same snapshot), with both arrays ordered by issue sequence. Preview writes nothing. Apply appends only `StatusChanged` events and commits all changes together; an empty or repeated run succeeds without writing events. All task content, labels, repositories, comments, priority, and hierarchy remain unchanged.
 
 `agent research-claim` selects one eligible `Blocked` task and records its durable research-attempt comment. Use
-`--dry-run` to preview without recording the marker, `--cooldown 14.00:00:00` to override the positive normal
-cooldown, or `--failure-cooldown 01:00:00` to override the positive retry cooldown after a worker failure. Agent JSON
-accepts the same durations as `"cooldown"` and `"failureCooldown"` TimeSpan strings. The selection uses hierarchy
-priority/sequence order. A successful or still-blocked attempt uses the normal 14-day cooldown. A launch, usage, or
-network failure recorded after the latest exact attempt marker by the exact `maddox-research-worker` actor, with a
-comment beginning exactly `Research worker could not complete: `, uses the one-hour failure cooldown starting at the
-failure comment. Spoofed actors, similar prefixes, unrelated human comments/status changes, and legacy histories
-without that failure marker do not shorten the normal cooldown.
+`--dry-run` to preview without recording the marker. A task's first blocked period must be at least 12 hours old
+before its first research claim. Every later research attempt, and every second or later transition into `Blocked`,
+waits 14 days from the latest attempt or blocked transition. Selection uses hierarchy priority/sequence order and
+skips blocked tasks whose repository scope overlaps a current `Active` task.
 The worker's internal `CompleteResearch` command is conditional: it requires the research marker and changes the
 source from `Blocked` to `Next`, or to `Done` for completed ledger-only work, only if the source is still `Blocked`, so a human status change cannot be overwritten.
 
@@ -276,12 +270,10 @@ If actor is omitted for `UpdateDescription`/`AddComment`, default resolution ord
 
 The long-running worker follows the same repository-less rule: it starts Codex in `RepoRoot` and attempts the stated objective instead of treating a missing `repo:` label as repository ambiguity. For task-management objectives, Codex may use only the published executable's agent JSON commands and may not change the claimed source status. The worker owns the source lifecycle. Retryable processing failures remain `Active` and use the same durable retry schedule whether or not a worktree exists; only a proven external gate or an exhausted repairable-worker retry moves the task to `Blocked`.
 
-The worker also reserves at most one shared Codex slot for blocked-task research. `agent research-claim` atomically
-selects one eligible `Blocked` task in the same hierarchy order and records a durable
-`maddox-research-worker` comment marker. A task with a marker newer than the configured
-`researchCooldown` (1 day by default) is skipped, so concurrent or recurring runs do not
-research the same task too often. If the worker records its exact failure marker after the latest attempt,
-the task instead becomes eligible after the configurable one-hour failure cooldown. Each run receives the selected task plus current all-task
+The worker reserves at most one shared Codex slot for blocked-task research only after a normal `agent claim`
+returns `null`. `agent research-claim` atomically selects one eligible `Blocked` task in the same hierarchy order,
+skips repository scopes held by `Active` tasks, and records a durable `maddox-research-worker` comment marker.
+The first blocked period waits 12 hours; subsequent blocked periods and research attempts wait 14 days. Each run receives the selected task plus current all-task
 context in a temporary JSON file, without direct database access. Live web search
 is enabled so the researcher can investigate that task's blocker, open relevant sources,
 and cite evidence for a concrete resolution. The research Codex process runs read-only;
@@ -346,8 +338,7 @@ one hour. Repairable worker failures are bounded by `workerRetryMaxAttempts` (3)
 `workerRetryMaxElapsed` (2 hours); `workerRetryBaseDelay` (5 minutes) controls both. Only
 explicit external gates such as credentials, hardware, missing input, upstream
 dependencies, user decisions, or policy restrictions move the task to `Blocked`.
-Failed blocked-task research uses `researchFailureCooldown` (1 hour) before another
-claim instead of the normal 1-day `researchCooldown`.
+Failed blocked-task research is subject to the same 14-day subsequent-attempt delay.
 
 During recovery, the worker may use an already-authenticated noninteractive tool to
 change an external system only when the task or repository names the exact resource

@@ -55,27 +55,21 @@ Record the durable research-attempt marker on one task:
 
 ```powershell
 .\MaddoxTasks.exe agent research-claim
-.\MaddoxTasks.exe agent research-claim --cooldown 14.00:00:00
-.\MaddoxTasks.exe agent research-claim --failure-cooldown 01:00:00
 ```
 
-Agent JSON supports the same settings:
+Agent JSON supports preview mode:
 
 ```json
 {
   "type": "research-claim",
-  "cooldown": "14.00:00:00",
-  "failureCooldown": "01:00:00",
   "dryRun": true
 }
 ```
 
 The command selects at most one `Blocked` task in hierarchy priority/sequence order and writes its exact attempt
-marker atomically, so concurrent workers cannot claim the same task. Successful or still-blocked research uses the
-normal positive cooldown (14 days by default). If a later comment by the exact `maddox-research-worker` actor begins
-exactly `Research worker could not complete: `, the cooldown starts at that failure comment and uses the short
-positive failure cooldown (one hour by default). A wrong actor, a similar prefix, a failure before the latest attempt,
-unrelated human comments/status changes, and legacy histories without the failure marker retain the normal cooldown.
+marker atomically, so concurrent workers cannot claim the same task. A task's first blocked period waits 12 hours.
+Every later research attempt, and every second or later transition into `Blocked`, waits 14 days from the latest
+attempt or blocked transition. Tasks whose repository scope overlaps a current `Active` task are skipped.
 Preview writes no events. The worker's research Codex receives a
 read-only snapshot containing the selected task and current blocked-task context and may perform read-only web research, but all file, Git/GitHub, and external mutations
 are forbidden. A validated result may change only Maddox task entries (including creating tasks). After mutations and
