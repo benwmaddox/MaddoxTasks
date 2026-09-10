@@ -43,6 +43,8 @@ public sealed class WorkerPolicyTests
     {
         var prompt = File.ReadAllText(FindWorkerAsset("worker-prompt.md"));
 
+        Assert.Contains("Create sub-agents only when the task scope warrants independent execution or review", prompt);
+        Assert.Contains("handle routine work directly", prompt);
         Assert.Contains("read and apply the applicable user-level AGENTS.md", prompt);
         Assert.Contains("gpt-6-astra with low reasoning", prompt);
         Assert.Contains("gpt-5.6-luna with max reasoning", prompt);
@@ -339,6 +341,26 @@ public sealed class WorkerPolicyTests
         var lines = DashboardFormatter.LatestLines("old\n\u001b[31msecond\u001b[0m\nthi\u0001rd\nfourth");
         Assert.Equal(["second", "third", "fourth"], lines);
         Assert.Equal("ab...", DashboardFormatter.Truncate("abcdefgh", 5));
+    }
+
+    [Fact]
+    public void DashboardBanner_RenderIncludesShortcutLegendAndResumedState()
+    {
+        var nextRun = new DateTime(2026, 9, 9, 14, 30, 0);
+
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: false, nextRun);
+
+        Assert.Equal($"Maddox Worker | active 2/4 | follow-ups 1 | next {nextRun:T}", lines[0]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
+    }
+
+    [Fact]
+    public void DashboardBanner_RenderIncludesShortcutLegendAndPausedState()
+    {
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: true, new DateTime(2026, 9, 9, 14, 30, 0));
+
+        Assert.Equal("Maddox Worker | active 2/4 | follow-ups 1 | claims paused by keyboard", lines[0]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
     }
 
     [Fact]
@@ -702,7 +724,7 @@ public sealed class WorkerPolicyTests
             {"type":"RemoveLabel","issueId":"{{targetId}}","label":"old"},
             {"type":"SetRepositoryLabels","issueId":"{{targetId}}","repositories":["alpha"]},
             {"type":"ChangeStatus","issueId":"{{targetId}}","newStatus":"Next"},
-            {"type":"CreateIssue","title":"Track contract","description":"Follow-up","status":"Backlog","priority":3,"repositories":["beta"]}
+            {"type":"CreateIssue","title":"Track contract","description":"Follow-up","status":"Next","priority":3,"repositories":["beta"]}
           ]
         }
         """;
@@ -712,6 +734,64 @@ public sealed class WorkerPolicyTests
         Assert.Equal(ResearchPlanPolicy.Unblocked, plan.Outcome);
         Assert.Equal(8, plan.Mutations.Length);
         Assert.Equal(["AddComment", "UpdateDescription", "ChangePriority", "AddLabel", "RemoveLabel", "SetRepositoryLabels", "ChangeStatus", "CreateIssue"], plan.Mutations.Select(mutation => mutation.Type).ToArray());
+        Assert.Equal("Next", plan.Mutations[^1].Status);
+        Assert.NotNull(plan.Mutations[^1].Description);
+        Assert.Contains("Research-created task scope:", plan.Mutations[^1].Description!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResearchPlanPolicy_RejectsBacklogCreatedIssue()
+    {
+        const string json =
+            """
+            {
+              "outcome": "unblocked",
+              "summary": "Route work.",
+              "findings": [],
+              "mutations": [
+                {
+                  "type": "CreateIssue",
+                  "title": "Repair",
+                  "description": "Focused repair.",
+                  "status": "Backlog",
+                  "priority": 2,
+                  "repositories": ["alpha"]
+                }
+              ]
+            }
+            """;
+
+        var exception = Assert.Throws<InvalidDataException>(() => ResearchPlanPolicy.Parse(
+            json,
+            new TaskDto(42, "01234567-89ab-cdef-0123-456789abcdef", "Source", "Blocked", ["alpha"])));
+        Assert.Contains("must start in 'Next'", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ResearchPlanPolicy_RejectsMoreThanThreeCreatedIssues()
+    {
+        var mutations = Enumerable.Range(1, 4)
+            .Select(index => new
+            {
+                type = "CreateIssue",
+                title = $"Repair {index}",
+                description = "Focused repair.",
+                status = "Next",
+                priority = 2,
+                repositories = new[] { "alpha" }
+            });
+        var json = JsonSerializer.Serialize(new
+        {
+            outcome = "unblocked",
+            summary = "Route work.",
+            findings = Array.Empty<string>(),
+            mutations
+        });
+
+        var exception = Assert.Throws<InvalidDataException>(() => ResearchPlanPolicy.Parse(
+            json,
+            new TaskDto(42, "01234567-89ab-cdef-0123-456789abcdef", "Source", "Blocked", ["alpha"])));
+        Assert.Contains("at most 3", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -778,6 +858,12 @@ public sealed class WorkerPolicyTests
         Assert.Contains("Do not edit files", prompt, StringComparison.Ordinal);
         Assert.Contains("zero mutations are allowed", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("set fields that do not apply", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("cluster the evidence", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Prefer one upstream owner task", prompt, StringComparison.Ordinal);
+        Assert.Contains("must start in Next", prompt, StringComparison.Ordinal);
+        Assert.Contains("at most 3", prompt, StringComparison.Ordinal);
+        Assert.Contains("smallest required change", prompt, StringComparison.Ordinal);
+        Assert.Contains("Validation requirements are evidence", prompt, StringComparison.Ordinal);
     }
 
     [Fact]
