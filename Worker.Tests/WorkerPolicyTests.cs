@@ -927,40 +927,6 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void WorkerConfig_DefaultsResearchCooldownToOneDayAndRejectsNonPositiveValues()
-    {
-        using var directory = new TemporaryDirectory();
-        var path = Path.Combine(directory.Path, "worker.json");
-        WriteConfig(path, directory.Path, 2, "model");
-        Assert.Equal(TimeSpan.FromDays(1), WorkerConfig.Load(path).EffectiveResearchCooldown);
-
-        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:00:00");
-        Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
-
-        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:02:00");
-        var state = new ConfigState(WorkerConfig.Load(path));
-        Assert.Equal(TimeSpan.FromMinutes(2), state.Current.EffectiveResearchCooldown);
-        WriteConfig(path, directory.Path, 2, "model", researchCooldown: "00:03:00");
-        Assert.True(state.TryReload(path, out var error), error);
-        Assert.Equal(TimeSpan.FromMinutes(3), state.Current.EffectiveResearchCooldown);
-    }
-
-    [Fact]
-    public void WorkerConfig_DefaultsResearchFailureCooldownToOneHourAndRejectsNonPositiveValues()
-    {
-        using var directory = new TemporaryDirectory();
-        var path = Path.Combine(directory.Path, "worker.json");
-        WriteConfig(path, directory.Path, 2, "model");
-        Assert.Equal(TimeSpan.FromHours(1), WorkerConfig.Load(path).EffectiveResearchFailureCooldown);
-
-        WriteConfig(path, directory.Path, 2, "model", researchFailureCooldown: "00:00:00");
-        Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
-
-        WriteConfig(path, directory.Path, 2, "model", researchFailureCooldown: "00:15:00");
-        Assert.Equal(TimeSpan.FromMinutes(15), WorkerConfig.Load(path).EffectiveResearchFailureCooldown);
-    }
-
-    [Fact]
     public void WorkerConfig_AllowsZeroConcurrencyAndRejectsNegativeConcurrency()
     {
         using var directory = new TemporaryDirectory();
@@ -1366,14 +1332,14 @@ public sealed class WorkerPolicyTests
 
     private static Job WithSnapshot(Job job, string model) { job.Model = model; return job; }
 
-    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null, string? researchCooldown = null, string? researchFailureCooldown = null)
+    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null)
     {
         File.WriteAllText(path, JsonSerializer.Serialize(new
         {
             schemaVersion = 1, claimInterval = "00:15:00", maxConcurrentCodexProcesses = cap, prPollInterval = "00:01:00",
             clarificationTimeout = "00:10:00", promptFile = "worker-prompt.md", model, reasoningEffort = "medium",
             repairMaxAttempts = 3, repairMaxElapsed = "02:00:00", reviewQuietPeriod = "00:30:00", ignoredChecks = Array.Empty<string>(),
-            blockedDisplayDuration, researchCooldown, researchFailureCooldown,
+            blockedDisplayDuration,
             autoMergeRepositories = new[] { "benwmaddox/StasisLang" }, autoMergeMethod = "squash", maddoxExe = "MaddoxTasks.exe",
             codexExe = "codex", ghExe = "gh", repoRoot = root, worktreeRoot = Path.Combine(root, "worktrees")
         }));

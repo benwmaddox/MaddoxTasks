@@ -108,10 +108,6 @@ public sealed class WorkerHost
             }
             return FreshClaimOutcome.Unavailable;
         }
-        if (allowResearch && !paused)
-        {
-            await TryStartResearchAsync(ct);
-        }
         foreach (var job in SnapshotJobs(JobPhases.StatusSyncPending))
             Enqueue(job, RecoveryMode.SyncBlocked);
         EnqueueDueRetries(clock.UtcNow);
@@ -138,9 +134,15 @@ public sealed class WorkerHost
                 log.Write("error", "claim.failed", new { error = exception.Message });
                 return FreshClaimOutcome.Unavailable;
             }
-            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output) || claim.Output.Trim() == "null")
+            if (claim.ExitCode != 0 || string.IsNullOrWhiteSpace(claim.Output))
             {
                 capacity.Release();
+                return FreshClaimOutcome.Unavailable;
+            }
+            if (claim.Output.Trim() == "null")
+            {
+                capacity.Release();
+                if (allowResearch) await TryStartResearchAsync(ct);
                 return FreshClaimOutcome.Unavailable;
             }
             Job job;
@@ -258,9 +260,7 @@ public sealed class WorkerHost
         var settings = config.Current;
         try
         {
-            var cooldown = settings.EffectiveResearchCooldown.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
-            var failureCooldown = settings.EffectiveResearchFailureCooldown.ToString("c", System.Globalization.CultureInfo.InvariantCulture);
-            var claim = await RunMaddoxCommandAsync(["research-claim", "--cooldown", cooldown, "--failure-cooldown", failureCooldown], ct);
+            var claim = await RunMaddoxCommandAsync(["research-claim"], ct);
             if (claim.ExitCode != 0)
             {
                 log.Write("warning", "research.claim.failed", new { error = claim.Error.Trim(), output = claim.Output.Trim() });
@@ -327,7 +327,7 @@ public sealed class WorkerHost
         }
         catch (Exception exception) when (CodexClientFailurePolicy.IsWorkerWide(exception.Message))
         {
-            var retryUtc = clock.UtcNow + settings.EffectiveResearchFailureCooldown;
+            var retryUtc = clock.UtcNow + TimeSpan.FromHours(1);
             RecordCodexUnavailable(retryUtc);
             log.Write("error", "research.client.deferred", new { task.Sequence, retryUtc, error = exception.Message });
         }

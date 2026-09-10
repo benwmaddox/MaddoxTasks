@@ -218,28 +218,20 @@ public sealed class IssueEngine
     /// the durable research-attempt comment. The issue remains Blocked until a
     /// worker has applied and validated a complete unblocking plan.
     /// </summary>
-    public ResearchClaimResult ResearchClaimBlocked(
-        TimeSpan? cooldown = null,
-        bool dryRun = false,
-        TimeSpan? failureCooldown = null)
+    public ResearchClaimResult ResearchClaimBlocked(bool dryRun = false)
     {
-        var effectiveCooldown = cooldown ?? TimeSpan.FromDays(14);
-        var effectiveFailureCooldown = failureCooldown ?? TimeSpan.FromHours(1);
-        if (effectiveCooldown <= TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(nameof(cooldown), "Research cooldown must be positive.");
-        }
-        if (effectiveFailureCooldown <= TimeSpan.Zero)
-        {
-            throw new ArgumentOutOfRangeException(nameof(failureCooldown), "Research failure cooldown must be positive.");
-        }
-
         return _eventStore.ExecuteAtomic(events =>
         {
             var now = NormalizeUtc(_clock.UtcNow);
             var state = IssueState.Replay(events);
+            var activeReservationKeys = state.OrderedIssues
+                .Where(issue => issue.Status == Status.Active)
+                .SelectMany(issue => RepositoryLabels.GetReservationKeys(issue.Repositories))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var candidate = state.HierarchicalIssues()
-                .FirstOrDefault(issue => ResearchClaimPolicy.IsEligible(issue, now, effectiveCooldown, effectiveFailureCooldown));
+                .FirstOrDefault(issue =>
+                    !RepositoryLabels.GetReservationKeys(issue.Repositories).Any(activeReservationKeys.Contains)
+                    && ResearchClaimPolicy.IsEligible(issue, events, now));
 
             if (candidate is null)
             {

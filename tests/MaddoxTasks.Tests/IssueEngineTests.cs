@@ -796,10 +796,10 @@ public sealed class IssueEngineTests
         var root = IssueId.New();
         var child = IssueId.New();
         var laterRoot = IssueId.New();
-        store.Append(new IssueCreated(Guid.NewGuid(), root, now, "Root", null, Status.Blocked, Priority.From(1), null, null));
-        store.Append(new IssueCreated(Guid.NewGuid(), child, now.AddMinutes(1), "Child", null, Status.Blocked, Priority.From(5), root, null));
-        store.Append(new IssueCreated(Guid.NewGuid(), laterRoot, now.AddMinutes(2), "Later root", null, Status.Blocked, Priority.From(2), null, null));
-        var engine = new IssueEngine(store, new FrozenClock(now.AddHours(1)));
+        store.Append(new IssueCreated(Guid.NewGuid(), root, now.AddHours(-13), "Root", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), child, now.AddHours(-13).AddMinutes(1), "Child", null, Status.Blocked, Priority.From(5), root, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), laterRoot, now.AddHours(-13).AddMinutes(2), "Later root", null, Status.Blocked, Priority.From(2), null, null));
+        var engine = new IssueEngine(store, new FrozenClock(now));
 
         var first = engine.ResearchClaimBlocked();
         var second = engine.ResearchClaimBlocked();
@@ -813,17 +813,15 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void ResearchClaim_CooldownBoundaryIsInclusiveAndDryRunDoesNotWrite()
+    public void ResearchClaim_FirstBlockedPeriodWaitsTwelveHoursAndDryRunDoesNotWrite()
     {
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
-        var cutoff = now.AddDays(-14);
+        var cutoff = now - ResearchClaimPolicy.InitialBlockedDelay;
         var eligible = IssueId.New();
         var tooRecent = IssueId.New();
         var store = new InMemoryEventStore();
-        store.Append(new IssueCreated(Guid.NewGuid(), eligible, now, "At boundary", null, Status.Blocked, Priority.From(1), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), eligible, cutoff, ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, now.AddMinutes(1), "Too recent", null, Status.Blocked, Priority.From(2), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, cutoff.AddTicks(1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), eligible, cutoff, "At boundary", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, cutoff.AddTicks(1), "Too recent", null, Status.Blocked, Priority.From(2), null, null));
         var engine = new IssueEngine(store, new FrozenClock(now));
         var before = store.LoadAll().Count;
 
@@ -833,7 +831,7 @@ public sealed class IssueEngineTests
         Assert.True(preview.DryRun);
         Assert.Equal(eligible, preview.Task!.Issue.Id);
         Assert.Equal(before, store.LoadAll().Count);
-        Assert.Equal(2, engine.GetState().OrderedIssues.Count(issue => ResearchClaimPolicy.HasAttempt(issue)));
+        Assert.DoesNotContain(engine.GetState().OrderedIssues, ResearchClaimPolicy.HasAttempt);
 
         var applied = engine.ResearchClaimBlocked();
         Assert.Equal(eligible, applied.Task!.Issue.Id);
@@ -841,19 +839,18 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void ResearchClaim_FailedAttemptUsesFailureCooldownBoundaryAndDryRunDoesNotWrite()
+    public void ResearchClaim_SubsequentAttemptWaitsFourteenDaysRegardlessOfFailure()
     {
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
-        var failureCutoff = now.AddHours(-1);
+        var cutoff = now - ResearchClaimPolicy.SubsequentBlockedDelay;
         var eligible = IssueId.New();
         var tooRecent = IssueId.New();
         var store = new InMemoryEventStore();
-        store.Append(new IssueCreated(Guid.NewGuid(), eligible, now.AddHours(-3), "Failure at boundary", null, Status.Blocked, Priority.From(1), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), eligible, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), eligible, failureCutoff, ResearchClaimPolicy.FailureMarkerPrefix + "usage limit", ResearchClaimPolicy.Actor));
-        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, now.AddHours(-3), "Failure too recent", null, Status.Blocked, Priority.From(2), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, failureCutoff.AddTicks(1), ResearchClaimPolicy.FailureMarkerPrefix + "network unavailable", ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), eligible, now.AddDays(-30), "Attempt at boundary", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), eligible, cutoff, ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        store.Append(new CommentAdded(Guid.NewGuid(), eligible, cutoff.AddHours(1), ResearchClaimPolicy.FailureMarkerPrefix + "usage limit", ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), tooRecent, now.AddDays(-30), "Attempt too recent", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new CommentAdded(Guid.NewGuid(), tooRecent, cutoff.AddTicks(1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
         var engine = new IssueEngine(store, new FrozenClock(now));
         var before = store.LoadAll().Count;
 
@@ -867,51 +864,48 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
-    public void ResearchClaim_NonFailureAndFailureBeforeLatestAttemptKeepLongCooldown()
+    public void ResearchClaim_SecondBlockedPeriodWaitsFourteenDaysFromLatestEntry()
     {
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
-        var stillBlocked = IssueId.New();
-        var retriedThenBlocked = IssueId.New();
+        var eligible = IssueId.New();
+        var tooRecent = IssueId.New();
         var store = new InMemoryEventStore();
-        store.Append(new IssueCreated(Guid.NewGuid(), stillBlocked, now.AddHours(-4), "Still blocked", null, Status.Blocked, Priority.From(1), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), stillBlocked, now.AddHours(-3), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), stillBlocked, now.AddHours(-2), "Research findings: blocker remains.", ResearchClaimPolicy.Actor));
-        store.Append(new IssueCreated(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-4), "Latest attempt did not fail", null, Status.Blocked, Priority.From(2), null, null));
-        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-3), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-2), ResearchClaimPolicy.FailureMarkerPrefix + "launch failed", ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), retriedThenBlocked, now.AddHours(-1), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
+        foreach (var (id, title, reblockedAt, priority) in new[]
+        {
+            (eligible, "At boundary", now.AddDays(-14), 1),
+            (tooRecent, "Too recent", now.AddDays(-14).AddTicks(1), 2)
+        })
+        {
+            store.Append(new IssueCreated(Guid.NewGuid(), id, now.AddDays(-30), title, null, Status.Blocked, Priority.From(priority), null, null));
+            store.Append(new StatusChanged(Guid.NewGuid(), id, now.AddDays(-20), Status.Next));
+            store.Append(new StatusChanged(Guid.NewGuid(), id, reblockedAt, Status.Blocked));
+        }
 
-        Assert.Null(new IssueEngine(store, new FrozenClock(now)).ResearchClaimBlocked().Task);
-        Assert.Equal(
-            stillBlocked,
-            new IssueEngine(store, new FrozenClock(now.AddDays(14).AddHours(-3))).ResearchClaimBlocked(dryRun: true).Task!.Issue.Id);
+        var claim = new IssueEngine(store, new FrozenClock(now)).ResearchClaimBlocked(dryRun: true);
+
+        Assert.Equal(eligible, claim.Task!.Issue.Id);
     }
 
     [Fact]
-    public void ResearchClaim_RejectsSpoofedFailureActorAndPrefix()
+    public void ResearchClaim_SkipsBlockedRepositoryReservedByActiveTask()
     {
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
-        var spoofedActor = IssueId.New();
-        var spoofedPrefix = IssueId.New();
-        var realFailure = IssueId.New();
+        var active = IssueId.New();
+        var conflicting = IssueId.New();
+        var available = IssueId.New();
         var store = new InMemoryEventStore();
-        foreach (var (id, title, priority) in new[]
-        {
-            (spoofedActor, "Spoofed actor", 1),
-            (spoofedPrefix, "Spoofed prefix", 2),
-            (realFailure, "Real failure", 3)
-        })
-        {
-            store.Append(new IssueCreated(Guid.NewGuid(), id, now.AddHours(-3), title, null, Status.Blocked, Priority.From(priority), null, null));
-            store.Append(new CommentAdded(Guid.NewGuid(), id, now.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-        }
-        store.Append(new CommentAdded(Guid.NewGuid(), spoofedActor, now.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "network", "human"));
-        store.Append(new CommentAdded(Guid.NewGuid(), spoofedPrefix, now.AddHours(-1), "Research worker could not complete network", ResearchClaimPolicy.Actor));
-        store.Append(new CommentAdded(Guid.NewGuid(), realFailure, now.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "network", ResearchClaimPolicy.Actor));
+        store.Append(new IssueCreated(Guid.NewGuid(), active, now.AddDays(-2), "Active", null, Status.Active, Priority.From(1), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), active, now.AddDays(-2), "repo:alpha"));
+        store.Append(new IssueCreated(Guid.NewGuid(), conflicting, now.AddDays(-2), "Conflicting", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), conflicting, now.AddDays(-2), "repo:ALPHA"));
+        store.Append(new IssueCreated(Guid.NewGuid(), available, now.AddDays(-2), "Available", null, Status.Blocked, Priority.From(2), null, null));
+        store.Append(new LabelAdded(Guid.NewGuid(), available, now.AddDays(-2), "repo:beta"));
 
-        var claim = new IssueEngine(store, new FrozenClock(now)).ResearchClaimBlocked();
+        var engine = new IssueEngine(store, new FrozenClock(now));
+        var claim = engine.ResearchClaimBlocked();
 
-        Assert.Equal(realFailure, claim.Task!.Issue.Id);
+        Assert.Equal(available, claim.Task!.Issue.Id);
+        Assert.False(ResearchClaimPolicy.HasAttempt(engine.GetState().Issues[conflicting]));
     }
 
     [Fact]
@@ -925,9 +919,8 @@ public sealed class IssueEngineTests
             var timestamp = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
             var setup = new SqliteEventStore(databasePath);
             var issueId = IssueId.New();
-            setup.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
-            setup.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddHours(-2), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
-            setup.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddHours(-1), ResearchClaimPolicy.FailureMarkerPrefix + "launch failed", ResearchClaimPolicy.Actor));
+            setup.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp.AddDays(-30), "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+            setup.Append(new CommentAdded(Guid.NewGuid(), issueId, timestamp.AddDays(-14), ResearchClaimPolicy.MarkerComment, ResearchClaimPolicy.Actor));
             var firstEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
             var secondEngine = new IssueEngine(new SqliteEventStore(databasePath), new FrozenClock(timestamp));
 
@@ -960,7 +953,7 @@ public sealed class IssueEngineTests
         var now = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
         var store = new InMemoryEventStore();
         var issueId = IssueId.New();
-        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now, "Blocked", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now.AddHours(-12), "Blocked", null, Status.Blocked, Priority.From(3), null, null));
         var engine = new IssueEngine(store, new FrozenClock(now));
         Assert.True(engine.ResearchClaimBlocked().Success);
 
@@ -981,8 +974,8 @@ public sealed class IssueEngineTests
         var unclaimed = IssueId.New();
         var claimed = IssueId.New();
         var store = new InMemoryEventStore();
-        store.Append(new IssueCreated(Guid.NewGuid(), claimed, now, "Claimed", null, Status.Blocked, Priority.From(3), null, null));
-        store.Append(new IssueCreated(Guid.NewGuid(), unclaimed, now.AddMinutes(1), "Unclaimed", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), claimed, now.AddHours(-13), "Claimed", null, Status.Blocked, Priority.From(3), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), unclaimed, now.AddHours(-13).AddMinutes(1), "Unclaimed", null, Status.Blocked, Priority.From(3), null, null));
         var engine = new IssueEngine(store, new FrozenClock(now));
         var rejected = engine.CompleteResearch(unclaimed);
         Assert.False(rejected.Success);
@@ -1003,7 +996,7 @@ public sealed class IssueEngineTests
         var now = new DateTime(2026, 9, 5, 12, 0, 0, DateTimeKind.Utc);
         var store = new InMemoryEventStore();
         var issueId = IssueId.New();
-        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now, "Task operations", null, Status.Blocked, Priority.From(1), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, now.AddHours(-12), "Task operations", null, Status.Blocked, Priority.From(1), null, null));
         var engine = new IssueEngine(store, new FrozenClock(now));
         Assert.True(engine.ResearchClaimBlocked().Success);
 
