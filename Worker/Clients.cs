@@ -55,6 +55,7 @@ public sealed record PullRequestSnapshot(
     public bool IsOpen => State.Equals("OPEN", StringComparison.OrdinalIgnoreCase);
     public bool Open => IsOpen;
     public bool MergeabilityPending => !Merged && Mergeable.Equals("UNKNOWN", StringComparison.OrdinalIgnoreCase);
+    public bool RequiresBaseUpdate => !Merged && IsOpen && MergeStateStatus.Equals("BEHIND", StringComparison.OrdinalIgnoreCase);
     public bool HasMergeConflict => !Merged && (Mergeable.Equals("CONFLICTING", StringComparison.OrdinalIgnoreCase)
         || MergeStateStatus.Equals("DIRTY", StringComparison.OrdinalIgnoreCase));
 
@@ -90,6 +91,7 @@ public interface IGitHubClient
     Task<PullRequestSnapshot> InspectAsync(string pullRequestUrl, bool includeFeedback, CancellationToken cancellationToken);
     Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken);
     Task ResolveAsync(string pullRequestUrl, string threadId, CancellationToken cancellationToken);
+    Task UpdateBranchAsync(string pullRequestUrl, CancellationToken cancellationToken);
     Task MergeAsync(string pullRequestUrl, CancellationToken cancellationToken);
 
     Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken);
@@ -185,6 +187,13 @@ public sealed class GitHubClient : IGitHubClient
         var settings = config();
         await Require(settings.GhExe, ["pr", "merge", pullRequestUrl, "--squash", "--delete-branch"], settings.RepoRoot, cancellationToken);
         log.Write("info", "github.merge", new { pullRequestUrl, method = "squash" });
+    }
+
+    public async Task UpdateBranchAsync(string pullRequestUrl, CancellationToken cancellationToken)
+    {
+        var settings = config();
+        await Require(settings.GhExe, ["pr", "update-branch", pullRequestUrl], settings.RepoRoot, cancellationToken);
+        log.Write("info", "github.branch.updated", new { pullRequestUrl });
     }
 
     private async Task<IReadOnlyList<ReviewFeedback>> GetFeedback(PullRequestId id, WorkerConfig settings, CancellationToken cancellationToken)
