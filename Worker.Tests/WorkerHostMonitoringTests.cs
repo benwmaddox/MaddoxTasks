@@ -191,6 +191,33 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task BehindPullRequest_UpdatesBranchInsteadOfAttemptingMergeOrRepair()
+    {
+        var behind = Snapshot(false) with { Mergeable = "MERGEABLE", MergeStateStatus = "BEHIND", HeadOid = "abc123", BaseRefName = "main" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: true, behind);
+
+        await fixture.MonitorAsync();
+
+        Assert.Equal([fixture.Job.PullRequests[0].Url], fixture.GitHub.UpdatedBranchUrls);
+        Assert.Empty(fixture.GitHub.MergedUrls);
+        Assert.Empty(fixture.Job.PendingCheckFailures);
+        Assert.False(fixture.Job.ReadyForReviewRecorded);
+    }
+
+    [Fact]
+    public async Task BehindPullRequest_InManualRepositoryRemainsReadyForHumanDecision()
+    {
+        var behind = Snapshot(false) with { Mergeable = "MERGEABLE", MergeStateStatus = "BEHIND", HeadOid = "abc123", BaseRefName = "main" };
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, behind);
+
+        await fixture.MonitorAsync();
+
+        Assert.Empty(fixture.GitHub.UpdatedBranchUrls);
+        Assert.True(fixture.Job.ReadyForReviewRecorded);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("ReadyForReview"));
+    }
+
+    [Fact]
     public async Task PersistedProcessedConflict_RearmsRepairWhenNoFailureIsPending()
     {
         var conflict = Snapshot(false) with { Mergeable = "CONFLICTING", MergeStateStatus = "DIRTY", HeadOid = "abc123", BaseRefName = "main" };
@@ -633,6 +660,7 @@ public sealed class WorkerHostMonitoringTests
 
         public List<(string Url, bool IncludeFeedback)> Inspections { get; } = [];
         public List<string> MergedUrls { get; } = [];
+        public List<string> UpdatedBranchUrls { get; } = [];
         public List<string> RerunUrls { get; } = [];
 
         public Task<PullRequestSnapshot> InspectAsync(string pullRequestUrl, bool includeFeedback, CancellationToken cancellationToken)
@@ -644,6 +672,7 @@ public sealed class WorkerHostMonitoringTests
 
         public Task ReplyAsync(string pullRequestUrl, ReviewFeedback feedback, string replyBody, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task ResolveAsync(string pullRequestUrl, string threadId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task UpdateBranchAsync(string pullRequestUrl, CancellationToken cancellationToken) { UpdatedBranchUrls.Add(pullRequestUrl); return Task.CompletedTask; }
         public Task RerunAsync(string actionsRunUrl, CancellationToken cancellationToken) { RerunUrls.Add(actionsRunUrl); return Task.CompletedTask; }
         public Task MergeAsync(string pullRequestUrl, CancellationToken cancellationToken) { MergedUrls.Add(pullRequestUrl); return Task.CompletedTask; }
     }

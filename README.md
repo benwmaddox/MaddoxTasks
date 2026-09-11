@@ -369,6 +369,10 @@ that a known pull request is still open, all checks pass, and no actionable revi
 feedback remains before moving the task to `ReadyForReview`. `reviewQuietPeriod`
 delays only automatic merging for configured auto-merge repositories; other
 repositories remain ready for your PR decision.
+For configured auto-merge repositories, a pull request reported as `BEHIND` is
+updated from its base branch before review readiness and automatic merge are
+re-evaluated. A true `CONFLICTING` or `DIRTY` state continues through the bounded
+Codex-assisted conflict-repair workflow.
 
 The runner validates every repository in a claim under `RepoRoot`, opens Codex in the first repository, and grants each additional repository with repeatable `--add-dir` arguments. An isolated regression check uses fake Maddox/Codex/GitHub commands and does not access the live database:
 

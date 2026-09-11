@@ -1512,6 +1512,7 @@ public sealed class WorkerHost
 
     private async Task MonitorJobAsync(Job job, CancellationToken ct)
     {
+        var autoMergeAllowed = IsAutoMergeAllowed(job);
         var allGreen = job.PullRequests.Count > 0;
         var allReviewReady = job.PullRequests.Count > 0;
         var newFeedback = false;
@@ -1554,7 +1555,12 @@ public sealed class WorkerHost
                 await AddCommentAsync(job, $"Ready for review; GitHub check {humanGate.Name} is waiting for human approval: {humanGate.Link}", ct);
                 job.ProcessedCheckIds.Add(humanGate.Id);
             }
-            if (snapshot.HasMergeConflict)
+            if (snapshot.RequiresBaseUpdate && autoMergeAllowed)
+            {
+                allReviewReady = false;
+                await github.UpdateBranchAsync(pullRequest.Url, ct);
+            }
+            else if (snapshot.HasMergeConflict)
             {
                 var conflict = new CheckState(
                     "pull-request-mergeability",
@@ -1602,7 +1608,7 @@ public sealed class WorkerHost
                 job.ReadyForReviewRecorded = true;
                 Save(job);
             }
-            if (IsAutoMergeAllowed(job) && allGreen && quietPeriodElapsed)
+            if (autoMergeAllowed && allGreen && quietPeriodElapsed)
             {
                 foreach (var pullRequest in job.PullRequests) await github.MergeAsync(pullRequest.Url, ct);
                 await ReconcileAsync(ct);

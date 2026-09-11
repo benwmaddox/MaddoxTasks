@@ -120,6 +120,27 @@ public sealed class GitHubInspectionTests
     }
 
     [Fact]
+    public void BehindSnapshot_RequiresBaseUpdateWithoutReportingConflict()
+    {
+        var snapshot = new PullRequestSnapshot(false, [], [], "MERGEABLE", "BEHIND", "abc123", "main");
+
+        Assert.True(snapshot.RequiresBaseUpdate);
+        Assert.False(snapshot.HasMergeConflict);
+        Assert.True(snapshot.IsReviewReady([]));
+    }
+
+    [Fact]
+    public async Task UpdateBranch_UsesPullRequestUrl()
+    {
+        using var fixture = new Fixture();
+
+        await fixture.Client.UpdateBranchAsync(PullRequestUrl, CancellationToken.None);
+
+        var call = Assert.Single(fixture.Processes.Calls);
+        Assert.Equal(["pr", "update-branch", PullRequestUrl], call.Arguments);
+    }
+
+    [Fact]
     public async Task Rerun_UsesRunIdAndRepositoryFromActionsUrl()
     {
         using var fixture = new Fixture();
