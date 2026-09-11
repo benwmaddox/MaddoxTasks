@@ -42,7 +42,8 @@ public sealed record WorkerConfig(
     string? PrivateRepositoryOwner = null,
     int? WorkerRetryMaxAttempts = null,
     TimeSpan? WorkerRetryMaxElapsed = null,
-    TimeSpan? WorkerRetryBaseDelay = null)
+    TimeSpan? WorkerRetryBaseDelay = null,
+    string WorkspaceMode = "checkout")
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true };
     public TimeSpan EffectiveBlockedDisplayDuration => BlockedDisplayDuration ?? TimeSpan.FromMinutes(10);
@@ -52,6 +53,8 @@ public sealed record WorkerConfig(
     public int EffectiveWorkerRetryMaxAttempts => WorkerRetryMaxAttempts ?? 3;
     public TimeSpan EffectiveWorkerRetryMaxElapsed => WorkerRetryMaxElapsed ?? TimeSpan.FromHours(2);
     public TimeSpan EffectiveWorkerRetryBaseDelay => WorkerRetryBaseDelay ?? TimeSpan.FromMinutes(5);
+    public string EffectiveWorkspaceMode => string.IsNullOrWhiteSpace(WorkspaceMode) ? "checkout" : WorkspaceMode;
+    public bool UseWorktrees => EffectiveWorkspaceMode.Equals("worktree", StringComparison.OrdinalIgnoreCase);
 
     public static WorkerConfig Load(string path)
     {
@@ -74,6 +77,9 @@ public sealed record WorkerConfig(
         if (WorkerRetryMaxAttempts is { } workerRetryMaxAttempts && workerRetryMaxAttempts < 1) throw new InvalidDataException("workerRetryMaxAttempts must be positive.");
         if (WorkerRetryMaxElapsed is { } workerRetryMaxElapsed && workerRetryMaxElapsed <= TimeSpan.Zero) throw new InvalidDataException("workerRetryMaxElapsed must be positive.");
         if (WorkerRetryBaseDelay is { } workerRetryBaseDelay && workerRetryBaseDelay <= TimeSpan.Zero) throw new InvalidDataException("workerRetryBaseDelay must be positive.");
+        if (!EffectiveWorkspaceMode.Equals("checkout", StringComparison.OrdinalIgnoreCase)
+            && !EffectiveWorkspaceMode.Equals("worktree", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException("workspaceMode must be 'checkout' or 'worktree'.");
         if (!string.Equals(AutoMergeMethod, "squash", StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Only squash auto-merge is supported.");
         foreach (var value in new[] { PromptFile, Model, ReasoningEffort, MaddoxExe, CodexExe, GhExe, RepoRoot, WorktreeRoot })
             if (string.IsNullOrWhiteSpace(value)) throw new InvalidDataException("Required configuration values cannot be blank.");
@@ -817,7 +823,7 @@ public static class WorkerRetryPolicy
 
     /// <summary>
     /// Internal-thread/session failures cannot be repaired by resuming the
-    /// same Codex conversation.  The next attempt should retain the worktree
+    /// same Codex conversation.  The next attempt should retain the workspace
     /// and repair context but start a fresh session.
     /// </summary>
     public static bool RequiresFreshSession(string kind, string? detail = null)
@@ -1011,12 +1017,21 @@ public static class WorkerRetryPolicy
 
 public sealed record RetryMetadataReconstruction(RecoveryMode Mode, string Reason);
 
-public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "");
+public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "", string DefaultRef = "");
 
 public sealed record WorkspaceBranchCandidate(string Branch, string Directory);
 
 public static class WorkspaceBranchPolicy
 {
+    public static string SelectDefaultRemoteRef(string symbolicRef, bool hasMain, bool hasMaster)
+    {
+        if (symbolicRef is "origin/main" or "origin/master") return symbolicRef;
+        if (hasMain) return "origin/main";
+        if (hasMaster) return "origin/master";
+        if (!string.IsNullOrWhiteSpace(symbolicRef)) return symbolicRef;
+        throw new InvalidOperationException("The origin remote has no default, main, or master branch.");
+    }
+
     public static WorkspaceBranchCandidate SelectAvailable(
         string baseBranch,
         string baseDirectory,
@@ -1048,6 +1063,27 @@ public static class WorkspaceBranchPolicy
         if (!prior.TryGetProperty("baseRefName", out var baseRefName)
             || string.IsNullOrWhiteSpace(baseRefName.GetString())) return defaultHead;
         return "origin/" + baseRefName.GetString();
+    }
+}
+
+public static class WorkspaceDirectoryPolicy
+{
+    public static bool IsCanonical(Workspace workspace, string repoRoot)
+    {
+        try
+        {
+            var expected = Path.GetFullPath(Path.Combine(repoRoot, workspace.Repository));
+            return Path.GetFullPath(workspace.Directory).Equals(expected, StringComparison.OrdinalIgnoreCase);
+        }
+        catch { return false; }
+    }
+
+    public static string LocalDefaultBranch(Workspace workspace)
+    {
+        var remoteRef = string.IsNullOrWhiteSpace(workspace.DefaultRef) ? "origin/main" : workspace.DefaultRef;
+        if (!remoteRef.StartsWith("origin/", StringComparison.Ordinal) || remoteRef.Length == "origin/".Length)
+            throw new InvalidDataException("Workspace default ref must name an origin branch.");
+        return remoteRef["origin/".Length..];
     }
 }
 public sealed record PullRequestState(string Url, string Repository, string HeadOid = "");
@@ -1956,13 +1992,12 @@ public static class ConsoleSegmentWriter
 
 public static class BlockedWorkspaceAdoption
 {
-    public static Job? TryAdopt(Journal journal, TaskDto claimedTask, string worktreeRoot, DateTime startedUtc)
+    public static Job? TryAdopt(Journal journal, TaskDto claimedTask, string repoRoot, string worktreeRoot, DateTime startedUtc)
     {
         var repositories = claimedTask.Repositories.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var root = Path.GetFullPath(worktreeRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var candidate = journal.Jobs
             .Where(job => job.Phase == JobPhases.Blocked && job.Task.IssueId.Equals(claimedTask.IssueId, StringComparison.OrdinalIgnoreCase))
-            .Where(job => IsEligible(job, repositories, root))
+            .Where(job => IsEligible(job, repositories, repoRoot, worktreeRoot))
             .OrderByDescending(job => job.StartedUtc)
             .FirstOrDefault();
         if (candidate is null) return null;
@@ -2007,19 +2042,21 @@ public static class BlockedWorkspaceAdoption
         return candidate;
     }
 
-    private static bool IsEligible(Job job, HashSet<string> repositories, string worktreeRoot)
+    private static bool IsEligible(Job job, HashSet<string> repositories, string repoRoot, string worktreeRoot)
     {
         if (job.Workspaces.Count == 0 || string.IsNullOrWhiteSpace(job.Prompt) || string.IsNullOrWhiteSpace(job.Model) || string.IsNullOrWhiteSpace(job.Effort)) return false;
         if (!repositories.SetEquals(job.Task.Repositories) || !repositories.SetEquals(job.Workspaces.Select(workspace => workspace.Repository))) return false;
         if (job.Workspaces.Select(workspace => workspace.Repository).Distinct(StringComparer.OrdinalIgnoreCase).Count() != job.Workspaces.Count) return false;
         var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var branches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var managedRoot = Path.GetFullPath(worktreeRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
         foreach (var workspace in job.Workspaces)
         {
             if (string.IsNullOrWhiteSpace(workspace.Repository) || string.IsNullOrWhiteSpace(workspace.Directory) || string.IsNullOrWhiteSpace(workspace.Branch) || string.IsNullOrWhiteSpace(workspace.Remote)) return false;
             string directory;
             try { directory = Path.GetFullPath(workspace.Directory); } catch { return false; }
-            if (!directory.StartsWith(worktreeRoot, StringComparison.OrdinalIgnoreCase) || !directories.Add(directory) || !branches.Add(workspace.Branch)) return false;
+            if ((!WorkspaceDirectoryPolicy.IsCanonical(workspace, repoRoot) && !directory.StartsWith(managedRoot, StringComparison.OrdinalIgnoreCase))
+                || !directories.Add(directory) || !branches.Add(workspace.Branch)) return false;
         }
         return true;
     }

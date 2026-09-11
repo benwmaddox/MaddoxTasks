@@ -319,8 +319,8 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 .\scripts\install-worker-task.ps1 -BinaryDir F:\MaddoxTasks
 ```
 
-Repository admission and workspace creation prepare each project at its exact directory beneath `repoRoot`.
-Existing `origin` remotes remain authoritative: the worker fetches and bases its isolated worktree on the remote default branch, without pulling or resetting the canonical checkout. Task publication pushes its task branch through the usual PR workflow.
+Repository admission prepares each project at its exact directory beneath `repoRoot`. The default `workspaceMode` is `checkout`: the worker uses that canonical checkout, requires it to be clean and on the remote default branch, and creates the task branch there. Maddox repository reservations admit at most one active task per repository, so separate repositories may still run concurrently without multiplying checkouts. An occupied or dirty checkout stops preparation instead of being bypassed.
+Existing `origin` remotes remain authoritative: before every new task, the worker fetches and prunes `origin`, resolves the freshly fetched `origin/main` or `origin/master` (falling back to another explicit remote default only when neither exists), and bases the task branch on that remote tip. It does not rely on a stale local default branch, pull, or reset unrelated work. Task publication pushes its task branch through the usual PR workflow. Set `workspaceMode` to `worktree` only as an explicit last-resort exception when a concrete technical constraint requires isolation; `worktreeRoot` is used only in that mode.
 To authorize creating missing remotes, set `privateRepositoryOwner` in `worker.json` to your GitHub username (for example `benwmaddox`). The authenticated `github.com` account must match. The worker creates a **private** repository named after the project directory; authentication failures and existing-name collisions stop preparation rather than adopting another repository. Without this setting, existing origins still work, but new remote creation stops with an actionable error.
 Projects without their own Git metadata are initialized locally, even when their parent is a checkout. An empty remote receives the existing committed HEAD. For an unborn local repository, the worker creates an initial baseline from nonignored project files; Stasis manifest `output` and `.stasis_cache` are excluded. Keep project `.gitignore` rules current for other generated files and local-only material. Existing staged initial files require a manual reviewed commit first; established repositories' unrelated working changes are never staged. Normal commit hooks remain enabled. Linked project paths are rejected, and no force-push or checkout reset is used.
 
@@ -338,9 +338,10 @@ then exit. Run `MaddoxTasks.Worker.exe --stop` or press Ctrl+C when an immediate
 local shutdown is required. The visible dashboard keeps recently blocked work for
 `blockedDisplayDuration` (10 minutes by default), then rolls it off while the
 durable journal and JSONL logs retain the full record.
-Blocked jobs retain their owned worktrees and branches, including tracked changes
-and non-ignored untracked files, for diagnosis or later recovery. Destructive
-worktree and branch cleanup is eligible only after the job reaches `Done`;
+Blocked jobs retain their owned workspace and branch, including tracked changes
+and non-ignored untracked files, for diagnosis or later recovery. Canonical checkouts
+remain reserved while blocked work is retained. Destructive cleanup of exceptional
+worktrees and their task branches is eligible only after the job reaches `Done`;
 best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 Worker-owned failures and structured `transientWorker` or `workerRepairable` blockers
 keep the task `Active` and retry the retained workspace with exponential backoff.

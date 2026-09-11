@@ -51,7 +51,7 @@ public sealed class WorkerHost
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, stop.Token);
         var ct = linked.Token;
-        Directory.CreateDirectory(config.Current.WorktreeRoot);
+        if (config.Current.UseWorktrees) Directory.CreateDirectory(config.Current.WorktreeRoot);
         await PreflightAsync(ct);
         await RecoverInvalidRetryMetadataAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
@@ -174,7 +174,7 @@ public sealed class WorkerHost
                 var adopted = false;
                 lock (journalGate)
                 {
-                    var owned = BlockedWorkspaceAdoption.TryAdopt(journal, task, snapshot.Config.WorktreeRoot, clock.UtcNow);
+                    var owned = BlockedWorkspaceAdoption.TryAdopt(journal, task, snapshot.Config.RepoRoot, snapshot.Config.WorktreeRoot, clock.UtcNow);
                     adopted = owned is not null;
                     job = owned ?? new Job { Task = task, Prompt = snapshot.Prompt, Model = snapshot.Config.Model, Effort = snapshot.Config.ReasoningEffort, StartedUtc = clock.UtcNow, PhaseChangedUtc = clock.UtcNow };
                     mode = owned is null ? RecoveryMode.Initial : RecoveryPlanner.ModeForAdopted(job);
@@ -863,7 +863,7 @@ public sealed class WorkerHost
             job.AdoptedResultReassessmentAttempted = true;
             Save(job);
             var schema = WriteSchema("result", ResultSchema);
-            const string prompt = "Reassess the structured result for this retained worker-owned workspace. Existing staged, unstaged, untracked, or committed changes in the supplied worktree are task-owned work from the previous attempt, not unrelated user changes. Inspect and preserve them, finish and validate the task, and report changed:true for each repository containing that retained task work so the worker can commit and publish it. Return changed:false only when the repository is clean and contains no task-owned commit after the execution start. Return the normal required structured result schema.";
+            const string prompt = "Reassess the structured result for this retained worker-owned workspace. Existing staged, unstaged, untracked, or committed changes in the supplied workspace are task-owned work from the previous attempt, not unrelated user changes. Inspect and preserve them, finish and validate the task, and report changed:true for each repository containing that retained task work so the worker can commit and publish it. Return changed:false only when the repository is clean and contains no task-owned commit after the execution start. Return the normal required structured result schema.";
             RequestDashboardRefresh();
             var run = await RunContinuationAsync(job, schema, prompt, ct);
             if (run.ExitCode != 0) throw new InvalidOperationException("Codex retained-workspace result reassessment failed: " + ExecResultDiagnostics.Failure(run));
@@ -1018,7 +1018,7 @@ public sealed class WorkerHost
             : job.AdoptedBlockedWorkspace
             ? "\nRETAINED WORKSPACE:\nThis worker-owned workspace was retained from a previous blocked attempt. Treat its existing staged, unstaged, untracked, and task-branch commit changes as task-owned work: inspect and preserve them, finish and validate the task, and report changed:true when they remain for publication."
             : string.Empty;
-        return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKTREES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}{adoptedContext}\nRESTRICTIONS:\n{restrictions}{repairContext}";
+        return $"{basePrompt}\nTASK:\n{JsonSerializer.Serialize(job.Task)}\nWORKSPACES:\n{JsonSerializer.Serialize(job.Workspaces)}{executionRoot}{adoptedContext}\nRESTRICTIONS:\n{restrictions}{repairContext}";
     }
 
     private async Task PrepareMergeabilityRepairsAsync(Job job, CancellationToken ct)
@@ -1193,15 +1193,31 @@ public sealed class WorkerHost
     private async Task<Workspace> MakeWorkspaceAsync(Job job, string repository, CancellationToken ct)
     {
         var source = await new RepositoryBootstrap(processes, config.Current.GhExe, config.Current.PrivateRepositoryOwner).EnsureAsync(config.Current.RepoRoot, repository, ct);
+        var useWorktrees = config.Current.UseWorktrees;
         var slug = Regex.Replace(job.Task.Title.ToLowerInvariant(), "[^a-z0-9]+", "-").Trim('-');
         if (slug.Length > 30) slug = slug[..30];
         if (slug.Length == 0) slug = "task";
         var branch = $"codex/task-{job.Task.Sequence}-{slug}";
         var repositorySlug = Regex.Replace(repository, "[^A-Za-z0-9._-]+", "-");
-        var directory = Path.Combine(config.Current.WorktreeRoot, $"{repositorySlug}-{job.Task.Sequence}");
-        await RequireAsync("git", ["fetch", "origin"], source, ct);
-        var head = (await processes.RunAsync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], source, ct)).Output.Trim();
-        if (string.IsNullOrWhiteSpace(head)) head = "origin/main";
+        var directory = useWorktrees ? Path.Combine(config.Current.WorktreeRoot, $"{repositorySlug}-{job.Task.Sequence}") : source;
+        if (useWorktrees) Directory.CreateDirectory(config.Current.WorktreeRoot);
+        await RequireAsync("git", ["fetch", "--prune", "origin"], source, ct);
+        var symbolicHead = (await processes.RunAsync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], source, ct)).Output.Trim();
+        var remoteMain = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", "refs/remotes/origin/main"], source, ct);
+        var remoteMaster = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", "refs/remotes/origin/master"], source, ct);
+        if (remoteMain.ExitCode is not (0 or 1) || remoteMaster.ExitCode is not (0 or 1))
+            throw new InvalidOperationException("Could not inspect the freshly fetched main/master refs.");
+        var head = WorkspaceBranchPolicy.SelectDefaultRemoteRef(symbolicHead, remoteMain.ExitCode == 0, remoteMaster.ExitCode == 0);
+        if (!useWorktrees)
+        {
+            var status = await RequireAsync("git", ["status", "--porcelain"], source, ct);
+            if (!string.IsNullOrWhiteSpace(status.Output))
+                throw new InvalidOperationException($"Canonical checkout is dirty: {source}. Preserve or finish that work before the worker claims this repository.");
+            var currentBranch = (await RequireAsync("git", ["branch", "--show-current"], source, ct)).Output.Trim();
+            var defaultBranch = head.StartsWith("origin/", StringComparison.Ordinal) ? head["origin/".Length..] : head;
+            if (!currentBranch.Equals(defaultBranch, StringComparison.Ordinal))
+                throw new InvalidOperationException($"Canonical checkout is occupied by branch '{currentBranch}': {source}. Return it to '{defaultBranch}' before worker use, or explicitly configure workspaceMode=worktree for exceptional isolation.");
+        }
         var localBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var remoteBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1210,7 +1226,7 @@ public sealed class WorkerHost
         while (true)
         {
             candidate = WorkspaceBranchPolicy.SelectAvailable(branch, directory, localBranches, remoteBranches, directories);
-            if (Directory.Exists(candidate.Directory))
+            if (useWorktrees && Directory.Exists(candidate.Directory))
             {
                 directories.Add(candidate.Directory);
             }
@@ -1226,7 +1242,7 @@ public sealed class WorkerHost
             else if (remoteProbe.ExitCode != 2) throw new InvalidOperationException("Could not verify remote branch ownership: " + remoteProbe.Error.Trim());
             if (!localBranches.Contains(candidate.Branch)
                 && !remoteBranches.Contains(candidate.Branch)
-                && !directories.Contains(candidate.Directory)) break;
+                && (!useWorktrees || !directories.Contains(candidate.Directory))) break;
         }
 
         var startingRef = head;
@@ -1235,18 +1251,22 @@ public sealed class WorkerHost
             var priorPullRequests = await RequireAsync(config.Current.GhExe, ["pr", "list", "--head", priorRemoteBranch, "--state", "all", "--limit", "1", "--json", "mergedAt,baseRefName"], source, ct);
             startingRef = WorkspaceBranchPolicy.SelectStartingRef(priorPullRequests.Output, head, $"origin/{priorRemoteBranch}");
         }
-        await RequireAsync("git", ["worktree", "add", "-b", candidate.Branch, candidate.Directory, startingRef], source, ct);
+        var workspaceDirectory = useWorktrees ? candidate.Directory : source;
+        if (useWorktrees)
+            await RequireAsync("git", ["worktree", "add", "-b", candidate.Branch, workspaceDirectory, startingRef], source, ct);
+        else
+            await RequireAsync("git", ["switch", "-c", candidate.Branch, startingRef], source, ct);
         var remote = (await RequireAsync("git", ["remote", "get-url", "origin"], source, ct)).Output.Trim();
-        return new Workspace(repository, candidate.Directory, candidate.Branch, remote, startingRef);
+        return new Workspace(repository, workspaceDirectory, candidate.Branch, remote, startingRef, head);
     }
 
     private async Task ValidateOwnedWorkspacesAsync(Job job, CancellationToken ct)
     {
         foreach (var workspace in job.Workspaces)
         {
-            if (!Directory.Exists(workspace.Directory)) throw new InvalidOperationException("Owned worktree is missing: " + workspace.Directory);
+            if (!Directory.Exists(workspace.Directory)) throw new InvalidOperationException("Owned workspace is missing: " + workspace.Directory);
             var branch = await RequireAsync("git", ["branch", "--show-current"], workspace.Directory, ct);
-            if (!branch.Output.Trim().Equals(workspace.Branch, StringComparison.Ordinal)) throw new InvalidOperationException("Worktree ownership mismatch: " + workspace.Directory);
+            if (!branch.Output.Trim().Equals(workspace.Branch, StringComparison.Ordinal)) throw new InvalidOperationException("Workspace ownership mismatch: " + workspace.Directory);
         }
     }
 
@@ -1664,6 +1684,22 @@ public sealed class WorkerHost
         foreach (var workspace in job.Workspaces)
         {
             var source = Path.GetFullPath(Path.Combine(config.Current.RepoRoot, workspace.Repository));
+            if (WorkspaceDirectoryPolicy.IsCanonical(workspace, config.Current.RepoRoot))
+            {
+                var currentBranch = (await RequireAsync("git", ["branch", "--show-current"], source, ct)).Output.Trim();
+                if (currentBranch.Equals(workspace.Branch, StringComparison.Ordinal))
+                {
+                    var status = await RequireAsync("git", ["status", "--porcelain"], source, ct);
+                    if (!string.IsNullOrWhiteSpace(status.Output))
+                        throw new InvalidOperationException("Canonical checkout still contains unpublished changes: " + source);
+                    var defaultBranch = WorkspaceDirectoryPolicy.LocalDefaultBranch(workspace);
+                    var localDefault = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{defaultBranch}"], source, ct);
+                    if (localDefault.ExitCode == 0) await RequireAsync("git", ["switch", defaultBranch], source, ct);
+                    else if (localDefault.ExitCode == 1) await RequireAsync("git", ["switch", "-c", defaultBranch, "--track", workspace.DefaultRef], source, ct);
+                    else throw new InvalidOperationException("Could not inspect the canonical default branch: " + localDefault.Error.Trim());
+                }
+                continue;
+            }
             if (Directory.Exists(workspace.Directory))
             {
                 var remove = await processes.RunAsync("git", ["worktree", "remove", workspace.Directory], source, ct);
