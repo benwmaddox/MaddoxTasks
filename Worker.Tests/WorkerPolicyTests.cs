@@ -5,6 +5,25 @@ namespace MaddoxTasks.Worker.Tests;
 
 public sealed class WorkerPolicyTests
 {
+    [Fact]
+    public async Task ConcurrencyGate_CloseRejectsAdmissionsAndWaitsForReservedWork()
+    {
+        var gate = new ConcurrencyGate(() => 2);
+        Assert.True(gate.TryReserve());
+        Assert.True(gate.TryReserve());
+
+        Assert.True(gate.Close());
+        Assert.False(gate.Close());
+        Assert.False(gate.TryReserve());
+        var idle = gate.WhenIdle;
+
+        gate.Release();
+        Assert.False(idle.IsCompleted);
+        gate.Release();
+        await idle;
+        Assert.Equal(0, gate.Active);
+    }
+
     [Theory]
     [InlineData("The 'gpt-6-astra' model requires a newer version of Codex")]
     [InlineData("failed to load models cache: missing field supports_parallel_tool_calls")]
@@ -348,19 +367,28 @@ public sealed class WorkerPolicyTests
     {
         var nextRun = new DateTime(2026, 9, 9, 14, 30, 0);
 
-        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: false, nextRun);
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: false, draining: false, nextRun);
 
         Assert.Equal($"Maddox Worker | active 2/4 | follow-ups 1 | next {nextRun:T}", lines[0]);
-        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Drain and stop", lines[1]);
     }
 
     [Fact]
     public void DashboardBanner_RenderIncludesShortcutLegendAndPausedState()
     {
-        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: true, new DateTime(2026, 9, 9, 14, 30, 0));
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: true, draining: false, new DateTime(2026, 9, 9, 14, 30, 0));
 
         Assert.Equal("Maddox Worker | active 2/4 | follow-ups 1 | claims paused by keyboard", lines[0]);
-        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker", lines[1]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Drain and stop", lines[1]);
+    }
+
+    [Fact]
+    public void DashboardBanner_RenderIncludesDrainingState()
+    {
+        var lines = DashboardBanner.Lines(active: 2, capacity: 4, followups: 1, paused: false, draining: true, new DateTime(2026, 9, 9, 14, 30, 0));
+
+        Assert.Equal("Maddox Worker | active 2/4 | follow-ups 1 | draining; exits when active work finishes", lines[0]);
+        Assert.Equal("[P] Pause/resume new claims | [R] Run scheduler now | [Q] Drain and stop", lines[1]);
     }
 
     [Fact]

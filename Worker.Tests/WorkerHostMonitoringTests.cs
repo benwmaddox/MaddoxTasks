@@ -7,6 +7,19 @@ namespace MaddoxTasks.Worker.Tests;
 public sealed class WorkerHostMonitoringTests
 {
     [Fact]
+    public async Task DrainRequested_SkipsClaimsResearchAndFollowups()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Host.RequestDrain();
+
+        var outcome = await fixture.TickAsync();
+
+        Assert.Equal(FreshClaimOutcome.NotAttempted, outcome);
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("claim", StringComparer.Ordinal));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("research-claim", StringComparer.Ordinal));
+    }
+
+    [Fact]
     public async Task ActiveUsageLimitCooldown_SkipsResearchFollowupsAndFreshClaims()
     {
         using var fixture = HostFixture.CreateThrottled(new DateTime(2026, 9, 10, 19, 14, 0, DateTimeKind.Utc));

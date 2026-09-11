@@ -1544,21 +1544,51 @@ public static class CommitHookRecoveryPolicy
 public sealed class ConcurrencyGate
 {
     private readonly Func<int> capacity;
+    private readonly object gate = new();
     private int active;
+    private bool accepting = true;
+    private TaskCompletionSource? idle;
+
     public ConcurrencyGate(Func<int> capacity) => this.capacity = capacity;
-    public int Active => Volatile.Read(ref active);
+
+    public int Active { get { lock (gate) return active; } }
+    public bool IsAccepting { get { lock (gate) return accepting; } }
+    public Task WhenIdle { get { lock (gate) return active == 0 ? Task.CompletedTask : (idle ??= new(TaskCreationOptions.RunContinuationsAsynchronously)).Task; } }
+
     public bool TryReserve()
     {
-        while (true)
+        lock (gate)
         {
-            var observed = Active;
-            if (observed >= capacity()) return false;
-            if (Interlocked.CompareExchange(ref active, observed + 1, observed) == observed) return true;
+            if (!accepting || active >= capacity()) return false;
+            active++;
+            return true;
         }
     }
+
+    public bool Close()
+    {
+        lock (gate)
+        {
+            if (!accepting) return false;
+            accepting = false;
+            return true;
+        }
+    }
+
     public void Release()
     {
-        if (Interlocked.Decrement(ref active) < 0) throw new InvalidOperationException("Concurrency reservation underflow.");
+        TaskCompletionSource? completed = null;
+        lock (gate)
+        {
+            if (active == 0) throw new InvalidOperationException("Concurrency reservation underflow.");
+            active--;
+            if (active == 0)
+            {
+                completed = idle;
+                idle = null;
+            }
+        }
+        completed?.TrySetResult();
     }
 }
 
@@ -1711,11 +1741,16 @@ public static class DashboardSummary
 
 public static class DashboardBanner
 {
-    public const string ShortcutLegend = "[P] Pause/resume new claims | [R] Run scheduler now | [Q] Stop worker";
+    public const string ShortcutLegend = "[P] Pause/resume new claims | [R] Run scheduler now | [Q] Drain and stop";
 
     public static string[] Lines(int active, int capacity, int followups, bool paused, DateTime nextRunLocal)
+        => Lines(active, capacity, followups, paused, draining: false, nextRunLocal);
+
+    public static string[] Lines(int active, int capacity, int followups, bool paused, bool draining, DateTime nextRunLocal)
     {
-        var scheduleStatus = capacity == 0
+        var scheduleStatus = draining
+            ? "draining; exits when active work finishes"
+            : capacity == 0
             ? "paused by concurrency cap"
             : paused ? "claims paused by keyboard" : $"next {nextRunLocal:T}";
         return
