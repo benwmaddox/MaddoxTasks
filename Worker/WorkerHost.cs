@@ -24,6 +24,7 @@ public sealed class WorkerHost
     private readonly BufferedRefresh dashboardRefresh;
     private readonly CancellationTokenSource stop = new();
     private readonly ConcurrencyGate capacity;
+    private readonly ConcurrencyGate monitoringActivity = new(() => 1);
     private readonly ResearchAdmission researchAdmission = new();
     private volatile bool paused;
     private volatile string? configError;
@@ -62,6 +63,12 @@ public sealed class WorkerHost
         {
             while (!ct.IsCancellationRequested)
             {
+                if (IsDrainRequested)
+                {
+                    RequestDashboardRefresh();
+                    await Task.WhenAll(capacity.WhenIdle, monitoringActivity.WhenIdle).WaitAsync(ct);
+                    break;
+                }
                 var now = clock.UtcNow;
                 var refillRequested = wakeReasons.HasFlag(SchedulerWakeReason.Manual)
                     || wakeReasons.HasFlag(SchedulerWakeReason.Followup)
@@ -94,10 +101,23 @@ public sealed class WorkerHost
 
     public void RequestStop() => stop.Cancel();
 
+    public void RequestDrain()
+    {
+        if (!capacity.Close()) return;
+        monitoringActivity.Close();
+        log.Write("info", "worker.drain.requested", new { active = capacity.Active, monitoring = monitoringActivity.Active, queued = followups.Count });
+        SignalScheduler(SchedulerWakeReason.Manual);
+        RequestDashboardRefresh();
+    }
+
+    internal bool IsDrainRequested => !capacity.IsAccepting;
+
     internal async Task<FreshClaimOutcome> TickAsync(CancellationToken ct, bool allowFreshClaim = true, bool allowResearch = true)
     {
         log.Write("info", "scheduler.tick", new { active = capacity.Active, queued = followups.Count, paused });
+        if (IsDrainRequested) return FreshClaimOutcome.NotAttempted;
         await ReconcileAsync(ct);
+        if (IsDrainRequested) return FreshClaimOutcome.NotAttempted;
         if (TryGetCodexUnavailableUntil(out var unavailableUntilUtc))
         {
             log.Write("warning", "codex.usage.deferred", new { unavailableUntilUtc });
@@ -1446,21 +1466,26 @@ public sealed class WorkerHost
     {
         while (!ct.IsCancellationRequested)
         {
-            try { await PollTaskUpdatesAsync(ct); }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-            catch (Exception exception) { log.Write("warning", "task-updates.poll.failed", new { error = exception.Message }); }
-            foreach (var job in SnapshotCleanupPending())
+            if (!monitoringActivity.TryReserve()) return;
+            try
             {
-                try { await CleanupAsync(job, ct); }
+                try { await PollTaskUpdatesAsync(ct); }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception exception) { log.Write("warning", "job.cleanup.deferred", new { job.Task.Sequence, error = exception.Message }); }
+                catch (Exception exception) { log.Write("warning", "task-updates.poll.failed", new { error = exception.Message }); }
+                foreach (var job in SnapshotCleanupPending())
+                {
+                    try { await CleanupAsync(job, ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception exception) { log.Write("warning", "job.cleanup.deferred", new { job.Task.Sequence, error = exception.Message }); }
+                }
+                foreach (var job in SnapshotJobs(JobPhases.Monitoring))
+                {
+                    try { await MonitorJobAsync(job, ct); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch (Exception exception) { log.Write("error", "monitor.failed", new { job.Task.Sequence, error = exception.Message }); }
+                }
             }
-            foreach (var job in SnapshotJobs(JobPhases.Monitoring))
-            {
-                try { await MonitorJobAsync(job, ct); }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-                catch (Exception exception) { log.Write("error", "monitor.failed", new { job.Task.Sequence, error = exception.Message }); }
-            }
+            finally { monitoringActivity.Release(); }
             await clock.Delay(config.Current.PrPollInterval, ct);
         }
     }
@@ -1750,7 +1775,7 @@ public sealed class WorkerHost
             {
                 case ConsoleKey.P: paused = !paused; log.Write("info", paused ? "claims.paused" : "claims.resumed"); if (!paused) SignalScheduler(SchedulerWakeReason.ConfigurationChanged); RequestDashboardRefresh(); break;
                 case ConsoleKey.R: SignalScheduler(SchedulerWakeReason.Manual); break;
-                case ConsoleKey.Q: RequestStop(); return;
+                case ConsoleKey.Q: RequestDrain(); return;
             }
         }
     }
@@ -1898,7 +1923,7 @@ public sealed class WorkerHost
         try
         {
             Console.Clear();
-            foreach (var line in DashboardBanner.Lines(capacity.Active, config.Current.MaxConcurrentCodexProcesses, followups.Count, paused, nextTickUtc.ToLocalTime()))
+            foreach (var line in DashboardBanner.Lines(capacity.Active, config.Current.MaxConcurrentCodexProcesses, followups.Count, paused, IsDrainRequested, nextTickUtc.ToLocalTime()))
                 ConsoleSegmentWriter.WriteLine([new ConsoleSegment(line, DashboardSegments.Structural)]);
             if (configError is not null) ConsoleSegmentWriter.WriteLine([new ConsoleSegment(DashboardFormatter.Truncate("Configuration error: " + configError, Math.Max(10, Console.WindowWidth - 1)), DashboardSegments.Detail)]);
             Job[] jobs;

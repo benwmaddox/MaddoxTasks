@@ -332,8 +332,10 @@ empty or fails, and it continues to drive reconciliation while the worker is at
 capacity. Follow-up work remains immediate and takes priority. Set
 `maxConcurrentCodexProcesses` to `0` to pause new Codex work while keeping PR
 monitoring and reconciliation active; running Codex processes drain naturally.
-Raise the value to resume. Run `MaddoxTasks.Worker.exe --stop` for an orderly
-local shutdown. The visible dashboard keeps recently blocked work for
+Raise the value to resume. In the interactive worker, press `Q` to stop new
+admissions, drain all active work through its normal completion handling, and
+then exit. Run `MaddoxTasks.Worker.exe --stop` or press Ctrl+C when an immediate
+local shutdown is required. The visible dashboard keeps recently blocked work for
 `blockedDisplayDuration` (10 minutes by default), then rolls it off while the
 durable journal and JSONL logs retain the full record.
 Blocked jobs retain their owned worktrees and branches, including tracked changes
