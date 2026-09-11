@@ -55,6 +55,7 @@ public sealed class WorkerPolicyTests
 
         Assert.Equal("gpt-5.6-sol", config.RootElement.GetProperty("model").GetString());
         Assert.Equal("medium", config.RootElement.GetProperty("reasoningEffort").GetString());
+        Assert.Equal("checkout", config.RootElement.GetProperty("workspaceMode").GetString());
     }
 
     [Fact]
@@ -136,6 +137,18 @@ public sealed class WorkerPolicyTests
 
         Assert.Equal("codex/task-1-fix-retry-4", candidate.Branch);
         Assert.Equal(@"D:\worktrees\repo-1-retry-4", candidate.Directory);
+    }
+
+    [Theory]
+    [InlineData("origin/main", true, true, "origin/main")]
+    [InlineData("origin/master", true, true, "origin/master")]
+    [InlineData("", true, false, "origin/main")]
+    [InlineData("", false, true, "origin/master")]
+    [InlineData("origin/trunk", false, false, "origin/trunk")]
+    public void WorkspaceBranchPolicy_SelectsTheFreshMainOrMasterTip(
+        string symbolicRef, bool hasMain, bool hasMaster, string expected)
+    {
+        Assert.Equal(expected, WorkspaceBranchPolicy.SelectDefaultRemoteRef(symbolicRef, hasMain, hasMaster));
     }
 
     [Fact]
@@ -966,6 +979,21 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void WorkerConfig_DefaultsToCanonicalCheckoutsAndRequiresAnExplicitWorktreeMode()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "worker.json");
+        WriteConfig(path, directory.Path, 1, "model");
+        Assert.False(WorkerConfig.Load(path).UseWorktrees);
+
+        WriteConfig(path, directory.Path, 1, "model", workspaceMode: "worktree");
+        Assert.True(WorkerConfig.Load(path).UseWorktrees);
+
+        WriteConfig(path, directory.Path, 1, "model", workspaceMode: "sometimes");
+        Assert.Throws<InvalidDataException>(() => WorkerConfig.Load(path));
+    }
+
+    [Fact]
     public void ConfigReload_FromZeroConcurrencyLetsGateResume()
     {
         using var directory = new TemporaryDirectory();
@@ -1171,7 +1199,7 @@ public sealed class WorkerPolicyTests
         var journal = new Journal { Jobs = [old, newest, duplicateWithoutWorkspace] };
         var claimed = new TaskDto(482, issueId, "Refreshed title", "Refreshed description", ["repo"]);
 
-        var adopted = BlockedWorkspaceAdoption.TryAdopt(journal, claimed, directory.Path, DateTime.UnixEpoch.AddDays(1));
+        var adopted = BlockedWorkspaceAdoption.TryAdopt(journal, claimed, directory.Path, directory.Path, DateTime.UnixEpoch.AddDays(1));
 
         Assert.Same(newest, adopted);
         Assert.Equal("Refreshed title", adopted!.Task.Title);
@@ -1194,8 +1222,23 @@ public sealed class WorkerPolicyTests
         noWorkspace.Task = noWorkspace.Task with { IssueId = issueId, Repositories = ["Repo"] };
         var claimed = new TaskDto(482, issueId, "Retry", "Description", ["Repo"]);
 
-        Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [mismatch] }, claimed, directory.Path, DateTime.UtcNow));
-        Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [noWorkspace] }, claimed, directory.Path, DateTime.UtcNow));
+        Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [mismatch] }, claimed, directory.Path, directory.Path, DateTime.UtcNow));
+        Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [noWorkspace] }, claimed, directory.Path, directory.Path, DateTime.UtcNow));
+    }
+
+    [Fact]
+    public void BlockedWorkspaceAdoption_AcceptsTheExactCanonicalCheckout()
+    {
+        using var directory = new TemporaryDirectory();
+        var issueId = Guid.NewGuid().ToString();
+        var job = OwnedBlockedJob(issueId, directory.Path, "retained", DateTime.UnixEpoch);
+        job.Workspaces = [new Workspace("Repo", Path.Combine(directory.Path, "Repo"), "codex/task-482-retained", "origin")];
+        var claimed = new TaskDto(482, issueId, "Retry", "Description", ["Repo"]);
+
+        var adopted = BlockedWorkspaceAdoption.TryAdopt(
+            new Journal { Jobs = [job] }, claimed, directory.Path, Path.Combine(directory.Path, "worktrees"), DateTime.UtcNow);
+
+        Assert.Same(job, adopted);
     }
 
     [Theory]
@@ -1360,7 +1403,7 @@ public sealed class WorkerPolicyTests
 
     private static Job WithSnapshot(Job job, string model) { job.Model = model; return job; }
 
-    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null)
+    private static void WriteConfig(string path, string root, int cap, string model, string? blockedDisplayDuration = null, string? workspaceMode = null)
     {
         File.WriteAllText(path, JsonSerializer.Serialize(new
         {
@@ -1369,7 +1412,7 @@ public sealed class WorkerPolicyTests
             repairMaxAttempts = 3, repairMaxElapsed = "02:00:00", reviewQuietPeriod = "00:30:00", ignoredChecks = Array.Empty<string>(),
             blockedDisplayDuration,
             autoMergeRepositories = new[] { "benwmaddox/StasisLang" }, autoMergeMethod = "squash", maddoxExe = "MaddoxTasks.exe",
-            codexExe = "codex", ghExe = "gh", repoRoot = root, worktreeRoot = Path.Combine(root, "worktrees")
+            codexExe = "codex", ghExe = "gh", repoRoot = root, worktreeRoot = Path.Combine(root, "worktrees"), workspaceMode
         }));
     }
 
