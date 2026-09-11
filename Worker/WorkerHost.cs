@@ -224,7 +224,8 @@ public sealed class WorkerHost
         Job[] invalid;
         lock (journalGate)
             invalid = journal.Jobs
-                .Where(job => job.Phase == JobPhases.RetryWaiting && !WorkerRetryPolicy.HasSafeMetadata(job))
+                .Where(job => (job.Phase is JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil)
+                    && !WorkerRetryPolicy.HasSafeMetadata(job))
                 .ToArray();
         foreach (var job in invalid)
         {
@@ -256,7 +257,7 @@ public sealed class WorkerHost
             // if the host crashes here, normal startup recovery sees the
             // implementing/repairing phase and resumes the same work.
             var phase = item.Mode == RecoveryMode.ResumeRepair ? JobPhases.Repairing : JobPhases.Implementing;
-            if (item.Job.Phase == JobPhases.RetryWaiting) item.Job.Phase = phase;
+            if (item.Job.Phase is JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil) item.Job.Phase = phase;
             if (WorkerRetryPolicy.ShouldStartFreshSession(item.Job))
             {
                 item.Job.ThreadId = null;
@@ -598,9 +599,13 @@ public sealed class WorkerHost
         {
             job.BlockReason = $"{classification.Kind}: {classification.Summary}";
             job.WorkerRetryMode = mode is RecoveryMode.ResumeRepair ? nameof(RecoveryMode.ResumeRepair) : nameof(RecoveryMode.ResumeInitial);
-            SetPhase(job, JobPhases.RetryWaiting);
+            SetPhase(job, job.WorkerRetryResetUtc is not null
+                ? JobPhases.ProviderPausedUntil
+                : classification.Kind == WorkerBlockerKinds.TransientWorker ? JobPhases.RetryWaiting : JobPhases.RepairRetryWaiting);
             await AddCommentAsync(job,
-                $"Worker retry scheduled ({FormatRetryAttempt(job, classification.Kind)}) for {FormatRetryTime(job, delay)}: {classification.Summary}",
+                job.WorkerRetryResetUtc is { } reset
+                    ? $"Worker paused until provider reset at {reset:O}: {classification.Summary}"
+                    : $"Bounded worker retry scheduled ({FormatRetryAttempt(job, classification.Kind)}) for {FormatRetryTime(job, delay)}: {classification.Summary}",
                 ct);
             Save(job);
             return;
@@ -684,6 +689,14 @@ public sealed class WorkerHost
             }
         }
         else await ValidateOwnedWorkspacesAsync(job, ct);
+
+        var recoveredRetry = job.WorkerRetryAttempts > 0;
+        WorkerRetryPolicy.Clear(job);
+        if (recoveredRetry)
+        {
+            await AddCommentAsync(job, "Bounded worker retry condition cleared; retained work resumed and the task remains Active.", ct);
+            Save(job);
+        }
 
         job.TaskUpdateWindowClosed = false;
         SetPhase(job, repair ? JobPhases.Repairing : JobPhases.Implementing);
@@ -985,9 +998,13 @@ public sealed class WorkerHost
             job.BlockReason = blocker.Kind + ": " + blocker.Summary + evidence;
             job.PendingResultJson = null;
             job.WorkerRetryMode = repair ? nameof(RecoveryMode.ResumeRepair) : nameof(RecoveryMode.ResumeInitial);
-            SetPhase(job, JobPhases.RetryWaiting);
+            SetPhase(job, job.WorkerRetryResetUtc is not null
+                ? JobPhases.ProviderPausedUntil
+                : blocker.Kind == WorkerBlockerKinds.TransientWorker ? JobPhases.RetryWaiting : JobPhases.RepairRetryWaiting);
             await AddCommentAsync(job,
-                $"Worker retry scheduled ({FormatRetryAttempt(job, blocker.Kind)}) for {FormatRetryTime(job, delay)}: {blocker.Summary}{evidence}",
+                job.WorkerRetryResetUtc is { } reset
+                    ? $"Worker paused until provider reset at {reset:O}: {blocker.Summary}{evidence}"
+                    : $"Bounded worker retry scheduled ({FormatRetryAttempt(job, blocker.Kind)}) for {FormatRetryTime(job, delay)}: {blocker.Summary}{evidence}",
                 ct);
             Save(job);
             return;
@@ -1211,12 +1228,30 @@ public sealed class WorkerHost
         if (!useWorktrees)
         {
             var status = await RequireAsync("git", ["status", "--porcelain"], source, ct);
-            if (!string.IsNullOrWhiteSpace(status.Output))
-                throw new InvalidOperationException($"Canonical checkout is dirty: {source}. Preserve or finish that work before the worker claims this repository.");
             var currentBranch = (await RequireAsync("git", ["branch", "--show-current"], source, ct)).Output.Trim();
             var defaultBranch = head.StartsWith("origin/", StringComparison.Ordinal) ? head["origin/".Length..] : head;
+            var owner = FindWorkspaceOwner(job, source);
+            var uniqueCommits = 0;
             if (!currentBranch.Equals(defaultBranch, StringComparison.Ordinal))
-                throw new InvalidOperationException($"Canonical checkout is occupied by branch '{currentBranch}': {source}. Return it to '{defaultBranch}' before worker use, or explicitly configure workspaceMode=worktree for exceptional isolation.");
+            {
+                var unique = await RequireAsync("git", ["rev-list", "--count", "HEAD", $"^{head}"], source, ct);
+                if (!int.TryParse(unique.Output.Trim(), out uniqueCommits))
+                    throw new InvalidOperationException("Could not determine canonical checkout branch ownership: " + source);
+            }
+            var action = CanonicalCheckoutPolicy.Decide(!string.IsNullOrWhiteSpace(status.Output), currentBranch, defaultBranch, owner is not null, uniqueCommits);
+            if (action == CanonicalCheckoutAction.BlockDirty)
+                throw new WorkspacePreflightException(WorkerBlockerKinds.UpstreamDependency,
+                    $"Canonical checkout has unowned changes and was preserved: {source}. Branch '{currentBranch}', status entries: {status.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length}. Ownership by task {job.Task.Sequence} could not be proven.");
+            if (action == CanonicalCheckoutAction.BlockExternalOwner)
+                throw new WorkspacePreflightException(WorkerBlockerKinds.UpstreamDependency, owner is not null
+                    ? $"Canonical checkout is owned by task {owner.Task.Sequence} on branch '{currentBranch}' at {source}; task {job.Task.Sequence} was not allowed to modify or retry it."
+                    : $"Canonical checkout branch '{currentBranch}' has {uniqueCommits} commit(s) not in {head} at {source}; another Codex/task owner is presumed and the branch was preserved.");
+            if (action == CanonicalCheckoutAction.RepairStaleBranch)
+            {
+                await RequireAsync("git", ["switch", defaultBranch], source, ct);
+                await RequireAsync("git", ["merge", "--ff-only", head], source, ct);
+                log.Write("info", "workspace.canonical.repaired", new { job.Task.Sequence, source, preservedBranch = currentBranch, defaultBranch, head });
+            }
         }
         var localBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var remoteBranches = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -1258,6 +1293,16 @@ public sealed class WorkerHost
             await RequireAsync("git", ["switch", "-c", candidate.Branch, startingRef], source, ct);
         var remote = (await RequireAsync("git", ["remote", "get-url", "origin"], source, ct)).Output.Trim();
         return new Workspace(repository, workspaceDirectory, candidate.Branch, remote, startingRef, head);
+    }
+
+    private Job? FindWorkspaceOwner(Job candidate, string directory)
+    {
+        var canonical = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        lock (journalGate)
+            return journal.Jobs.FirstOrDefault(job => !ReferenceEquals(job, candidate)
+                && job.Phase != JobPhases.Done
+                && job.Workspaces.Any(workspace => Path.GetFullPath(workspace.Directory).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                    .Equals(canonical, StringComparison.OrdinalIgnoreCase)));
     }
 
     private async Task ValidateOwnedWorkspacesAsync(Job job, CancellationToken ct)
@@ -1971,6 +2016,7 @@ public sealed class WorkerHost
                 {
                     JobPhases.Blocked => "Recently blocked",
                     JobPhases.Monitoring => MonitoringDisplay.Describe(job, clock.UtcNow, config.Current.ReviewQuietPeriod, IsAutoMergeAllowed(job)),
+                    JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil => RetryDisplay.Describe(job, clock.UtcNow),
                     _ => job.Phase
                 };
                 phase = TaskUpdatePolicy.DashboardPhase(job, phase);
