@@ -1110,6 +1110,13 @@ public static class WorkspaceDirectoryPolicy
         return remoteRef["origin/".Length..];
     }
 }
+
+public static class StaleCanonicalOwnershipPolicy
+{
+    public static bool LedgerReleasesOwnership(string status)
+        => status is "Next" or "Backlog" or "Done" or "Rejected";
+}
+
 public sealed record PullRequestState(string Url, string Repository, string HeadOid = "");
 
 public static class PublicationMetadata

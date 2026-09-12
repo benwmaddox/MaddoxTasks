@@ -207,6 +207,8 @@ public sealed class WorkerHost
     {
         if (settings.UseWorktrees) return await RunMaddoxCommandAsync(["claim"], ct);
 
+        await ReleaseStaleCanonicalOwnershipAsync(settings, ct);
+
         var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         lock (journalGate)
         {
@@ -279,6 +281,34 @@ public sealed class WorkerHost
             if (unique.ExitCode != 0 || !int.TryParse(unique.Output.Trim(), out var count) || count != 0) return false;
         }
         return true;
+    }
+
+    private async Task ReleaseStaleCanonicalOwnershipAsync(WorkerConfig settings, CancellationToken ct)
+    {
+        var blocked = SnapshotJobs(job =>
+            job.Phase == JobPhases.Blocked
+            && job.Workspaces.Any(workspace => WorkspaceDirectoryPolicy.IsCanonical(workspace, settings.RepoRoot)));
+        if (blocked.Length == 0) return;
+
+        var statuses = await ReadIssueStatusesAsync(ct);
+        foreach (var job in blocked)
+        {
+            if (!statuses.TryGetValue(job.Task.IssueId, out var status)
+                || !StaleCanonicalOwnershipPolicy.LedgerReleasesOwnership(status)
+                || !await IsLocallyAvailableAsync(job.Task, settings, ct))
+                continue;
+
+            lock (journalGate)
+            {
+                if (job.Phase != JobPhases.Blocked) continue;
+                WorkerRetryPolicy.Clear(job);
+                job.CleanupPending = false;
+                job.Phase = JobPhases.Done;
+                job.PhaseChangedUtc = clock.UtcNow;
+                journal.Save(journalPath);
+            }
+            log.Write("info", "claim.stale-canonical-ownership.released", new { job.Task.Sequence, status });
+        }
     }
 
     private bool EnqueueDueRetries(DateTime? nowUtc = null)
