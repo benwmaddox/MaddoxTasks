@@ -743,7 +743,7 @@ public sealed class WorkerHostMonitoringTests
 
         var command = Assert.Single(fixture.Processes.Commands, command => command.Executable == "codex");
         Assert.Equal(fixture.Job.Workspaces[0].Directory, command.WorkingDirectory);
-        Assert.Equal(["exec", "--sandbox", "danger-full-access", "resume", "thread-1"], command.Arguments[..5]);
+        Assert.Equal(["exec", "--approve-for-me", "resume", "thread-1"], command.Arguments[..4]);
         Assert.Equal("-", command.Arguments[^1]);
     }
 
@@ -756,6 +756,10 @@ public sealed class WorkerHostMonitoringTests
 
         Assert.Contains("commit, push, and pull-request publication are the expected handoff", envelope);
         Assert.Contains("return completed with changed:true and blocker none", envelope);
+        Assert.Contains("workspace-write sandbox with automatic approval review", envelope);
+        Assert.Contains("Windows CurrentUser certificate store", envelope);
+        Assert.Contains("retry it once with escalation", envelope);
+        Assert.Contains("report policyRestriction", envelope);
     }
 
     private static PullRequestSnapshot Snapshot(bool merged, IReadOnlyList<CheckState>? checks = null, IReadOnlyList<ReviewFeedback>? feedback = null)

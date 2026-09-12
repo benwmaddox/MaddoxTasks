@@ -1298,18 +1298,17 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void InitialCodexArguments_UseUnrestrictedNonInteractiveSandbox()
+    public void InitialCodexArguments_UseWorkspaceSandboxWithAutomaticReview()
     {
         var job = CreateJob();
         job.Workspaces.Add(new Workspace("Repo", @"D:\code\Repo-worktree", "codex/task-1", "https://github.com/example/Repo.git"));
 
         var arguments = WorkerHost.BuildInitialCodexArguments(job, "schema.json", "prompt");
 
-        Assert.Contains("--sandbox", arguments);
-        Assert.Equal("danger-full-access", arguments[arguments.IndexOf("--sandbox") + 1]);
-        Assert.Contains("approval_policy=never", arguments);
+        Assert.Contains("--approve-for-me", arguments);
+        Assert.DoesNotContain("--sandbox", arguments);
+        Assert.DoesNotContain("approval_policy=never", arguments);
         Assert.Contains("--skip-git-repo-check", arguments);
-        Assert.DoesNotContain("--approve-for-me", arguments);
     }
 
     [Fact]
@@ -1320,11 +1319,10 @@ public sealed class WorkerPolicyTests
 
         var arguments = WorkerHost.BuildContinuationCodexArguments(job, "schema.json", "prompt");
 
-        Assert.Equal(["exec", "--sandbox", "danger-full-access", "resume", "thread-123"], arguments[..5]);
-        Assert.True(arguments.IndexOf("--sandbox") < arguments.IndexOf("resume"));
-        Assert.Contains("--sandbox", arguments);
-        Assert.Equal("danger-full-access", arguments[arguments.IndexOf("--sandbox") + 1]);
-        Assert.Contains("approval_policy=never", arguments);
+        Assert.Equal(["exec", "--approve-for-me", "resume", "thread-123"], arguments[..4]);
+        Assert.True(arguments.IndexOf("--approve-for-me") < arguments.IndexOf("resume"));
+        Assert.DoesNotContain("--sandbox", arguments);
+        Assert.DoesNotContain("approval_policy=never", arguments);
         Assert.Contains("--skip-git-repo-check", arguments);
         Assert.Equal("prompt", arguments[^1]);
     }
