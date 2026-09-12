@@ -51,10 +51,12 @@ public sealed record WorkerConfig(
     // the pull-request repair budget: a transient worker failure is a
     // different failure domain from a repeatedly failing review check.
     public int EffectiveWorkerRetryMaxAttempts => WorkerRetryMaxAttempts ?? 3;
-    public TimeSpan EffectiveWorkerRetryMaxElapsed => WorkerRetryMaxElapsed ?? TimeSpan.FromHours(2);
-    public TimeSpan EffectiveWorkerRetryBaseDelay => WorkerRetryBaseDelay ?? TimeSpan.FromMinutes(5);
+    public TimeSpan EffectiveWorkerRetryMaxElapsed => Min(WorkerRetryMaxElapsed ?? TimeSpan.FromMinutes(1), WorkerRetryPolicy.MaxRetryWindow);
+    public TimeSpan EffectiveWorkerRetryBaseDelay => Min(WorkerRetryBaseDelay ?? TimeSpan.FromSeconds(5), WorkerRetryPolicy.MaxRetryWindow);
     public string EffectiveWorkspaceMode => string.IsNullOrWhiteSpace(WorkspaceMode) ? "checkout" : WorkspaceMode;
     public bool UseWorktrees => EffectiveWorkspaceMode.Equals("worktree", StringComparison.OrdinalIgnoreCase);
+
+    private static TimeSpan Min(TimeSpan left, TimeSpan right) => left <= right ? left : right;
 
     public static WorkerConfig Load(string path)
     {
@@ -755,6 +757,8 @@ public static class WorkerFailurePolicy
 
     public static WorkerFailureClassification Classify(Exception exception, DateTime nowUtc)
     {
+        if (exception is WorkspacePreflightException preflight)
+            return new WorkerFailureClassification(preflight.Kind, preflight.Message, WorkerRetryPolicy.Fingerprint(preflight.Kind, preflight.Message));
         var text = Flatten(exception);
         var normalized = text.ToLowerInvariant();
         var kind = ClassifyKind(exception, normalized);
@@ -774,7 +778,7 @@ public static class WorkerFailurePolicy
             return WorkerBlockerKinds.UserDecision;
         if (exception is System.ComponentModel.Win32Exception or FileNotFoundException)
             return WorkerBlockerKinds.TransientWorker;
-        if (ContainsAny(text, "rate limit", "rate-limit", "too many requests", "429", "quota", "usage limit", "overloaded", "temporarily unavailable", "service unavailable", "try again later", "timed out", "timeout", "connection reset", "connection refused", "socket", "network", "dns", "could not resolve", "github api", "api request failed", "git fetch", "git push", "process failed to start", "failed to start", "failed to launch", "could not start", "cannot start", "executable not found", "no such file or directory", "system cannot find", "process start", "tool failed", "502", "503", "504"))
+        if (ContainsAny(text, "rate limit", "rate-limit", "too many requests", "429", "quota", "usage limit", "overloaded", "temporarily unavailable", "service unavailable", "try again later", "timed out", "timeout", "connection reset", "connection refused", "socket", "network", "dns", "could not resolve", "github api", "api request failed", "git fetch", "git push", "index.lock", "another git process", "process shutdown", "being used by another process", "sharing violation", "process failed to start", "failed to start", "failed to launch", "could not start", "cannot start", "executable not found", "no such file or directory", "system cannot find", "process start", "tool failed", "502", "503", "504"))
             return WorkerBlockerKinds.TransientWorker;
         if (ContainsAny(text, "merge conflict", "conflicting", "worktree is dirty", "workspace", "structured result", "codex result", "repository manifest", "result change flag"))
             return WorkerBlockerKinds.WorkerRepairable;
@@ -812,7 +816,8 @@ public static class CodexClientFailurePolicy
 
 public static class WorkerRetryPolicy
 {
-    public static TimeSpan MaxRetryDelay { get; } = TimeSpan.FromHours(1);
+    public static TimeSpan MaxRetryWindow { get; } = TimeSpan.FromMinutes(1);
+    public static TimeSpan MaxRetryDelay => MaxRetryWindow;
 
     public static string Fingerprint(string kind, string detail)
     {
@@ -844,7 +849,7 @@ public static class WorkerRetryPolicy
 
     public static bool ShouldStartFreshSession(Job job) => job.WorkerRetryFreshSession;
 
-    public static bool HasSafeMetadata(Job job) => job.Phase == JobPhases.RetryWaiting
+    public static bool HasSafeMetadata(Job job) => job.Phase is JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil
         && job.WorkerRetryAttempts > 0
         && !string.IsNullOrWhiteSpace(job.WorkerRetryFingerprint)
         && IsUsableTimestamp(job.WorkerRetryStartedUtc)
@@ -862,25 +867,26 @@ public static class WorkerRetryPolicy
 
         var fingerprint = Fingerprint(kind, summary);
         var same = string.Equals(job.WorkerRetryFingerprint, fingerprint, StringComparison.Ordinal);
-        var continuingRepairEpisode = kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase)
-            && job.WorkerRetryLastKind?.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase) == true
+        var continuingWorkerEpisode = job.WorkerRetryResetUtc is null
+            && WorkerBlockerKinds.IsRetryable(job.WorkerRetryLastKind ?? string.Empty)
             && job.WorkerRetryAttempts > 0
             && IsUsableTimestamp(job.WorkerRetryStartedUtc);
-        if (!same && !continuingRepairEpisode)
+        if (!same && !continuingWorkerEpisode)
         {
             job.WorkerRetryAttempts = 0;
             job.WorkerRetryStartedUtc = nowUtc;
         }
         else job.WorkerRetryStartedUtc ??= nowUtc;
 
-        // Service/transient failures are temporal gates.  They must continue
-        // to be retried after a long outage or usage-limit reset; the delay is
-        // capped to keep malformed or unbounded diagnostics from creating a
-        // single effectively permanent sleep.  A workerRepairable episode is
-        // bounded across changing summaries because model paraphrases must not
-        // reset its configured attempt and elapsed-time budget.  Clear() marks
-        // genuine progress and starts a fresh episode for a later failure.
-        if (kind.Equals(WorkerBlockerKinds.WorkerRepairable, StringComparison.OrdinalIgnoreCase))
+        var parsedRetryAt = retryAtUtc is { } explicitRetryAt
+            ? NormalizeUtc(explicitRetryAt)
+            : RetryTimestampPolicy.ParseFuture(summary, NormalizeUtc(nowUtc));
+        var providerPause = parsedRetryAt is { } resetAt && resetAt > NormalizeUtc(nowUtc);
+
+        // Retry waiting is a bounded worker-owned episode. Provider reset
+        // windows use a separately named durable pause and are not constrained
+        // by this one-minute repair budget.
+        if (!providerPause)
         {
             if (nowUtc - job.WorkerRetryStartedUtc.Value >= config.EffectiveWorkerRetryMaxElapsed) return false;
             if (job.WorkerRetryAttempts >= config.EffectiveWorkerRetryMaxAttempts) return false;
@@ -893,11 +899,9 @@ public static class WorkerRetryPolicy
         job.WorkerRetryFreshSession = RequiresFreshSession(kind, summary);
         var exponent = Math.Min(job.WorkerRetryAttempts - 1, 10);
         var multiplier = Math.Pow(2, exponent);
-        var seconds = Math.Min(config.EffectiveWorkerRetryBaseDelay.TotalSeconds * multiplier, MaxRetryDelay.TotalSeconds);
+        var remaining = config.EffectiveWorkerRetryMaxElapsed - (NormalizeUtc(nowUtc) - NormalizeUtc(job.WorkerRetryStartedUtc.Value));
+        var seconds = Math.Min(config.EffectiveWorkerRetryBaseDelay.TotalSeconds * multiplier, Math.Min(MaxRetryDelay.TotalSeconds, Math.Max(1, remaining.TotalSeconds)));
         delay = TimeSpan.FromSeconds(Math.Max(1, seconds));
-        var parsedRetryAt = retryAtUtc is { } explicitRetryAt
-            ? NormalizeUtc(explicitRetryAt)
-            : RetryTimestampPolicy.ParseFuture(summary, NormalizeUtc(nowUtc));
         if (parsedRetryAt is { } retryAt && retryAt > NormalizeUtc(nowUtc))
         {
             // A service-provided reset is authoritative.  Persisting the
@@ -930,7 +934,7 @@ public static class WorkerRetryPolicy
     public static bool TryReconstruct(Job job, DateTime nowUtc, WorkerConfig config, out RetryMetadataReconstruction reconstruction)
     {
         reconstruction = default!;
-        if (job.Phase != JobPhases.RetryWaiting || HasSafeMetadata(job)) return false;
+        if (job.Phase is not (JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil) || HasSafeMetadata(job)) return false;
 
         var now = NormalizeUtc(nowUtc);
         var kind = WorkerBlockerKinds.All.Contains(job.LastBlockerKind ?? string.Empty)
@@ -964,7 +968,7 @@ public static class WorkerRetryPolicy
         job.WorkerRetryResetUtc = parsedReset;
         var next = UsableTimestamp(job.WorkerRetryNextUtc);
         if (next is null || next <= now)
-            next = parsedReset is { } future ? future : now + config.EffectiveWorkerRetryBaseDelay;
+            next = parsedReset is { } future ? future : now + Min(config.EffectiveWorkerRetryBaseDelay, MaxRetryWindow);
         job.WorkerRetryNextUtc = next;
         reconstruction = new RetryMetadataReconstruction(
             mode,
@@ -1001,6 +1005,8 @@ public static class WorkerRetryPolicy
     private static DateTime NormalizeUtc(DateTime value)
         => value.Kind == DateTimeKind.Utc ? value : DateTime.SpecifyKind(value, DateTimeKind.Utc);
 
+    private static TimeSpan Min(TimeSpan left, TimeSpan right) => left <= right ? left : right;
+
     public static void Clear(Job job)
     {
         job.WorkerRetryAttempts = 0;
@@ -1016,6 +1022,24 @@ public static class WorkerRetryPolicy
 }
 
 public sealed record RetryMetadataReconstruction(RecoveryMode Mode, string Reason);
+
+public sealed class WorkspacePreflightException(string kind, string message) : InvalidOperationException(message)
+{
+    public string Kind { get; } = kind;
+}
+
+public enum CanonicalCheckoutAction { Proceed, RepairStaleBranch, BlockExternalOwner, BlockDirty }
+
+public static class CanonicalCheckoutPolicy
+{
+    public static CanonicalCheckoutAction Decide(bool dirty, string currentBranch, string defaultBranch, bool ownedByAnotherJob, int uniqueCommits)
+    {
+        if (ownedByAnotherJob) return CanonicalCheckoutAction.BlockExternalOwner;
+        if (dirty) return CanonicalCheckoutAction.BlockDirty;
+        if (currentBranch.Equals(defaultBranch, StringComparison.Ordinal)) return CanonicalCheckoutAction.Proceed;
+        return uniqueCommits == 0 ? CanonicalCheckoutAction.RepairStaleBranch : CanonicalCheckoutAction.BlockExternalOwner;
+    }
+}
 
 public sealed record Workspace(string Repository, string Directory, string Branch, string Remote, string BaseRef = "", string DefaultRef = "");
 
@@ -1330,6 +1354,8 @@ public static class JobPhases
     public const string Publishing = "Publishing";
     public const string Monitoring = "Monitoring";
     public const string RetryWaiting = "Retry waiting";
+    public const string RepairRetryWaiting = "Worker repair pending";
+    public const string ProviderPausedUntil = "Paused until provider reset";
     public const string StatusSyncPending = "Status sync pending";
     public const string Blocked = "Blocked";
     public const string Done = "Done";
@@ -1389,7 +1415,7 @@ public static class RecoveryPlanner
 {
     public static IReadOnlyList<Job> JobsToRequeue(Journal journal, DateTime? nowUtc = null) => journal.Jobs
         .Where(job => job.Phase is not (JobPhases.Done or JobPhases.Blocked or JobPhases.Monitoring))
-        .Where(job => job.Phase != JobPhases.RetryWaiting
+        .Where(job => job.Phase is not (JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil)
             || (WorkerRetryPolicy.HasSafeMetadata(job) && (nowUtc is null || WorkerRetryPolicy.IsDue(job, nowUtc.Value))))
         .OrderBy(job => job.StartedUtc)
         .ToArray();
@@ -1403,6 +1429,12 @@ public static class RecoveryPlanner
         JobPhases.RetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
         JobPhases.RetryWaiting when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
         JobPhases.RetryWaiting when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.RepairRetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
+        JobPhases.RepairRetryWaiting when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
+        JobPhases.RepairRetryWaiting when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.ProviderPausedUntil when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
+        JobPhases.ProviderPausedUntil when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
+        JobPhases.ProviderPausedUntil when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
         JobPhases.Publishing => RecoveryMode.UnrecoverablePublication,
         _ => RecoveryMode.Initial
     };
@@ -1919,6 +1951,20 @@ public static class MonitoringDisplay
 }
 
 public sealed record ConsoleSegment(string Text, ConsoleColor Color);
+
+public static class RetryDisplay
+{
+    public static string Describe(Job job, DateTime nowUtc)
+    {
+        if (job.WorkerRetryNextUtc is not { } next) return job.Phase;
+        if (job.Phase == JobPhases.ProviderPausedUntil)
+            return $"Paused until provider reset · {next.ToUniversalTime():yyyy-MM-dd HH:mm:ss}Z";
+        var remaining = next.ToUniversalTime() - nowUtc.ToUniversalTime();
+        var seconds = Math.Max(0, (int)Math.Ceiling(remaining.TotalSeconds));
+        var label = job.Phase == JobPhases.RepairRetryWaiting ? "Bounded worker repair" : "Bounded transient retry";
+        return $"{label} · next attempt in {seconds}s at {next.ToUniversalTime():HH:mm:ss}Z";
+    }
+}
 
 public static class DashboardSegments
 {

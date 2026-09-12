@@ -49,7 +49,7 @@ public sealed class WorkerLifecycleTests
           "model":"model","reasoningEffort":"medium","repairMaxAttempts":3,"repairMaxElapsed":"02:00:00",
           "reviewQuietPeriod":"00:30:00","ignoredChecks":[],"autoMergeRepositories":[],"autoMergeMethod":"squash",
           "maddoxExe":"MaddoxTasks.exe","codexExe":"codex","ghExe":"gh","repoRoot":"ROOT",
-          "worktreeRoot":"WORK","workerRetryMaxAttempts":2,"workerRetryMaxElapsed":"01:00:00","workerRetryBaseDelay":"00:01:00"
+          "worktreeRoot":"WORK","workerRetryMaxAttempts":2,"workerRetryMaxElapsed":"00:01:00","workerRetryBaseDelay":"00:00:10"
         }
         """.Replace("ROOT", directory.Path.Replace("\\", "\\\\"), StringComparison.Ordinal).Replace("WORK", Path.Combine(directory.Path, "worktrees").Replace("\\", "\\\\"), StringComparison.Ordinal));
         var config = WorkerConfig.Load(configPath);
@@ -63,10 +63,10 @@ public sealed class WorkerLifecycleTests
         var now = DateTime.UnixEpoch;
         Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "same failure", now, config, out var firstDelay));
         job.Phase = JobPhases.RetryWaiting;
-        Assert.Equal(TimeSpan.FromMinutes(1), firstDelay);
-        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "same failure", now.AddMinutes(1), config, out var secondDelay));
-        Assert.Equal(TimeSpan.FromMinutes(2), secondDelay);
-        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "same failure", now.AddMinutes(3), config, out _));
+        Assert.Equal(TimeSpan.FromSeconds(10), firstDelay);
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "same failure", now.AddSeconds(10), config, out var secondDelay));
+        Assert.Equal(TimeSpan.FromSeconds(20), secondDelay);
+        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "same failure", now.AddSeconds(30), config, out _));
         Assert.Equal(2, job.WorkerRetryAttempts);
     }
 
@@ -79,8 +79,8 @@ public sealed class WorkerLifecycleTests
         var job = CreateJob(JobPhases.RetryWaiting);
 
         Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "first failure", started, config, out _));
-        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "different wording", started.AddMinutes(1), config, out _));
-        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "another paraphrase", started.AddMinutes(2), config, out _));
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "different wording", started.AddSeconds(10), config, out _));
+        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "another paraphrase", started.AddSeconds(20), config, out _));
         Assert.Equal(2, job.WorkerRetryAttempts);
         Assert.Equal(started, job.WorkerRetryStartedUtc);
 
@@ -91,23 +91,57 @@ public sealed class WorkerLifecycleTests
     }
 
     [Fact]
-    public void WorkerRetryPolicy_RetriesTransientFailuresIndefinitelyWithCappedDelay()
+    public void WorkerRetryPolicy_ChangingTransientSummaryCannotExtendEpisodePastOneMinute()
+    {
+        using var directory = new TemporaryDirectory();
+        var config = TestConfig(directory.Path, maxAttempts: 3, maxElapsed: TimeSpan.FromMinutes(1), baseDelay: TimeSpan.FromSeconds(5));
+        var started = new DateTime(2026, 9, 7, 10, 0, 0, DateTimeKind.Utc);
+        var job = CreateJob(JobPhases.RetryWaiting);
+
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "git index lock", started, config, out _));
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "brief process shutdown race", started.AddSeconds(5), config, out _));
+        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "network timeout", started.AddMinutes(1), config, out _));
+        Assert.Equal(started, job.WorkerRetryStartedUtc);
+    }
+
+    [Fact]
+    public void WorkerRetryPolicy_BoundsTransientFailuresToOneMinute()
     {
         using var directory = new TemporaryDirectory();
         var config = TestConfig(directory.Path, maxAttempts: 1, maxElapsed: TimeSpan.FromMinutes(1), baseDelay: TimeSpan.FromMinutes(20));
         var job = CreateJob(JobPhases.RetryWaiting);
         var now = new DateTime(2026, 9, 7, 12, 0, 0, DateTimeKind.Utc);
 
-        for (var attempt = 0; attempt < 12; attempt++)
+        Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "service temporarily unavailable", now, config, out var delay));
+        Assert.Equal(TimeSpan.FromMinutes(1), delay);
+        job.Phase = JobPhases.RetryWaiting;
+        Assert.Contains("Bounded transient retry · next attempt in 60s", RetryDisplay.Describe(job, now));
+        now = job.WorkerRetryNextUtc!.Value;
+
+        Assert.False(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "service temporarily unavailable", now, config, out _));
+        Assert.Equal(1, job.WorkerRetryAttempts);
+        Assert.True(WorkerRetryPolicy.HasSafeMetadata(job));
+    }
+
+    [Fact]
+    public void WorkerRetryPolicy_TransientCanSucceedWithinOneMinute()
+    {
+        using var directory = new TemporaryDirectory();
+        var config = TestConfig(directory.Path, maxAttempts: 3, maxElapsed: TimeSpan.FromMinutes(1), baseDelay: TimeSpan.FromSeconds(5));
+        var job = CreateJob(JobPhases.RetryWaiting);
+        var now = new DateTime(2026, 9, 7, 12, 0, 0, DateTimeKind.Utc);
+
+        for (var attempt = 0; attempt < 2; attempt++)
         {
             Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "service temporarily unavailable", now, config, out var delay));
-            Assert.InRange(delay, TimeSpan.FromMinutes(1), WorkerRetryPolicy.MaxRetryDelay);
+            Assert.InRange(delay, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10));
             job.Phase = JobPhases.RetryWaiting;
             now = job.WorkerRetryNextUtc!.Value;
         }
 
-        Assert.True(job.WorkerRetryAttempts >= 12);
-        Assert.True(WorkerRetryPolicy.HasSafeMetadata(job));
+        WorkerRetryPolicy.Clear(job);
+        Assert.Equal(0, job.WorkerRetryAttempts);
+        Assert.Null(job.WorkerRetryNextUtc);
     }
 
     [Fact]
@@ -124,6 +158,7 @@ public sealed class WorkerLifecycleTests
         Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.TransientWorker, "usage limit reached", now, config, parsed, out _));
         Assert.Equal(reset, job.WorkerRetryNextUtc);
         Assert.Equal(reset, job.WorkerRetryResetUtc);
+        job.Phase = JobPhases.ProviderPausedUntil;
 
         var journalPath = Path.Combine(directory.Path, "journal.json");
         new Journal { Jobs = [job] }.Save(journalPath);
@@ -131,6 +166,7 @@ public sealed class WorkerLifecycleTests
         Assert.True(WorkerRetryPolicy.HasSafeMetadata(recovered));
         Assert.False(WorkerRetryPolicy.IsDue(recovered, reset.AddSeconds(-1)));
         Assert.True(WorkerRetryPolicy.IsDue(recovered, reset));
+        Assert.Contains("Paused until provider reset", RetryDisplay.Describe(recovered, now));
     }
 
     [Fact]
@@ -146,6 +182,8 @@ public sealed class WorkerLifecycleTests
         Assert.True(WorkerRetryPolicy.TrySchedule(job, WorkerBlockerKinds.WorkerRepairable, "resume failed: invalid thread", DateTime.UtcNow, config, out _));
         Assert.True(job.WorkerRetryFreshSession);
         Assert.True(WorkerRetryPolicy.ShouldStartFreshSession(job));
+        job.Phase = JobPhases.RepairRetryWaiting;
+        Assert.Contains("Bounded worker repair", RetryDisplay.Describe(job, DateTime.UtcNow));
     }
 
     [Fact]
@@ -207,12 +245,34 @@ public sealed class WorkerLifecycleTests
         Assert.Equal(WorkerBlockerKinds.TransientWorker, transient.Kind);
         Assert.True(transient.Retryable);
 
+        Assert.Equal(WorkerBlockerKinds.TransientWorker,
+            WorkerFailurePolicy.Classify(new InvalidOperationException("fatal: Unable to create '.git/index.lock': File exists")).Kind);
+        Assert.Equal(WorkerBlockerKinds.TransientWorker,
+            WorkerFailurePolicy.Classify(new InvalidOperationException("process shutdown race: file is being used by another process")).Kind);
+
         var unknown = WorkerFailurePolicy.Classify(new InvalidOperationException("Unexpected worker pipeline failure"));
         Assert.Equal(WorkerBlockerKinds.WorkerRepairable, unknown.Kind);
         Assert.True(unknown.Retryable);
 
         var filePermission = WorkerFailurePolicy.Classify(new IOException("Permission denied writing a generated file"));
         Assert.Equal(WorkerBlockerKinds.WorkerRepairable, filePermission.Kind);
+
+        var occupied = WorkerFailurePolicy.Classify(new WorkspacePreflightException(
+            WorkerBlockerKinds.UpstreamDependency, "Canonical checkout is owned by task 42"));
+        Assert.Equal(WorkerBlockerKinds.UpstreamDependency, occupied.Kind);
+        Assert.False(occupied.Retryable);
+    }
+
+    [Theory]
+    [InlineData(false, "main", false, 0, CanonicalCheckoutAction.Proceed)]
+    [InlineData(false, "codex/stale", false, 0, CanonicalCheckoutAction.RepairStaleBranch)]
+    [InlineData(false, "codex/task-42", false, 1, CanonicalCheckoutAction.BlockExternalOwner)]
+    [InlineData(false, "codex/task-42", true, 0, CanonicalCheckoutAction.BlockExternalOwner)]
+    [InlineData(true, "main", false, 0, CanonicalCheckoutAction.BlockDirty)]
+    public void CanonicalCheckoutPolicy_PreservesOwnedOrAmbiguousWorkAndRepairsOnlyCleanStaleBranches(
+        bool dirty, string branch, bool externallyOwned, int uniqueCommits, CanonicalCheckoutAction expected)
+    {
+        Assert.Equal(expected, CanonicalCheckoutPolicy.Decide(dirty, branch, "main", externallyOwned, uniqueCommits));
     }
 
     [Fact]

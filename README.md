@@ -343,13 +343,17 @@ and non-ignored untracked files, for diagnosis or later recovery. Canonical chec
 remain reserved while blocked work is retained. Destructive cleanup of exceptional
 worktrees and their task branches is eligible only after the job reaches `Done`;
 best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
-Worker-owned failures and structured `transientWorker` or `workerRepairable` blockers
-keep the task `Active` and retry the retained workspace with exponential backoff.
-Temporal failures keep retrying, honor provider reset timestamps, and cap the delay at
-one hour. Repairable worker failures are bounded by `workerRetryMaxAttempts` (3) and
-`workerRetryMaxElapsed` (2 hours); `workerRetryBaseDelay` (5 minutes) controls both. Only
-explicit external gates such as credentials, hardware, missing input, upstream
-dependencies, user decisions, or policy restrictions move the task to `Blocked`.
+Genuinely transient worker failures keep the task `Active` in a bounded retry phase;
+the dashboard shows both a countdown and the next-attempt time. Worker repair retries
+use a separately named phase. Both are bounded by `workerRetryMaxAttempts` (3) and an
+absolute 60-second maximum window; `workerRetryBaseDelay` defaults to 5 seconds.
+Provider-supplied reset windows use `Paused until provider reset` instead of Retry
+waiting and retain their absolute UTC reset time across restarts. Exhausted retries and
+explicit external gates move the task to `Blocked` with the recorded cause and evidence.
+At canonical-checkout preflight, a clean stale branch with no commits beyond the fresh
+default ref is preserved and repaired immediately. Another journal owner, a branch with
+unpublished commits, or dirty work without provable same-task ownership is preserved
+and blocked immediately; a retained same-task workspace resumes in place.
 Failed blocked-task research is subject to the same 14-day subsequent-attempt delay.
 
 During recovery, the worker may use an already-authenticated noninteractive tool to
