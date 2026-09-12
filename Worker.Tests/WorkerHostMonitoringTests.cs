@@ -131,6 +131,56 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task LegacyMissingWorktree_IsReleasedAndActiveReservationReturnsToNext()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.Phase = JobPhases.Blocked;
+        fixture.Job.ThreadId = null;
+        fixture.Job.BlockReason = "Owned workspace is missing: " + fixture.Job.Workspaces[0].Directory;
+        fixture.Job.Workspaces =
+        [
+            new Workspace(
+                "Repo",
+                Path.Combine(fixture.Settings.WorktreeRoot, "repo-1"),
+                "codex/task-1-retry",
+                "https://github.com/example/Repo.git")
+        ];
+        fixture.Processes.Responder = call =>
+            call.Arguments.SequenceEqual(["agent", "issues"])
+                ? new ExecResult(0, $"[{{\"issueId\":\"{fixture.Job.Task.IssueId}\",\"status\":\"Active\"}}]", "")
+                : call.Arguments.Contains("command", StringComparer.Ordinal)
+                    ? new ExecResult(0, "{\"success\":true}", "")
+                    : new ExecResult(0, "", "");
+
+        await fixture.ReleaseLegacyMissingWorktreesAsync();
+
+        Assert.Equal(JobPhases.Done, fixture.Job.Phase);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("Next"));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Executable == "codex");
+    }
+
+    [Fact]
+    public async Task LegacyMissingWorktree_MixedExistingWorkspaceIsPreserved()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.Phase = JobPhases.Blocked;
+        fixture.Job.ThreadId = null;
+        fixture.Job.BlockReason = "Owned workspace is missing: retained work must be inspected";
+        var existing = Path.Combine(fixture.Settings.WorktreeRoot, "repo-1");
+        Directory.CreateDirectory(existing);
+        fixture.Job.Workspaces =
+        [
+            new Workspace("Repo", existing, "codex/task-1-retry", "https://github.com/example/Repo.git"),
+            new Workspace("Other", Path.Combine(fixture.Settings.WorktreeRoot, "other-1"), "codex/task-1-other", "https://github.com/example/Other.git")
+        ];
+
+        await fixture.ReleaseLegacyMissingWorktreesAsync();
+
+        Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.IsStatus("Next"));
+    }
+
+    [Fact]
     public async Task GreenCi_RecordsReadyForReviewBeforeAutoMergeQuietPeriod()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: true, Snapshot(false));
@@ -687,6 +737,12 @@ public sealed class WorkerHostMonitoringTests
         public async Task ReleaseLegacyCheckoutAdmissionRetriesAsync()
         {
             var method = typeof(WorkerHost).GetMethod("ReleaseLegacyCheckoutAdmissionRetriesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [CancellationToken.None])!;
+        }
+
+        public async Task ReleaseLegacyMissingWorktreesAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("ReleaseLegacyMissingWorktreesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task)method.Invoke(Host, [CancellationToken.None])!;
         }
 
