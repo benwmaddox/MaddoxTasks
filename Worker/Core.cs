@@ -1335,6 +1335,8 @@ public static class WorkspaceCleanupPolicy
     }
 
     public static bool CanDelete(Job job) => job.Phase == JobPhases.Done && job.CleanupPending;
+    public static bool IsEntirelyMissingProvenOwned(Job job, string worktreeRoot)
+        => IsProvenOwned(job, worktreeRoot) && job.Workspaces.All(workspace => !Directory.Exists(workspace.Directory));
     public static IReadOnlyList<Job> Pending(IEnumerable<Job> jobs) => jobs.Where(CanDelete).ToArray();
 }
 
@@ -2102,7 +2104,7 @@ public static class BlockedWorkspaceAdoption
             string directory;
             try { directory = Path.GetFullPath(workspace.Directory); } catch { return false; }
             if ((!WorkspaceDirectoryPolicy.IsCanonical(workspace, repoRoot) && !directory.StartsWith(managedRoot, StringComparison.OrdinalIgnoreCase))
-                || !directories.Add(directory) || !branches.Add(workspace.Branch)) return false;
+                || !Directory.Exists(directory) || !directories.Add(directory) || !branches.Add(workspace.Branch)) return false;
         }
         return true;
     }

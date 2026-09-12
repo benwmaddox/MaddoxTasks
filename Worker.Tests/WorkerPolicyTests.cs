@@ -1194,6 +1194,8 @@ public sealed class WorkerPolicyTests
         var issueId = Guid.NewGuid().ToString();
         var old = OwnedBlockedJob(issueId, directory.Path, "old", DateTime.UnixEpoch);
         var newest = OwnedBlockedJob(issueId, directory.Path, "new", DateTime.UnixEpoch.AddHours(1));
+        Directory.CreateDirectory(old.Workspaces[0].Directory);
+        Directory.CreateDirectory(newest.Workspaces[0].Directory);
         var duplicateWithoutWorkspace = CreateJob(JobPhases.Blocked, DateTime.UnixEpoch.AddHours(2));
         duplicateWithoutWorkspace.Task = duplicateWithoutWorkspace.Task with { IssueId = issueId, Repositories = ["Repo"] };
         var journal = new Journal { Jobs = [old, newest, duplicateWithoutWorkspace] };
@@ -1217,6 +1219,7 @@ public sealed class WorkerPolicyTests
         using var directory = new TemporaryDirectory();
         var issueId = Guid.NewGuid().ToString();
         var mismatch = OwnedBlockedJob(issueId, directory.Path, "mismatch", DateTime.UnixEpoch);
+        Directory.CreateDirectory(mismatch.Workspaces[0].Directory);
         mismatch.Task = mismatch.Task with { Repositories = ["Other"] };
         var noWorkspace = CreateJob(JobPhases.Blocked);
         noWorkspace.Task = noWorkspace.Task with { IssueId = issueId, Repositories = ["Repo"] };
@@ -1227,12 +1230,24 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void BlockedWorkspaceAdoption_RefusesMissingOwnedWorkspace()
+    {
+        using var directory = new TemporaryDirectory();
+        var issueId = Guid.NewGuid().ToString();
+        var missing = OwnedBlockedJob(issueId, directory.Path, "missing", DateTime.UnixEpoch);
+        var claimed = new TaskDto(482, issueId, "Retry", "Description", ["Repo"]);
+
+        Assert.Null(BlockedWorkspaceAdoption.TryAdopt(new Journal { Jobs = [missing] }, claimed, directory.Path, directory.Path, DateTime.UtcNow));
+    }
+
+    [Fact]
     public void BlockedWorkspaceAdoption_AcceptsTheExactCanonicalCheckout()
     {
         using var directory = new TemporaryDirectory();
         var issueId = Guid.NewGuid().ToString();
         var job = OwnedBlockedJob(issueId, directory.Path, "retained", DateTime.UnixEpoch);
         job.Workspaces = [new Workspace("Repo", Path.Combine(directory.Path, "Repo"), "codex/task-482-retained", "origin")];
+        Directory.CreateDirectory(job.Workspaces[0].Directory);
         var claimed = new TaskDto(482, issueId, "Retry", "Description", ["Repo"]);
 
         var adopted = BlockedWorkspaceAdoption.TryAdopt(

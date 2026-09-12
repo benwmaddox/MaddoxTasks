@@ -55,6 +55,7 @@ public sealed class WorkerHost
         await PreflightAsync(ct);
         await RecoverInvalidRetryMetadataAsync(ct);
         await ReleaseLegacyCheckoutAdmissionRetriesAsync(ct);
+        await ReleaseLegacyMissingWorktreesAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct), dashboardRefresh.RunAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
@@ -330,6 +331,58 @@ public sealed class WorkerHost
             Save(job);
             log.Write("info", "claim.legacy-checkout-retry.released", new { job.Task.Sequence });
         }
+    }
+
+    private async Task ReleaseLegacyMissingWorktreesAsync(CancellationToken ct)
+    {
+        var legacy = SnapshotJobs(job =>
+            (job.Phase is JobPhases.Blocked or JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting)
+            && string.IsNullOrWhiteSpace(job.ThreadId)
+            && WorkspaceCleanupPolicy.IsEntirelyMissingProvenOwned(job, config.Current.WorktreeRoot)
+            && (job.BlockReason?.Contains("Owned workspace is missing", StringComparison.OrdinalIgnoreCase) == true
+                || job.WorkerRetryLastSummary?.Contains("Owned workspace is missing", StringComparison.OrdinalIgnoreCase) == true));
+        if (legacy.Length == 0) return;
+
+        var statuses = await ReadIssueStatusesAsync(ct);
+        var legacySet = legacy.ToHashSet();
+        foreach (var group in legacy.GroupBy(job => job.Task.IssueId, StringComparer.OrdinalIgnoreCase))
+        {
+            var representative = group.OrderByDescending(job => job.StartedUtc).First();
+            var hasLiveOwner = SnapshotJobs(job =>
+                job.Task.IssueId.Equals(group.Key, StringComparison.OrdinalIgnoreCase)
+                && !legacySet.Contains(job)
+                && job.Phase is not (JobPhases.Done or JobPhases.Blocked)).Length > 0;
+            if (!hasLiveOwner
+                && statuses.TryGetValue(group.Key, out var status)
+                && status is "Active" or "Blocked")
+                await ChangeStatusAsync(representative, "Next", ct);
+
+            foreach (var job in group)
+            {
+                WorkerRetryPolicy.Clear(job);
+                SetPhase(job, JobPhases.Done);
+                Save(job);
+                log.Write("info", "claim.legacy-missing-worktree.released", new { job.Task.Sequence });
+            }
+        }
+    }
+
+    private async Task<Dictionary<string, string>> ReadIssueStatusesAsync(CancellationToken ct)
+    {
+        var result = await RunMaddoxAsync("issues", ct);
+        if (result.ExitCode != 0) throw new InvalidOperationException("Could not inspect task statuses during workspace recovery: " + result.Error.Trim());
+        using var document = JsonDocument.Parse(result.Output);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+            throw new InvalidDataException("Task status response was not an array.");
+        var statuses = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var issue in document.RootElement.EnumerateArray())
+        {
+            if (!issue.TryGetProperty("issueId", out var issueId) || !issue.TryGetProperty("status", out var status)) continue;
+            var id = issueId.GetString();
+            var value = status.GetString();
+            if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(value)) statuses[id] = value;
+        }
+        return statuses;
     }
 
     private void DrainFollowups(CancellationToken ct)

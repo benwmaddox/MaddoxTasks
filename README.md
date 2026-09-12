@@ -355,6 +355,11 @@ At canonical-checkout preflight, a clean stale branch with no commits beyond the
 default ref is preserved and repaired immediately. Another journal owner, a branch with
 unpublished commits, or dirty work without provable same-task ownership is preserved
 and blocked immediately; a retained same-task workspace resumes in place.
+Legacy blocked jobs are adopted only when every recorded workspace still exists.
+On startup, a threadless job whose workspaces are all proven worker-owned, all absent,
+and explicitly failed as `Owned workspace is missing` is retired; an orphaned Active or
+Blocked reservation returns to `Next`. Mixed or existing workspace sets are preserved
+for inspection rather than treated as disposable history.
 Task-owned repository state must not be abandoned when a job becomes `Blocked` or
 `Done`: publish or otherwise durably preserve the task branch first, then return the
 canonical checkout to a clean default branch. The worker never resets, stashes, or
