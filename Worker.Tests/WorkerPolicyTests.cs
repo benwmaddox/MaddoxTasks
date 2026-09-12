@@ -248,16 +248,41 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void RecoveryPlanner_RetiresRetryWhoseLedgerWasAlreadyBlocked()
+    {
+        var retry = CreateJob();
+        retry.Phase = JobPhases.RepairRetryWaiting;
+        var monitoring = CreateJob();
+        monitoring.Task = monitoring.Task with { IssueId = "review-task" };
+        monitoring.Phase = JobPhases.Monitoring;
+        var statuses = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [retry.Task.IssueId] = "Blocked",
+            [monitoring.Task.IssueId] = "ReadyForReview"
+        };
+
+        Assert.Equal([retry], RecoveryPlanner.JobsSupersededByLedger(new Journal { Jobs = [retry, monitoring] }, statuses));
+        Assert.False(RecoveryPlanner.IsSupersededByLedger(monitoring, statuses));
+    }
+
+    [Fact]
     public void RecoveryPlanner_ResumesSessionsAndPersistedPublicationExplicitly()
     {
         var implementing = CreateJob(JobPhases.Implementing); implementing.ThreadId = "thread-1";
         var repairing = CreateJob(JobPhases.Repairing); repairing.ThreadId = "thread-2";
         var publishing = CreateJob(JobPhases.Publishing); publishing.PendingResultJson = "{\"status\":\"completed\"}";
+        var publicationRetry = CreateJob(JobPhases.RetryWaiting); publicationRetry.PendingResultJson = "{\"status\":\"completed\"}";
+        publicationRetry.WorkerRetryAttempts = 1;
+        publicationRetry.WorkerRetryFingerprint = "publication-failure";
+        publicationRetry.WorkerRetryStartedUtc = DateTime.UnixEpoch;
+        publicationRetry.WorkerRetryNextUtc = DateTime.UnixEpoch;
         var legacyPublishing = CreateJob(JobPhases.Publishing); legacyPublishing.ThreadId = "thread-3";
         Assert.Equal(RecoveryMode.ResumeInitial, RecoveryPlanner.ModeFor(implementing));
         Assert.Equal(RecoveryMode.ResumeRepair, RecoveryPlanner.ModeFor(repairing));
         Assert.Equal(RecoveryMode.Publish, RecoveryPlanner.ModeFor(publishing));
+        Assert.Equal(RecoveryMode.Publish, RecoveryPlanner.ModeFor(publicationRetry));
         Assert.Equal(RecoveryMode.UnrecoverablePublication, RecoveryPlanner.ModeFor(legacyPublishing));
+        Assert.Contains(publicationRetry, RecoveryPlanner.JobsToRequeue(new Journal { Jobs = [publicationRetry] }));
     }
 
     [Fact]
@@ -1273,16 +1298,18 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void InitialCodexArguments_UseApproveForMeWithoutConflictingSandboxOption()
+    public void InitialCodexArguments_UseUnrestrictedNonInteractiveSandbox()
     {
         var job = CreateJob();
         job.Workspaces.Add(new Workspace("Repo", @"D:\code\Repo-worktree", "codex/task-1", "https://github.com/example/Repo.git"));
 
         var arguments = WorkerHost.BuildInitialCodexArguments(job, "schema.json", "prompt");
 
-        Assert.Contains("--approve-for-me", arguments);
+        Assert.Contains("--sandbox", arguments);
+        Assert.Equal("danger-full-access", arguments[arguments.IndexOf("--sandbox") + 1]);
+        Assert.Contains("approval_policy=never", arguments);
         Assert.Contains("--skip-git-repo-check", arguments);
-        Assert.DoesNotContain("--sandbox", arguments);
+        Assert.DoesNotContain("--approve-for-me", arguments);
     }
 
     [Fact]
@@ -1293,8 +1320,11 @@ public sealed class WorkerPolicyTests
 
         var arguments = WorkerHost.BuildContinuationCodexArguments(job, "schema.json", "prompt");
 
-        Assert.Equal("resume", arguments[1]);
-        Assert.Equal("thread-123", arguments[2]);
+        Assert.Equal(["exec", "--sandbox", "danger-full-access", "resume", "thread-123"], arguments[..5]);
+        Assert.True(arguments.IndexOf("--sandbox") < arguments.IndexOf("resume"));
+        Assert.Contains("--sandbox", arguments);
+        Assert.Equal("danger-full-access", arguments[arguments.IndexOf("--sandbox") + 1]);
+        Assert.Contains("approval_policy=never", arguments);
         Assert.Contains("--skip-git-repo-check", arguments);
         Assert.Equal("prompt", arguments[^1]);
     }
@@ -1312,14 +1342,30 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void ProcessArguments_AddExactSafeDirectoryForGitOnly()
+    public void ProcessArguments_KeepArgumentsUntouchedAndScopeSafeDirectoryInEnvironment()
     {
         var workingDirectory = Path.GetFullPath(@"D:\code\Repo");
         var git = ProcessArguments.Prepare("git", ["status", "--porcelain"], workingDirectory);
         var codex = ProcessArguments.Prepare("codex", ["--version"], workingDirectory);
 
-        Assert.Equal(["-c", $"safe.directory={workingDirectory.Replace('\\', '/')}", "status", "--porcelain"], git);
+        Assert.Equal(["status", "--porcelain"], git);
         Assert.Equal(["--version"], codex);
+
+        var callerEnvironment = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["WORKER_TEST_VALUE"] = "preserved",
+            ["GIT_CONFIG_COUNT"] = "1",
+            ["GIT_CONFIG_KEY_0"] = "user.name",
+            ["GIT_CONFIG_VALUE_0"] = "worker-test"
+        };
+        var environment = ProcessArguments.PrepareEnvironment("gh", workingDirectory, callerEnvironment);
+
+        Assert.Equal("preserved", environment["WORKER_TEST_VALUE"]);
+        Assert.Equal("2", environment["GIT_CONFIG_COUNT"]);
+        Assert.Equal("user.name", environment["GIT_CONFIG_KEY_0"]);
+        Assert.Equal("worker-test", environment["GIT_CONFIG_VALUE_0"]);
+        Assert.Equal("safe.directory", environment["GIT_CONFIG_KEY_1"]);
+        Assert.Equal(workingDirectory, environment["GIT_CONFIG_VALUE_1"]);
     }
 
     [Fact]

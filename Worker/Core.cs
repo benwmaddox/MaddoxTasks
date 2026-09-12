@@ -992,6 +992,8 @@ public static class WorkerRetryPolicy
 
     private static RecoveryMode ResolveRetryMode(Job job)
     {
+        if (!string.IsNullOrWhiteSpace(job.PendingResultJson)) return RecoveryMode.Publish;
+        if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Publish), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.Publish;
         if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.ResumeRepair;
         if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeInitial), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.ResumeInitial;
         if (string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Initial), StringComparison.OrdinalIgnoreCase)) return RecoveryMode.Initial;
@@ -1422,8 +1424,21 @@ public static partial class CodexUsageLimitPolicy
 
 public static class RecoveryPlanner
 {
+    public static bool IsSupersededByLedger(Job job, IReadOnlyDictionary<string, string> statuses)
+    {
+        if (job.Phase is JobPhases.Done or JobPhases.Blocked) return false;
+        if (!statuses.TryGetValue(job.Task.IssueId, out var status)) return false;
+        var expected = job.Phase == JobPhases.Monitoring ? "ReadyForReview" : "Active";
+        return !status.Equals(expected, StringComparison.OrdinalIgnoreCase)
+            && !(expected == "ReadyForReview" && status.Equals("Ready for Review", StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static IReadOnlyList<Job> JobsSupersededByLedger(Journal journal, IReadOnlyDictionary<string, string> statuses)
+        => journal.Jobs.Where(job => IsSupersededByLedger(job, statuses)).ToArray();
+
     public static IReadOnlyList<Job> JobsToRequeue(Journal journal, DateTime? nowUtc = null) => journal.Jobs
-        .Where(job => job.Phase is not (JobPhases.Done or JobPhases.Blocked or JobPhases.Monitoring))
+        .Where(job => job.Phase is not (JobPhases.Done or JobPhases.Blocked or JobPhases.Monitoring)
+            && (job.Phase != JobPhases.Publishing || !string.IsNullOrWhiteSpace(job.PendingResultJson)))
         .Where(job => job.Phase is not (JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting or JobPhases.ProviderPausedUntil)
             || (WorkerRetryPolicy.HasSafeMetadata(job) && (nowUtc is null || WorkerRetryPolicy.IsDue(job, nowUtc.Value))))
         .OrderBy(job => job.StartedUtc)
@@ -1435,12 +1450,18 @@ public static class RecoveryPlanner
         JobPhases.Publishing when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
         JobPhases.Repairing => RecoveryMode.ResumeRepair,
         JobPhases.Implementing when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.RetryWaiting when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
+        JobPhases.RetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Publish), StringComparison.OrdinalIgnoreCase) => RecoveryMode.Publish,
         JobPhases.RetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
         JobPhases.RetryWaiting when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
         JobPhases.RetryWaiting when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.RepairRetryWaiting when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
+        JobPhases.RepairRetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Publish), StringComparison.OrdinalIgnoreCase) => RecoveryMode.Publish,
         JobPhases.RepairRetryWaiting when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
         JobPhases.RepairRetryWaiting when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
         JobPhases.RepairRetryWaiting when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,
+        JobPhases.ProviderPausedUntil when !string.IsNullOrWhiteSpace(job.PendingResultJson) => RecoveryMode.Publish,
+        JobPhases.ProviderPausedUntil when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.Publish), StringComparison.OrdinalIgnoreCase) => RecoveryMode.Publish,
         JobPhases.ProviderPausedUntil when string.Equals(job.WorkerRetryMode, nameof(RecoveryMode.ResumeRepair), StringComparison.OrdinalIgnoreCase) => RecoveryMode.ResumeRepair,
         JobPhases.ProviderPausedUntil when job.PendingResultIsRepair => RecoveryMode.ResumeRepair,
         JobPhases.ProviderPausedUntil when !string.IsNullOrWhiteSpace(job.ThreadId) => RecoveryMode.ResumeInitial,

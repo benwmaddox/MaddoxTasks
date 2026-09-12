@@ -632,6 +632,8 @@ public sealed class WorkerHostMonitoringTests
         fixture.Job.PendingCheckFailures.Add(failure);
         fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["status", "--porcelain"])
             ? new ExecResult(0, "M src/file.cs\n", "")
+            : call.Arguments.SequenceEqual(["diff", "--quiet"])
+                ? new ExecResult(1, "", "")
             : call.Arguments.SequenceEqual(["rev-parse", "HEAD"])
                 ? new ExecResult(0, "local-head\n", "")
                 : call.Arguments.FirstOrDefault() == "ls-remote"
@@ -741,7 +743,7 @@ public sealed class WorkerHostMonitoringTests
 
         var command = Assert.Single(fixture.Processes.Commands, command => command.Executable == "codex");
         Assert.Equal(fixture.Job.Workspaces[0].Directory, command.WorkingDirectory);
-        Assert.Equal(["exec", "resume", "thread-1"], command.Arguments[..3]);
+        Assert.Equal(["exec", "--sandbox", "danger-full-access", "resume", "thread-1"], command.Arguments[..5]);
         Assert.Equal("-", command.Arguments[^1]);
     }
 

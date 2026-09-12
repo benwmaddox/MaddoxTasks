@@ -56,6 +56,7 @@ public sealed class WorkerHost
         await RecoverInvalidRetryMetadataAsync(ct);
         await ReleaseLegacyCheckoutAdmissionRetriesAsync(ct);
         await ReleaseLegacyMissingWorktreesAsync(ct);
+        await RetireSupersededExecutionJobsAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct), dashboardRefresh.RunAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
@@ -413,6 +414,24 @@ public sealed class WorkerHost
             if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(value)) statuses[id] = value;
         }
         return statuses;
+    }
+
+    private async Task RetireSupersededExecutionJobsAsync(CancellationToken ct)
+    {
+        var statuses = await ReadIssueStatusesAsync(ct);
+        foreach (var job in RecoveryPlanner.JobsSupersededByLedger(journal, statuses))
+        {
+            lock (journalGate)
+            {
+                if (!RecoveryPlanner.IsSupersededByLedger(job, statuses)) continue;
+                WorkerRetryPolicy.Clear(job);
+                job.CleanupPending = false;
+                job.Phase = JobPhases.Done;
+                job.PhaseChangedUtc = clock.UtcNow;
+                journal.Save(journalPath);
+            }
+            log.Write("info", "job.stale-execution.retired", new { job.Task.Sequence, ledgerStatus = statuses[job.Task.IssueId] });
+        }
     }
 
     private void DrainFollowups(CancellationToken ct)
@@ -778,7 +797,12 @@ public sealed class WorkerHost
             && WorkerRetryPolicy.TrySchedule(job, classification.Kind, classification.Summary, clock.UtcNow, config.Current, classification.RetryAtUtc, out var delay))
         {
             job.BlockReason = $"{classification.Kind}: {classification.Summary}";
-            job.WorkerRetryMode = mode is RecoveryMode.ResumeRepair ? nameof(RecoveryMode.ResumeRepair) : nameof(RecoveryMode.ResumeInitial);
+            job.WorkerRetryMode = mode switch
+            {
+                RecoveryMode.Publish => nameof(RecoveryMode.Publish),
+                RecoveryMode.ResumeRepair => nameof(RecoveryMode.ResumeRepair),
+                _ => nameof(RecoveryMode.ResumeInitial)
+            };
             SetPhase(job, job.WorkerRetryResetUtc is not null
                 ? JobPhases.ProviderPausedUntil
                 : classification.Kind == WorkerBlockerKinds.TransientWorker ? JobPhases.RetryWaiting : JobPhases.RepairRetryWaiting);
@@ -870,11 +894,13 @@ public sealed class WorkerHost
         }
         else await ValidateOwnedWorkspacesAsync(job, ct);
 
-        var recoveredRetry = job.WorkerRetryAttempts > 0;
-        WorkerRetryPolicy.Clear(job);
-        if (recoveredRetry)
+        // Keep the retry episode durable while the resumed attempt is running.
+        // Clearing here made every failing retry look like a first attempt and
+        // allowed transient worker failures to churn indefinitely. Terminal
+        // success paths clear the ledger after publication completes.
+        if (job.WorkerRetryAttempts > 0)
         {
-            await AddCommentAsync(job, "Bounded worker retry condition cleared; retained work resumed and the task remains Active.", ct);
+            await AddCommentAsync(job, "Bounded worker retry resumed; retained work remains Active while this attempt runs.", ct);
             Save(job);
         }
 
@@ -1382,7 +1408,9 @@ public sealed class WorkerHost
         var workingDirectory = job.Workspaces.FirstOrDefault()?.Directory ?? fallbackDirectory;
         if (string.IsNullOrWhiteSpace(workingDirectory))
             throw new InvalidDataException("A repository-less task requires a fallback working directory.");
-        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model, "-c", $"model_reasoning_effort={job.Effort}", "--approve-for-me", "--skip-git-repo-check", "-C", workingDirectory };
+        var arguments = new List<string> { "exec", "--json", "--output-schema", schema, "-m", job.Model,
+            "-c", $"model_reasoning_effort={job.Effort}", "-c", "approval_policy=never",
+            "--sandbox", "danger-full-access", "--skip-git-repo-check", "-C", workingDirectory };
         foreach (var workspace in job.Workspaces.Skip(1)) { arguments.Add("--add-dir"); arguments.Add(workspace.Directory); }
         arguments.Add(envelope);
         return arguments;
@@ -1391,8 +1419,9 @@ public sealed class WorkerHost
     public static List<string> BuildContinuationCodexArguments(Job job, string schema, string prompt)
     {
         if (string.IsNullOrWhiteSpace(job.ThreadId)) throw new InvalidOperationException("Cannot resume without an existing Codex thread ID.");
-        return ["exec", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model,
-            "-c", $"model_reasoning_effort={job.Effort}", "--skip-git-repo-check", prompt];
+        return ["exec", "--sandbox", "danger-full-access", "resume", job.ThreadId, "--json", "--output-schema", schema, "-m", job.Model,
+            "-c", $"model_reasoning_effort={job.Effort}", "-c", "approval_policy=never",
+            "--skip-git-repo-check", prompt];
     }
 
     private async Task<Workspace> MakeWorkspaceAsync(Job job, string repository, CancellationToken ct)
@@ -1513,17 +1542,14 @@ public sealed class WorkerHost
             if (!reported[workspace.Repository]) continue;
             if (!job.Publication.TryGetValue(workspace.Repository, out var progress))
                 job.Publication[workspace.Repository] = progress = new PublicationProgress();
-            var status = await RequireAsync("git", ["status", "--porcelain"], workspace.Directory, ct);
-            changed = true;
+            var hasChanges = await HasExecutionChangesAsync(job, workspace, ct);
+            if (!hasChanges && !progress.CommitCreated)
+                throw new InvalidOperationException($"Persisted publication reports changes but no task changes exist for {workspace.Repository}.");
+            changed |= hasChanges || progress.CommitCreated;
             if (!progress.CommitCreated)
             {
-                if (!string.IsNullOrWhiteSpace(status.Output))
-                {
-                    await RequireAsync("git", ["add", "-A"], workspace.Directory, ct);
-                    await CommitAsync(workspace, PublicationMetadata.CommitMessage(result, job.Task.Sequence), ct);
-                }
-                else if (!await HasExecutionChangesAsync(job, workspace, ct))
-                    throw new InvalidOperationException($"Persisted publication reports changes but no task commit exists for {workspace.Repository}.");
+                await RequireAsync("git", ["add", "-A"], workspace.Directory, ct);
+                await CommitAsync(workspace, PublicationMetadata.CommitMessage(result, job.Task.Sequence), ct);
                 progress.CommitCreated = true;
                 Save(job);
             }
@@ -1619,7 +1645,22 @@ public sealed class WorkerHost
     private async Task<bool> HasExecutionChangesAsync(Job job, Workspace workspace, CancellationToken ct)
     {
         var status = await RequireAsync("git", ["status", "--porcelain"], workspace.Directory, ct);
-        if (!string.IsNullOrWhiteSpace(status.Output)) return true;
+        if (!string.IsNullOrWhiteSpace(status.Output))
+        {
+            // Porcelain can report a stale index stat change even when the
+            // blob and index are byte-for-byte identical. Preserve staged and
+            // untracked detection, but verify tracked content before treating
+            // status output as task work.
+            var unstaged = await processes.RunAsync("git", ["diff", "--quiet"], workspace.Directory, ct);
+            if (unstaged.ExitCode is not (0 or 1))
+                throw new InvalidOperationException("Could not inspect unstaged changes: " + ExecResultDiagnostics.Failure(unstaged));
+            var staged = await processes.RunAsync("git", ["diff", "--cached", "--quiet"], workspace.Directory, ct);
+            if (staged.ExitCode is not (0 or 1))
+                throw new InvalidOperationException("Could not inspect staged changes: " + ExecResultDiagnostics.Failure(staged));
+            if (unstaged.ExitCode == 1 || staged.ExitCode == 1) return true;
+            var untracked = await RequireAsync("git", ["ls-files", "--others", "--exclude-standard"], workspace.Directory, ct);
+            if (!string.IsNullOrWhiteSpace(untracked.Output)) return true;
+        }
         if (job.Publication.TryGetValue(workspace.Repository, out var progress) && progress.CommitCreated) return true;
         if (!job.ExecutionStartHeads.TryGetValue(workspace.Repository, out var startHead)) return false;
         var head = (await RequireAsync("git", ["rev-parse", "HEAD"], workspace.Directory, ct)).Output.Trim();
