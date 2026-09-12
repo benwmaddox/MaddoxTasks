@@ -44,8 +44,8 @@ public sealed class ProcessRunner : IProcessRunner, IDisposable
         var argumentList = ProcessArguments.Prepare(executable, arguments, workingDirectory);
         log.Write("info", "process.start", new { executable = Path.GetFileName(executable), argumentCount = argumentList.Length, standardInputLength = standardInput?.Length ?? 0, workingDirectory });
         using var process = new Process { StartInfo = CreateStartInfo(executable, workingDirectory) };
-        if (environment is not null)
-            foreach (var (name, value) in environment)
+        var preparedEnvironment = ProcessArguments.PrepareEnvironment(executable, workingDirectory, environment);
+        foreach (var (name, value) in preparedEnvironment)
                 if (value is null) process.StartInfo.Environment.Remove(name);
                 else process.StartInfo.Environment[name] = value;
         process.StartInfo.RedirectStandardInput = standardInput is not null;
@@ -149,11 +149,37 @@ public static class ProcessArguments
 
     public static string[] Prepare(string executable, IEnumerable<string> arguments, string workingDirectory)
     {
-        var values = arguments.ToArray();
-        if (!Path.GetFileNameWithoutExtension(executable).Equals("git", StringComparison.OrdinalIgnoreCase)) return values;
+        return arguments.ToArray();
+    }
 
-        var safeDirectory = Path.GetFullPath(workingDirectory).Replace('\\', '/');
-        return ["-c", $"safe.directory={safeDirectory}", .. values];
+    /// <summary>
+    /// Gives Git (including Git invoked by the GitHub CLI) a safe.directory
+    /// entry scoped to this child process. The caller's environment and any
+    /// existing command-scoped Git config entries are preserved.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string?> PrepareEnvironment(
+        string executable,
+        string workingDirectory,
+        IReadOnlyDictionary<string, string?>? environment = null)
+    {
+        var prepared = environment is null
+            ? new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string?>(environment, StringComparer.OrdinalIgnoreCase);
+        var name = Path.GetFileNameWithoutExtension(executable);
+        if (!name.Equals("git", StringComparison.OrdinalIgnoreCase)
+            && !name.Equals("gh", StringComparison.OrdinalIgnoreCase)) return prepared;
+
+        var count = 0;
+        if (prepared.TryGetValue("GIT_CONFIG_COUNT", out var suppliedCount))
+            _ = int.TryParse(suppliedCount, out count);
+        else if (int.TryParse(Environment.GetEnvironmentVariable("GIT_CONFIG_COUNT"), out var inheritedCount))
+            count = inheritedCount;
+        if (count < 0) count = 0;
+
+        prepared["GIT_CONFIG_COUNT"] = (count + 1).ToString(System.Globalization.CultureInfo.InvariantCulture);
+        prepared[$"GIT_CONFIG_KEY_{count}"] = "safe.directory";
+        prepared[$"GIT_CONFIG_VALUE_{count}"] = Path.GetFullPath(workingDirectory);
+        return prepared;
     }
 }
 
