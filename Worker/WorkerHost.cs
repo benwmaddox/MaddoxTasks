@@ -1935,6 +1935,12 @@ public sealed class WorkerHost
             }
             if (Directory.Exists(workspace.Directory))
             {
+                var metadata = Path.Combine(workspace.Directory, ".git");
+                if (!File.Exists(metadata) && !Directory.Exists(metadata))
+                {
+                    log.Write("warning", "job.cleanup.orphan-preserved", new { job.Task.Sequence, workspace.Directory, reason = "directory has no Git worktree metadata" });
+                    continue;
+                }
                 var remove = await processes.RunAsync("git", ["worktree", "remove", workspace.Directory], source, ct);
                 if (remove.ExitCode != 0)
                 {
