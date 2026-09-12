@@ -267,6 +267,20 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void RecoveryPlanner_ResumesStatusSyncAfterLedgerReachedBlocked()
+    {
+        var pending = CreateJob(JobPhases.StatusSyncPending);
+        var statuses = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [pending.Task.IssueId] = "Blocked"
+        };
+
+        Assert.False(RecoveryPlanner.IsSupersededByLedger(pending, statuses));
+        Assert.Contains(pending, RecoveryPlanner.JobsToRequeue(new Journal { Jobs = [pending] }));
+        Assert.Equal(RecoveryMode.SyncBlocked, RecoveryPlanner.ModeFor(pending));
+    }
+
+    [Fact]
     public void RecoveryPlanner_ResumesSessionsAndPersistedPublicationExplicitly()
     {
         var implementing = CreateJob(JobPhases.Implementing); implementing.ThreadId = "thread-1";

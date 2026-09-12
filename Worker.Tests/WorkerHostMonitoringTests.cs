@@ -155,7 +155,7 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
-    public async Task RequeuedBlockedJob_WithDirtyCanonicalCheckout_PreservesOwnership()
+    public async Task RequeuedBlockedJob_WithDirtyCanonicalCheckout_CheckpointsAndReleasesOwnership()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
         fixture.CreateCanonicalRepository("Repo");
@@ -166,33 +166,57 @@ public sealed class WorkerHostMonitoringTests
                 "Repo",
                 Path.Combine(fixture.Settings.RepoRoot, "Repo"),
                 "codex/task-1-old",
-                "https://github.com/example/Repo.git")
+                "https://github.com/example/Repo.git",
+                "origin/main",
+                "origin/main")
         ];
+        var candidate = new TaskDto(42, Guid.NewGuid().ToString(), "Available", "Description", ["Repo"]);
+        var statusInspections = 0;
+        var branch = "codex/task-1-old";
         fixture.Processes.Responder = call =>
         {
             if (call.Arguments.SequenceEqual(["agent", "issues"]))
-                return new ExecResult(0, $"[{{\"issueId\":\"{fixture.Job.Task.IssueId}\",\"status\":\"Next\"}}]", "");
+                return new ExecResult(0, $"[{{\"issueId\":\"{fixture.Job.Task.IssueId}\",\"status\":\"Blocked\"}}]", "");
             if (call.Executable == "git" && call.Arguments.SequenceEqual(["status", "--porcelain"]))
-                return new ExecResult(0, " M retained.txt", "");
+                return new ExecResult(0, statusInspections++ == 0 ? " M retained.txt" : "", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new ExecResult(0, branch, "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["write-tree"]))
+                return new ExecResult(0, "tree", "");
+            if (call.Executable == "git" && call.Arguments.Contains("commit", StringComparer.Ordinal))
+                return new ExecResult(0, "checkpoint", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["show-ref", "--verify", "--quiet", "refs/heads/main"]))
+                return new ExecResult(0, "", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["switch", "main"]))
+            {
+                branch = "main";
+                return new ExecResult(0, "", "");
+            }
             if (call.Arguments.Contains("--dry-run", StringComparer.Ordinal))
-                return new ExecResult(0, "null", "");
-            if (call.Arguments.SequenceEqual(["agent", "research-claim"]))
-                return new ExecResult(0, "{\"success\":true,\"task\":null}", "");
-            return new ExecResult(0, "", "");
+                return new ExecResult(0, JsonSerializer.Serialize(candidate), "");
+            if (call.Arguments.Contains("--expected-issue-id", StringComparer.Ordinal))
+                return new ExecResult(0, JsonSerializer.Serialize(candidate), "");
+            return call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
         };
 
         await fixture.TickAsync();
 
         Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.Contains("Repo", fixture.Job.ReleasedCanonicalRepositories);
         var preview = Assert.Single(fixture.Processes.Commands, command => command.Arguments.Contains("--dry-run", StringComparer.Ordinal));
-        Assert.Contains("--exclude-repository", preview.Arguments);
-        Assert.Contains("Repo", preview.Arguments);
+        Assert.DoesNotContain("--exclude-repository", preview.Arguments);
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["add", "-A"]));
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.Contains("commit", StringComparer.Ordinal));
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["switch", "main"]));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("push", StringComparer.Ordinal));
     }
 
     [Theory]
     [InlineData("Active", false)]
-    [InlineData("Blocked", false)]
-    [InlineData("ReadyForReview", false)]
+    [InlineData("Blocked", true)]
+    [InlineData("ReadyForReview", true)]
     [InlineData("Next", true)]
     [InlineData("Backlog", true)]
     [InlineData("Done", true)]
@@ -200,6 +224,156 @@ public sealed class WorkerHostMonitoringTests
     public void StaleCanonicalOwnershipPolicy_TracksLedgerOwnership(string status, bool expected)
     {
         Assert.Equal(expected, StaleCanonicalOwnershipPolicy.LedgerReleasesOwnership(status));
+    }
+
+    [Theory]
+    [InlineData(JobPhases.Blocked, false, true)]
+    [InlineData(JobPhases.Blocked, true, false)]
+    [InlineData(JobPhases.Monitoring, true, false)]
+    [InlineData(JobPhases.Done, false, false)]
+    public void PickupContention_RequiresAnUnreleasedJournalLease(string phase, bool released, bool expected)
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.Phase = phase;
+        if (released) fixture.Job.ReleasedCanonicalRepositories.Add("Repo");
+
+        Assert.Equal(expected, StaleCanonicalOwnershipPolicy.HoldsCanonicalLease(fixture.Job, fixture.Job.Workspaces[0]));
+    }
+
+    [Fact]
+    public async Task ReleasedCanonicalCheckout_IsRestoredWhenBlockedTaskIsReclaimed()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.CreateCanonicalRepository("Repo");
+        fixture.Job.Phase = JobPhases.Claimed;
+        fixture.Job.AdoptedBlockedWorkspace = true;
+        fixture.Job.ReleasedCanonicalRepositories.Add("Repo");
+        fixture.Job.ExecutionStartHeads.Clear();
+        fixture.Job.Workspaces =
+        [
+            new Workspace(
+                "Repo",
+                Path.Combine(fixture.Settings.RepoRoot, "Repo"),
+                "codex/task-1-old",
+                "https://github.com/example/Repo.git",
+                "origin/main",
+                "origin/main")
+        ];
+        var branch = "main";
+        fixture.Processes.Responder = call =>
+        {
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new ExecResult(0, branch, "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["status", "--porcelain"]))
+                return new ExecResult(0, "", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["show-ref", "--verify", "--quiet", "refs/heads/codex/task-1-old"]))
+                return new ExecResult(0, "", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["switch", "codex/task-1-old"]))
+            {
+                branch = "codex/task-1-old";
+                return new ExecResult(0, "", "");
+            }
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["merge-base", "HEAD", "origin/main"]))
+                return new ExecResult(0, "base-head", "");
+            return new ExecResult(0, "", "");
+        };
+
+        await fixture.ValidateOwnedWorkspacesAsync();
+
+        Assert.DoesNotContain("Repo", fixture.Job.ReleasedCanonicalRepositories);
+        Assert.Equal("base-head", fixture.Job.ExecutionStartHeads["Repo"]);
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["switch", "codex/task-1-old"]));
+    }
+
+    [Fact]
+    public async Task FailedCanonicalCheckpoint_DoesNotMoveTaskOutOfActive()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.CreateCanonicalRepository("Repo");
+        fixture.Job.Phase = JobPhases.StatusSyncPending;
+        fixture.Job.Workspaces =
+        [
+            new Workspace(
+                "Repo",
+                Path.Combine(fixture.Settings.RepoRoot, "Repo"),
+                "codex/task-1-old",
+                "https://github.com/example/Repo.git",
+                "origin/main",
+                "origin/main")
+        ];
+        fixture.Processes.Responder = call =>
+        {
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new ExecResult(0, "codex/task-1-old", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["status", "--porcelain"]))
+                return new ExecResult(0, " M retained.txt", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["add", "-A"]))
+                return new ExecResult(1, "", "index unavailable");
+            return new ExecResult(0, "", "");
+        };
+
+        await Assert.ThrowsAsync<AggregateException>(() => fixture.ChangeStatusAsync("Blocked"));
+
+        Assert.DoesNotContain("Repo", fixture.Job.ReleasedCanonicalRepositories);
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.IsStatus("Blocked"));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("switch", StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task PickupContention_ReleasesSuccessfulRepositoryWhenAnotherCheckpointFails()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.CreateCanonicalRepository("Repo");
+        fixture.CreateCanonicalRepository("Other");
+        fixture.Job.Phase = JobPhases.Blocked;
+        fixture.Job.Task = fixture.Job.Task with { Repositories = ["Repo", "Other"] };
+        fixture.Job.Workspaces =
+        [
+            new Workspace("Repo", Path.Combine(fixture.Settings.RepoRoot, "Repo"), "codex/task-1-repo", "https://github.com/example/Repo.git", "origin/main", "origin/main"),
+            new Workspace("Other", Path.Combine(fixture.Settings.RepoRoot, "Other"), "codex/task-1-other", "https://github.com/example/Other.git", "origin/main", "origin/main")
+        ];
+        var candidate = new TaskDto(42, Guid.NewGuid().ToString(), "Available", "Description", ["Repo"]);
+        fixture.Processes.Responder = call =>
+        {
+            if (call.Arguments.SequenceEqual(["agent", "issues"]))
+                return new ExecResult(0, $"[{{\"issueId\":\"{fixture.Job.Task.IssueId}\",\"status\":\"Blocked\"}}]", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["branch", "--show-current"]))
+                return new ExecResult(0, Path.GetFileName(call.WorkingDirectory) == "Repo" ? "main" : "codex/task-1-other", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["status", "--porcelain"]))
+                return new ExecResult(0, Path.GetFileName(call.WorkingDirectory) == "Repo" ? "" : " M retained.txt", "");
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["add", "-A"]))
+                return new ExecResult(1, "", "index unavailable");
+            if (call.Arguments.Contains("--dry-run", StringComparer.Ordinal))
+                return new ExecResult(0, JsonSerializer.Serialize(candidate), "");
+            if (call.Arguments.Contains("--expected-issue-id", StringComparer.Ordinal))
+                return new ExecResult(0, JsonSerializer.Serialize(candidate), "");
+            return call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
+        };
+
+        await fixture.TickAsync();
+
+        Assert.Contains("Repo", fixture.Job.ReleasedCanonicalRepositories);
+        Assert.DoesNotContain("Other", fixture.Job.ReleasedCanonicalRepositories);
+        Assert.Contains(fixture.Processes.Commands, command =>
+            Path.GetFileName(command.WorkingDirectory) == "Repo"
+            && command.Arguments.SequenceEqual(["merge", "--ff-only", "origin/main"]));
+        var preview = Assert.Single(fixture.Processes.Commands, command => command.Arguments.Contains("--dry-run", StringComparer.Ordinal));
+        Assert.Contains("Other", preview.Arguments);
+        Assert.DoesNotContain("Repo", preview.Arguments);
+    }
+
+    [Fact]
+    public void MonitoringRepair_IsMarkedInFlightBeforePickupContentionAudit()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.Phase = JobPhases.Monitoring;
+
+        fixture.MarkWorkItemDispatched(RecoveryMode.ResumeRepair);
+
+        Assert.Equal(JobPhases.Repairing, fixture.Job.Phase);
+        Assert.False(StaleCanonicalOwnershipPolicy.JournalCanReleaseOwnership(fixture.Job.Phase));
     }
 
     [Fact]
@@ -704,6 +878,44 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task ReclaimedCheckpointCommit_IsPublishedWithoutCreatingAnEmptyCommit()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var failure = new CheckState("build", "FAILURE", "fail", "check", fixture.Job.PullRequests[0].Url);
+        fixture.Job.PendingCheckFailures.Add(failure);
+        fixture.Job.ExecutionStartHeads["Repo"] = "base-head";
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["status", "--porcelain"])
+            ? new ExecResult(0, "", "")
+            : call.Arguments.SequenceEqual(["rev-parse", "HEAD"])
+                ? new ExecResult(0, "checkpoint-head", "")
+                : call.Arguments.FirstOrDefault() == "ls-remote"
+                    ? new ExecResult(0, "checkpoint-head refs/heads/codex/task-1-fix", "")
+                    : call.Arguments.Contains("command", StringComparer.Ordinal)
+                        ? new ExecResult(0, "{\"success\":true}", "")
+                        : new ExecResult(0, "", "");
+        var result = JsonSerializer.Serialize(new
+        {
+            status = "blocked",
+            summary = "checkpoint preserved; external input remains",
+            validationEvidence = new[] { "checkpoint inspected" },
+            repositories = new[] { new { repository = "Repo", changed = true } },
+            commitMessage = "publish checkpoint",
+            prTitle = "publish checkpoint",
+            prBody = "publish checkpoint",
+            checkDispositions = new[] { new { checkId = failure.Id, addressed = true, summary = "addressed" } },
+            threadDispositions = Array.Empty<object>(),
+            workComplete = false,
+            blocker = new { kind = "missingInput", summary = "input required", evidence = new[] { "input absent" }, retryAtUtc = (string?)null }
+        });
+
+        await fixture.CompleteAsync(result, repair: true);
+
+        Assert.Equal(JobPhases.Blocked, fixture.Job.Phase);
+        Assert.DoesNotContain(fixture.Processes.Commands, call => call.Arguments.FirstOrDefault() is "add" or "commit" or "push");
+        Assert.Contains(fixture.Processes.Commands, call => call.IsStatus("Blocked"));
+    }
+
+    [Fact]
     public async Task UnknownMergeability_WaitsWithoutQueuingRepairOrAutoMerge()
     {
         var pending = Snapshot(false) with { Mergeable = "UNKNOWN", MergeStateStatus = "UNKNOWN" };
@@ -872,6 +1084,26 @@ public sealed class WorkerHostMonitoringTests
         {
             var method = typeof(WorkerHost).GetMethod("CleanupAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
+        }
+
+        public async Task ValidateOwnedWorkspacesAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("ValidateOwnedWorkspacesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
+        }
+
+        public async Task ChangeStatusAsync(string status)
+        {
+            var method = typeof(WorkerHost).GetMethod("ChangeStatusAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task<ExecResult>)method.Invoke(Host, [Job, status, CancellationToken.None])!;
+        }
+
+        public void MarkWorkItemDispatched(RecoveryMode mode)
+        {
+            var workItemType = typeof(WorkerHost).GetNestedType("WorkItem", BindingFlags.NonPublic)!;
+            var workItem = Activator.CreateInstance(workItemType, Job, mode)!;
+            var method = typeof(WorkerHost).GetMethod("MarkWorkItemDispatched", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            method.Invoke(Host, [workItem]);
         }
 
         public async Task ContinueAsync()
