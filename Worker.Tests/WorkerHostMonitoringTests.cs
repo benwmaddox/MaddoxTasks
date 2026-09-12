@@ -251,6 +251,31 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task CompletedCleanup_PreservesOrphanDirectoryWithoutGitMetadata_AndStopsRetrying()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        var orphan = Path.Combine(fixture.Settings.WorktreeRoot, "repo-1");
+        Directory.CreateDirectory(orphan);
+        File.WriteAllText(Path.Combine(orphan, "retained.txt"), "preserve");
+        fixture.Job.Phase = JobPhases.Done;
+        fixture.Job.CleanupPending = true;
+        fixture.Job.Workspaces =
+        [
+            new Workspace(
+                "Repo",
+                orphan,
+                "codex/task-1-old",
+                "https://github.com/example/Repo.git")
+        ];
+
+        await fixture.CleanupAsync();
+
+        Assert.False(fixture.Job.CleanupPending);
+        Assert.True(File.Exists(Path.Combine(orphan, "retained.txt")));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("worktree", StringComparer.Ordinal));
+    }
+
+    [Fact]
     public async Task LegacyMissingWorktree_MixedExistingWorkspaceIsPreserved()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
@@ -835,6 +860,12 @@ public sealed class WorkerHostMonitoringTests
         {
             var method = typeof(WorkerHost).GetMethod("ReleaseLegacyMissingWorktreesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             await (Task)method.Invoke(Host, [CancellationToken.None])!;
+        }
+
+        public async Task CleanupAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("CleanupAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [Job, CancellationToken.None])!;
         }
 
         public async Task ContinueAsync()
