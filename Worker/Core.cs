@@ -1116,7 +1116,13 @@ public static class WorkspaceDirectoryPolicy
 public static class StaleCanonicalOwnershipPolicy
 {
     public static bool LedgerReleasesOwnership(string status)
-        => status is "Next" or "Backlog" or "Done" or "Rejected";
+        => status is "Blocked" or "Next" or "Backlog" or "ReadyForReview" or "Ready for Review" or "Done" or "Rejected";
+
+    public static bool JournalCanReleaseOwnership(string phase)
+        => phase is JobPhases.Blocked or JobPhases.Monitoring or JobPhases.StatusSyncPending;
+
+    public static bool HoldsCanonicalLease(Job job, Workspace workspace)
+        => job.Phase != JobPhases.Done && !job.ReleasedCanonicalRepositories.Contains(workspace.Repository);
 }
 
 public sealed record PullRequestState(string Url, string Repository, string HeadOid = "");
@@ -1232,6 +1238,7 @@ public sealed class Job
     public bool PullRequestCommentRecorded { get; set; }
     public bool CodexResultCommentRecorded { get; set; }
     public bool CleanupPending { get; set; }
+    public HashSet<string> ReleasedCanonicalRepositories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public DateTime? ObservedTaskUpdatedAt { get; set; }
     public string? ObservedDescription { get; set; }
     public HashSet<string> ProcessedHumanCommentKeys { get; set; } = new(StringComparer.Ordinal);
@@ -1428,6 +1435,7 @@ public static class RecoveryPlanner
     {
         if (job.Phase is JobPhases.Done or JobPhases.Blocked) return false;
         if (!statuses.TryGetValue(job.Task.IssueId, out var status)) return false;
+        if (job.Phase == JobPhases.StatusSyncPending && status.Equals("Blocked", StringComparison.OrdinalIgnoreCase)) return false;
         var expected = job.Phase == JobPhases.Monitoring ? "ReadyForReview" : "Active";
         return !status.Equals(expected, StringComparison.OrdinalIgnoreCase)
             && !(expected == "ReadyForReview" && status.Equals("Ready for Review", StringComparison.OrdinalIgnoreCase));

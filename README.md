@@ -322,7 +322,7 @@ The Windows release also includes `MaddoxTasks.Worker.exe`, `worker.json`, and `
 Repository admission prepares each project at its exact directory beneath `repoRoot`. The default `workspaceMode` is `checkout`: the worker uses that canonical checkout, requires it to be clean and on the remote default branch, and creates the task branch there. Maddox repository reservations admit at most one active task per repository, so separate repositories may still run concurrently without multiplying checkouts. An occupied or dirty checkout stops preparation instead of being bypassed.
 Before changing any task to `Active`, the worker previews the next claim and performs a read-only Git ownership check. Dirty checkouts and branches with unpublished commits are excluded from that atomic claim, allowing work in other repositories to continue without reservation comments or retry churn. The real claim includes the previewed issue identity, so a concurrent queue change claims nothing rather than reserving an uninspected repository. The post-claim check remains as a race guard.
 
-Before those exclusions are built, a blocked journal owner whose ledger task is now `Next`, `Backlog`, `Done`, or `Rejected` is retired when its canonical checkout is clean and has no unpublished commits. This lets manual or automated requeue operations recover on the next claim cycle without silently excluding the repository, while retained dirty work continues to block claims until it is preserved or completed.
+Before those exclusions are built, the worker audits every inactive journal owner that still names a canonical checkout. Task-owned dirty work is captured in a local recovery commit on its existing task branch, the checkout is returned to an updated clean default branch, and that released owner is omitted from claim contention. If ownership cannot be proven or the recovery commit cannot be created, the repository remains excluded with an actionable warning. No incomplete recovery commit is pushed automatically. A later claim of the same blocked task restores the recorded local task branch and continues from its merge base.
 
 Completed-job cleanup removes only directories that still carry Git worktree metadata. If an expected worktree path exists without that metadata, the worker preserves the directory, records a warning, and closes the cleanup attempt instead of retrying a destructive removal every polling cycle.
 Existing `origin` remotes remain authoritative: before every new task, the worker fetches and prunes `origin`, resolves the freshly fetched `origin/main` or `origin/master` (falling back to another explicit remote default only when neither exists), and bases the task branch on that remote tip. It does not rely on a stale local default branch, pull, or reset unrelated work. Task publication pushes its task branch through the usual PR workflow. Set `workspaceMode` to `worktree` only as an explicit last-resort exception when a concrete technical constraint requires isolation; `worktreeRoot` is used only in that mode.
@@ -343,9 +343,10 @@ then exit. Run `MaddoxTasks.Worker.exe --stop` or press Ctrl+C when an immediate
 local shutdown is required. The visible dashboard keeps recently blocked work for
 `blockedDisplayDuration` (10 minutes by default), then rolls it off while the
 durable journal and JSONL logs retain the full record.
-Blocked jobs retain their owned workspace and branch, including tracked changes
-and non-ignored untracked files, for diagnosis or later recovery. Canonical checkouts
-remain reserved while blocked work is retained. Destructive cleanup of exceptional
+Blocked jobs retain their owned branch, including tracked changes and non-ignored
+untracked files captured in a local recovery commit, for diagnosis or later recovery.
+Canonical checkouts are released after that checkpoint instead of remaining reserved.
+Destructive cleanup of exceptional
 worktrees and their task branches is eligible only after the job reaches `Done`;
 best-effort ignored generated-output cleanup may still run with `git clean -fdX`.
 Genuinely transient worker failures keep the task `Active` in a bounded retry phase;
