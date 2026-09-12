@@ -56,6 +56,7 @@ public sealed class WorkerHost
         await RecoverInvalidRetryMetadataAsync(ct);
         await ReleaseLegacyCheckoutAdmissionRetriesAsync(ct);
         await ReleaseLegacyMissingWorktreesAsync(ct);
+        await RetireSupersededExecutionJobsAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct), dashboardRefresh.RunAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
@@ -413,6 +414,24 @@ public sealed class WorkerHost
             if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(value)) statuses[id] = value;
         }
         return statuses;
+    }
+
+    private async Task RetireSupersededExecutionJobsAsync(CancellationToken ct)
+    {
+        var statuses = await ReadIssueStatusesAsync(ct);
+        foreach (var job in RecoveryPlanner.JobsSupersededByLedger(journal, statuses))
+        {
+            lock (journalGate)
+            {
+                if (!RecoveryPlanner.IsSupersededByLedger(job, statuses)) continue;
+                WorkerRetryPolicy.Clear(job);
+                job.CleanupPending = false;
+                job.Phase = JobPhases.Done;
+                job.PhaseChangedUtc = clock.UtcNow;
+                journal.Save(journalPath);
+            }
+            log.Write("info", "job.stale-execution.retired", new { job.Task.Sequence, ledgerStatus = statuses[job.Task.IssueId] });
+        }
     }
 
     private void DrainFollowups(CancellationToken ct)

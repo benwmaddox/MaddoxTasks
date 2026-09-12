@@ -1424,6 +1424,18 @@ public static partial class CodexUsageLimitPolicy
 
 public static class RecoveryPlanner
 {
+    public static bool IsSupersededByLedger(Job job, IReadOnlyDictionary<string, string> statuses)
+    {
+        if (job.Phase is JobPhases.Done or JobPhases.Blocked) return false;
+        if (!statuses.TryGetValue(job.Task.IssueId, out var status)) return false;
+        var expected = job.Phase == JobPhases.Monitoring ? "ReadyForReview" : "Active";
+        return !status.Equals(expected, StringComparison.OrdinalIgnoreCase)
+            && !(expected == "ReadyForReview" && status.Equals("Ready for Review", StringComparison.OrdinalIgnoreCase));
+    }
+
+    public static IReadOnlyList<Job> JobsSupersededByLedger(Journal journal, IReadOnlyDictionary<string, string> statuses)
+        => journal.Jobs.Where(job => IsSupersededByLedger(job, statuses)).ToArray();
+
     public static IReadOnlyList<Job> JobsToRequeue(Journal journal, DateTime? nowUtc = null) => journal.Jobs
         .Where(job => job.Phase is not (JobPhases.Done or JobPhases.Blocked or JobPhases.Monitoring)
             && (job.Phase != JobPhases.Publishing || !string.IsNullOrWhiteSpace(job.PendingResultJson)))
