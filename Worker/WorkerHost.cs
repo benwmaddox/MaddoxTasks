@@ -54,6 +54,7 @@ public sealed class WorkerHost
         if (config.Current.UseWorktrees) Directory.CreateDirectory(config.Current.WorktreeRoot);
         await PreflightAsync(ct);
         await RecoverInvalidRetryMetadataAsync(ct);
+        await ReleaseLegacyCheckoutAdmissionRetriesAsync(ct);
         foreach (var job in RecoveryPlanner.JobsToRequeue(journal, clock.UtcNow)) Enqueue(job, RecoveryPlanner.ModeFor(job));
         var background = new[] { WatchFilesAsync(ct), ReadKeysAsync(ct), MonitorAsync(ct), dashboardRefresh.RunAsync(ct) };
         var cadence = new ClaimCadence(clock.UtcNow);
@@ -146,7 +147,7 @@ public sealed class WorkerHost
                 return FreshClaimOutcome.Unavailable;
             }
             ExecResult claim;
-            try { claim = await RunMaddoxAsync("claim", ct); }
+            try { claim = await ClaimLocallyAvailableAsync(claimSnapshot!.Config, ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { capacity.Release(); throw; }
             catch (Exception exception)
             {
@@ -201,6 +202,84 @@ public sealed class WorkerHost
         return FreshClaimOutcome.NotAttempted;
     }
 
+    private async Task<ExecResult> ClaimLocallyAvailableAsync(WorkerConfig settings, CancellationToken ct)
+    {
+        if (settings.UseWorktrees) return await RunMaddoxCommandAsync(["claim"], ct);
+
+        var excluded = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (journalGate)
+        {
+            foreach (var job in journal.Jobs.Where(job => job.Phase != JobPhases.Done))
+            foreach (var workspace in job.Workspaces.Where(workspace => WorkspaceDirectoryPolicy.IsCanonical(workspace, settings.RepoRoot)))
+                foreach (var repository in job.Task.Repositories) excluded.Add(repository);
+        }
+
+        while (true)
+        {
+            var previewArguments = new List<string> { "claim", "--dry-run" };
+            AddClaimExclusions(previewArguments, excluded);
+            var preview = await RunMaddoxCommandAsync(previewArguments, ct);
+            if (preview.ExitCode != 0 || string.IsNullOrWhiteSpace(preview.Output) || preview.Output.Trim() == "null") return preview;
+
+            var task = JsonSerializer.Deserialize<TaskDto>(preview.Output, JsonOptions)
+                ?? throw new InvalidDataException("Claim preview response was empty.");
+            if (!await IsLocallyAvailableAsync(task, settings, ct))
+            {
+                foreach (var repository in task.Repositories) excluded.Add(repository);
+                log.Write("info", "claim.repository.skipped", new { task.Sequence, task.Repositories, reason = "canonical checkout is occupied" });
+                continue;
+            }
+
+            var claimArguments = new List<string> { "claim", "--expected-issue-id", task.IssueId };
+            AddClaimExclusions(claimArguments, excluded);
+            return await RunMaddoxCommandAsync(claimArguments, ct);
+        }
+    }
+
+    private static void AddClaimExclusions(List<string> arguments, IEnumerable<string> excluded)
+    {
+        foreach (var repository in excluded.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+        {
+            arguments.Add("--exclude-repository");
+            arguments.Add(repository);
+        }
+    }
+
+    private async Task<bool> IsLocallyAvailableAsync(TaskDto task, WorkerConfig settings, CancellationToken ct)
+    {
+        foreach (var repository in task.Repositories)
+        {
+            string source;
+            try
+            {
+                var root = Path.GetFullPath(settings.RepoRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                source = Path.GetFullPath(Path.Combine(root, repository));
+                if (!source.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return false;
+            }
+            catch { return false; }
+
+            if (!Directory.Exists(source) || !Directory.Exists(Path.Combine(source, ".git"))) continue;
+            var status = await processes.RunAsync("git", ["status", "--porcelain"], source, ct);
+            if (status.ExitCode != 0 || !string.IsNullOrWhiteSpace(status.Output)) return false;
+            var branch = await processes.RunAsync("git", ["branch", "--show-current"], source, ct);
+            if (branch.ExitCode != 0 || string.IsNullOrWhiteSpace(branch.Output)) return false;
+            var symbolic = await processes.RunAsync("git", ["symbolic-ref", "refs/remotes/origin/HEAD", "--short"], source, ct);
+            var remoteRef = symbolic.ExitCode == 0 ? symbolic.Output.Trim() : string.Empty;
+            if (string.IsNullOrWhiteSpace(remoteRef))
+            {
+                var main = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", "refs/remotes/origin/main"], source, ct);
+                var master = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", "refs/remotes/origin/master"], source, ct);
+                remoteRef = main.ExitCode == 0 ? "origin/main" : master.ExitCode == 0 ? "origin/master" : string.Empty;
+            }
+            if (string.IsNullOrWhiteSpace(remoteRef)) continue;
+            var defaultBranch = remoteRef["origin/".Length..];
+            if (branch.Output.Trim().Equals(defaultBranch, StringComparison.Ordinal)) continue;
+            var unique = await processes.RunAsync("git", ["rev-list", "--count", "HEAD", $"^{remoteRef}"], source, ct);
+            if (unique.ExitCode != 0 || !int.TryParse(unique.Output.Trim(), out var count) || count != 0) return false;
+        }
+        return true;
+    }
+
     private bool EnqueueDueRetries(DateTime? nowUtc = null)
     {
         var now = nowUtc ?? clock.UtcNow;
@@ -232,6 +311,24 @@ public sealed class WorkerHost
             if (!WorkerRetryPolicy.TryReconstruct(job, clock.UtcNow, config.Current, out var reconstruction)) continue;
             await AddCommentAsync(job, "Worker recovered an interrupted retry: " + reconstruction.Reason, ct);
             Save(job);
+        }
+    }
+
+    private async Task ReleaseLegacyCheckoutAdmissionRetriesAsync(CancellationToken ct)
+    {
+        var legacy = SnapshotJobs(job =>
+            (job.Phase is JobPhases.RetryWaiting or JobPhases.RepairRetryWaiting)
+            && job.Workspaces.Count == 0
+            && string.IsNullOrWhiteSpace(job.ThreadId)
+            && (job.BlockReason?.Contains("Canonical checkout", StringComparison.OrdinalIgnoreCase) == true
+                || job.WorkerRetryLastSummary?.Contains("Canonical checkout", StringComparison.OrdinalIgnoreCase) == true));
+        foreach (var job in legacy)
+        {
+            await ChangeStatusAsync(job, "Next", ct);
+            WorkerRetryPolicy.Clear(job);
+            SetPhase(job, JobPhases.Done);
+            Save(job);
+            log.Write("info", "claim.legacy-checkout-retry.released", new { job.Task.Sequence });
         }
     }
 
@@ -868,6 +965,13 @@ public sealed class WorkerHost
                     Save(job);
                 }
             }
+            if (!repair) await ValidateResultAsync(job, result, ct);
+            if (!structured.Blocker.IsRetryable)
+            {
+                if (!repair && ResultRepositories(result).Values.Any(changed => changed))
+                    await PublishAsync(job, result, repair: false, ct);
+                await ReleaseTerminalCanonicalCheckoutsAsync(job, ct);
+            }
             await HandleBlockedResultAsync(job, structured.Blocker, repair, ct);
             return;
         }
@@ -903,6 +1007,7 @@ public sealed class WorkerHost
                 job.CodexResultCommentRecorded = true;
                 Save(job);
             }
+            await ReleaseTerminalCanonicalCheckoutsAsync(job, ct);
             await ChangeStatusAsync(job, "Done", ct);
             job.PendingResultJson = null;
             WorkerRetryPolicy.Clear(job);
@@ -1760,6 +1865,33 @@ public sealed class WorkerHost
         job.CleanupPending = false;
         Save(job);
         log.Write("info", "job.cleaned", new { job.Task.Sequence });
+    }
+
+    private async Task ReleaseTerminalCanonicalCheckoutsAsync(Job job, CancellationToken ct)
+    {
+        foreach (var workspace in job.Workspaces.Where(workspace => WorkspaceDirectoryPolicy.IsCanonical(workspace, config.Current.RepoRoot)))
+        {
+            var currentBranch = (await RequireAsync("git", ["branch", "--show-current"], workspace.Directory, ct)).Output.Trim();
+            if (!currentBranch.Equals(workspace.Branch, StringComparison.Ordinal)) continue;
+            var status = await RequireAsync("git", ["status", "--porcelain"], workspace.Directory, ct);
+            if (!string.IsNullOrWhiteSpace(status.Output))
+                throw new InvalidOperationException("Blocked canonical checkout still contains unpublished changes: " + workspace.Directory);
+            var localHead = (await RequireAsync("git", ["rev-parse", "HEAD"], workspace.Directory, ct)).Output.Trim();
+            var remoteHead = await RequireAsync("git", ["ls-remote", "origin", $"refs/heads/{workspace.Branch}"], workspace.Directory, ct);
+            var publishedHead = remoteHead.Output.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
+            var baseHead = string.IsNullOrWhiteSpace(workspace.BaseRef)
+                ? string.Empty
+                : (await RequireAsync("git", ["rev-parse", workspace.BaseRef], workspace.Directory, ct)).Output.Trim();
+            if (!localHead.Equals(publishedHead, StringComparison.OrdinalIgnoreCase)
+                && !localHead.Equals(baseHead, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Blocked canonical checkout branch is not durably pushed: " + workspace.Directory);
+            var defaultBranch = WorkspaceDirectoryPolicy.LocalDefaultBranch(workspace);
+            var localDefault = await processes.RunAsync("git", ["show-ref", "--verify", "--quiet", $"refs/heads/{defaultBranch}"], workspace.Directory, ct);
+            if (localDefault.ExitCode == 0) await RequireAsync("git", ["switch", defaultBranch], workspace.Directory, ct);
+            else if (localDefault.ExitCode == 1) await RequireAsync("git", ["switch", "-c", defaultBranch, "--track", workspace.DefaultRef], workspace.Directory, ct);
+            else throw new InvalidOperationException("Could not inspect the canonical default branch: " + workspace.Directory);
+        }
+        Save(job);
     }
 
     private async Task CleanIgnoredGeneratedOutputsAsync(Job job, CancellationToken ct)

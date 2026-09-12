@@ -441,13 +441,20 @@ public static class CliRunner
     private static CliCommand BuildAgentClaimCommand(Option<string> dbOption)
     {
         var dryRunOption = new Option<bool>("--dry-run", "Select without changing the task status.");
+        var excludeRepositoryOption = new Option<string[]>("--exclude-repository", "Repository reservation key to skip for this claim.")
+        {
+            AllowMultipleArgumentsPerToken = true
+        };
+        var expectedIssueOption = new Option<string?>("--expected-issue-id", "Claim only when this issue remains the next eligible candidate.");
         var command = new CliCommand("claim", "Atomically claim the next available repository-backed task as Active.");
         command.AddOption(dryRunOption);
-        command.SetHandler((string dbPath, bool dryRun) =>
+        command.AddOption(excludeRepositoryOption);
+        command.AddOption(expectedIssueOption);
+        command.SetHandler((string dbPath, bool dryRun, string[] excludedRepositories, string? expectedIssueId) =>
         {
             var engine = CreateEngine(dbPath);
-            Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun));
-        }, dbOption, dryRunOption);
+            Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun, excludedRepositories, expectedIssueId));
+        }, dbOption, dryRunOption, excludeRepositoryOption, expectedIssueOption);
         return command;
     }
 

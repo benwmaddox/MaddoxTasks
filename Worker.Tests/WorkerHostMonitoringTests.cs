@@ -51,7 +51,7 @@ public sealed class WorkerHostMonitoringTests
     public async Task EmptyFreshClaim_IsFollowedByResearchClaim()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
-        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["agent", "claim"])
+        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["agent", "claim", "--dry-run"])
             ? new ExecResult(0, "null", "")
             : call.Arguments.SequenceEqual(["agent", "research-claim"])
                 ? new ExecResult(0, "{\"success\":true,\"task\":null}", "")
@@ -59,7 +59,7 @@ public sealed class WorkerHostMonitoringTests
 
         await fixture.TickAsync();
 
-        var claimIndex = fixture.Processes.Commands.FindIndex(command => command.Arguments.SequenceEqual(["agent", "claim"]));
+        var claimIndex = fixture.Processes.Commands.FindIndex(command => command.Arguments.SequenceEqual(["agent", "claim", "--dry-run"]));
         var researchIndex = fixture.Processes.Commands.FindIndex(command => command.Arguments.SequenceEqual(["agent", "research-claim"]));
         Assert.True(claimIndex >= 0);
         Assert.True(researchIndex > claimIndex);
@@ -70,7 +70,7 @@ public sealed class WorkerHostMonitoringTests
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
         var task = new TaskDto(42, Guid.NewGuid().ToString(), "Claimed", "Description", ["Repo"]);
-        fixture.Processes.Responder = call => call.Arguments.SequenceEqual(["agent", "claim"])
+        fixture.Processes.Responder = call => call.Arguments.Length >= 2 && call.Arguments[0] == "agent" && call.Arguments[1] == "claim"
             ? new ExecResult(0, JsonSerializer.Serialize(task), "")
             : call.Arguments.Contains("command", StringComparer.Ordinal)
                 ? new ExecResult(0, "{\"success\":true}", "")
@@ -78,8 +78,56 @@ public sealed class WorkerHostMonitoringTests
 
         await fixture.TickAsync();
 
-        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["agent", "claim"]));
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.SequenceEqual(["agent", "claim", "--dry-run"]));
+        Assert.Contains(fixture.Processes.Commands, command => command.Arguments.Contains("--expected-issue-id"));
         Assert.DoesNotContain(fixture.Processes.Commands, command => command.Arguments.Contains("research-claim"));
+    }
+
+    [Fact]
+    public async Task DirtyCanonicalCheckout_IsExcludedBeforeAnotherRepositoryIsClaimed()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.CreateCanonicalRepository("Occupied");
+        var occupied = new TaskDto(41, Guid.NewGuid().ToString(), "Occupied", "Description", ["Occupied"]);
+        var available = new TaskDto(42, Guid.NewGuid().ToString(), "Available", "Description", ["Available"]);
+        fixture.Processes.Responder = call =>
+        {
+            if (call.Executable == "git" && call.Arguments.SequenceEqual(["status", "--porcelain"]))
+                return new ExecResult(0, " M owned.txt", "");
+            if (call.Arguments.Length >= 3 && call.Arguments[0] == "agent" && call.Arguments[1] == "claim" && call.Arguments.Contains("--dry-run"))
+                return new ExecResult(0, JsonSerializer.Serialize(call.Arguments.Contains("Occupied") ? available : occupied), "");
+            if (call.Arguments.Contains("--expected-issue-id"))
+                return new ExecResult(0, JsonSerializer.Serialize(available), "");
+            return call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
+        };
+
+        await fixture.TickAsync();
+
+        Assert.DoesNotContain(fixture.Processes.Commands, command =>
+            command.Arguments.Contains("--expected-issue-id") && command.Arguments.Contains(occupied.IssueId));
+        Assert.Contains(fixture.Processes.Commands, command =>
+            command.Arguments.Contains("--expected-issue-id") && command.Arguments.Contains(available.IssueId));
+    }
+
+    [Fact]
+    public async Task LegacyCheckoutAdmissionRetry_IsReleasedWithoutRunningCodex()
+    {
+        using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
+        fixture.Job.Phase = JobPhases.RetryWaiting;
+        fixture.Job.Workspaces.Clear();
+        fixture.Job.ThreadId = null;
+        fixture.Job.WorkerRetryLastSummary = "Canonical checkout is dirty: C:\\repo";
+        fixture.Processes.Responder = call => call.Arguments.Contains("command", StringComparer.Ordinal)
+            ? new ExecResult(0, "{\"success\":true}", "")
+            : new ExecResult(0, "", "");
+
+        await fixture.ReleaseLegacyCheckoutAdmissionRetriesAsync();
+
+        Assert.Equal(JobPhases.Done, fixture.Job.Phase);
+        Assert.Contains(fixture.Processes.Commands, command => command.IsStatus("Next"));
+        Assert.DoesNotContain(fixture.Processes.Commands, command => command.Executable == "codex");
     }
 
     [Fact]
@@ -627,6 +675,19 @@ public sealed class WorkerHostMonitoringTests
         {
             var method = typeof(WorkerHost).GetMethod("TickAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
             return await (Task<FreshClaimOutcome>)method.Invoke(Host, [CancellationToken.None, true, true])!;
+        }
+
+        public void CreateCanonicalRepository(string repository)
+        {
+            var path = Path.Combine(directory.Path, repository);
+            Directory.CreateDirectory(path);
+            Directory.CreateDirectory(Path.Combine(path, ".git"));
+        }
+
+        public async Task ReleaseLegacyCheckoutAdmissionRetriesAsync()
+        {
+            var method = typeof(WorkerHost).GetMethod("ReleaseLegacyCheckoutAdmissionRetriesAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            await (Task)method.Invoke(Host, [CancellationToken.None])!;
         }
 
         public async Task ContinueAsync()

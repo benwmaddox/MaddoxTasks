@@ -538,6 +538,55 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
+    public void ClaimNext_ExcludesUnavailableRepositoryAndFallsThrough()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(DateTime.UtcNow));
+        var occupied = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Occupied", null, Priority.From(1), null, null)).IssueId);
+        var available = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Available", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(occupied, "repo:occupied")).Success);
+        Assert.True(engine.Execute(new AddLabel(available, "repo:available")).Success);
+
+        var claim = engine.ClaimNext(excludedRepositories: ["OCCUPIED"]);
+
+        Assert.Equal(available, claim!.Issue.Id);
+        Assert.Equal(Status.Next, engine.GetState().Issues[occupied].Status);
+    }
+
+    [Fact]
+    public void ClaimNext_ExcludingAnyRepositorySkipsMultiRepositoryTask()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(DateTime.UtcNow));
+        var multi = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Multi", null, Priority.From(1), null, null)).IssueId);
+        var fallback = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Fallback", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(multi, "repo:first")).Success);
+        Assert.True(engine.Execute(new AddLabel(multi, "repo:second")).Success);
+        Assert.True(engine.Execute(new AddLabel(fallback, "repo:fallback")).Success);
+
+        var claim = engine.ClaimNext(excludedRepositories: ["second"]);
+
+        Assert.Equal(fallback, claim!.Issue.Id);
+        Assert.Equal(Status.Next, engine.GetState().Issues[multi].Status);
+    }
+
+    [Fact]
+    public void ClaimNext_ExpectedIssueMismatchDoesNotClaimAnotherTask()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(DateTime.UtcNow));
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First", null, Priority.From(1), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second", null, Priority.From(2), null, null)).IssueId);
+
+        Assert.Null(engine.ClaimNext(expectedIssueId: second));
+        Assert.Equal(Status.Next, engine.GetState().Issues[first].Status);
+        Assert.Equal(Status.Next, engine.GetState().Issues[second].Status);
+    }
+
+    [Fact]
     public void HierarchicalIssues_HandlesCyclicAndMissingParentsDeterministically()
     {
         var start = new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc);
