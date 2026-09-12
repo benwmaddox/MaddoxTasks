@@ -325,9 +325,22 @@ public static partial class AgentRunner
         return JsonSerializer.Serialize(dto, PrettyJsonContext.AgentIssueDto);
     }
 
-    public static string GetClaimJson(IssueEngine engine, bool dryRun = false)
+    public static string GetClaimJson(
+        IssueEngine engine,
+        bool dryRun = false,
+        IEnumerable<string>? excludedRepositories = null,
+        string? expectedIssueId = null)
     {
-        var view = engine.ClaimNext(dryRun);
+        IssueId? expected = null;
+        if (!string.IsNullOrWhiteSpace(expectedIssueId))
+        {
+            if (!engine.GetState().TryResolveIssueToken(expectedIssueId, out var resolved, out _))
+            {
+                return "null";
+            }
+            expected = resolved;
+        }
+        var view = engine.ClaimNext(dryRun, excludedRepositories, expected);
         if (view is null)
         {
             return "null";

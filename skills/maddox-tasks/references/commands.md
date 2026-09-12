@@ -35,6 +35,17 @@ Read-only preview:
 .\MaddoxTasks.exe agent claim --dry-run
 ```
 
+Worker admission may exclude locally occupied repositories and condition the real
+claim on the exact previewed issue:
+
+```powershell
+.\MaddoxTasks.exe agent claim --dry-run --exclude-repository stasislang
+.\MaddoxTasks.exe agent claim --expected-issue-id 551e912f --exclude-repository stasislang
+```
+
+`--exclude-repository` is repeatable. If the expected issue is no longer the next
+eligible candidate, the command returns `null` without claiming a replacement task.
+
 Real claim:
 
 ```powershell

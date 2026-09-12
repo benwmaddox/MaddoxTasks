@@ -328,8 +328,14 @@ public sealed class IssueEngine
     public ResearchCompletionResult CompleteResearch(IssueId issueId, bool dryRun = false, Status completionStatus = Status.Next)
         => TryCompleteResearch(issueId, dryRun, completionStatus);
 
-    public IssueView? ClaimNext(bool dryRun = false)
+    public IssueView? ClaimNext(
+        bool dryRun = false,
+        IEnumerable<string>? excludedRepositories = null,
+        IssueId? expectedIssueId = null)
     {
+        var excludedReservationKeys = (excludedRepositories ?? [])
+            .Select(RepositoryLabels.Normalize)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         return _eventStore.ExecuteAtomic(events =>
             {
                 var now = NormalizeUtc(_clock.UtcNow);
@@ -363,9 +369,11 @@ public sealed class IssueEngine
                 var candidate = state.SelectHierarchical(
                     issue => issue.Status == Status.Next &&
                              !RepositoryLabels.GetReservationKeys(issue.Repositories)
-                                 .Any(activeReservationKeys.Contains));
+                                 .Any(activeReservationKeys.Contains) &&
+                             !RepositoryLabels.GetReservationKeys(issue.Repositories)
+                                 .Any(excludedReservationKeys.Contains));
 
-                if (candidate is null)
+                if (candidate is null || (expectedIssueId is { } expected && candidate.Id != expected))
                 {
                     return new EventStoreOperation<IssueView?>(dryRun ? [] : cleanupEvents, null);
                 }
