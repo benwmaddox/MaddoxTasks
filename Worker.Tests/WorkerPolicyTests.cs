@@ -48,13 +48,13 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
-    public void ShippedWorkerConfig_UsesSolWithMediumReasoningByDefault()
+    public void ShippedWorkerConfig_UsesLunaWithMaxReasoningByDefault()
     {
         var configPath = FindWorkerAsset("worker.json");
         using var config = JsonDocument.Parse(File.ReadAllText(configPath));
 
-        Assert.Equal("gpt-5.6-sol", config.RootElement.GetProperty("model").GetString());
-        Assert.Equal("medium", config.RootElement.GetProperty("reasoningEffort").GetString());
+        Assert.Equal("gpt-5.6-luna", config.RootElement.GetProperty("model").GetString());
+        Assert.Equal("max", config.RootElement.GetProperty("reasoningEffort").GetString());
         Assert.Equal("checkout", config.RootElement.GetProperty("workspaceMode").GetString());
     }
 
@@ -66,11 +66,12 @@ public sealed class WorkerPolicyTests
         Assert.Contains("Create sub-agents only when the task scope warrants independent execution or review", prompt);
         Assert.Contains("handle routine work directly", prompt);
         Assert.Contains("read and apply the applicable user-level AGENTS.md", prompt);
-        Assert.Contains("gpt-6-astra with low reasoning", prompt);
-        Assert.Contains("gpt-5.6-luna with max reasoning", prompt);
-        Assert.Contains("gpt-5.6-sol with medium reasoning", prompt);
-        Assert.Contains("Review delegated output", prompt);
-        Assert.Contains("escalate to a stronger model if stalled", prompt);
+        Assert.Contains("gpt-5.6-luna with max reasoning as the default and primary model", prompt);
+        Assert.Contains("genuinely challenging task", prompt);
+        Assert.Contains("focused sub-agent may use gpt-5.6-sol with medium reasoning", prompt);
+        Assert.Contains("bounded up-front planning pass may also use gpt-5.6-sol with medium reasoning", prompt);
+        Assert.Contains("Keep the primary implementation on Luna/max", prompt);
+        Assert.Contains("Review delegated output before relying on it", prompt);
     }
 
     [Fact]
