@@ -248,6 +248,24 @@ public sealed class WorkerPolicyTests
     }
 
     [Fact]
+    public void RecoveryPlanner_RetiresRetryWhoseLedgerWasAlreadyBlocked()
+    {
+        var retry = CreateJob();
+        retry.Phase = JobPhases.RepairRetryWaiting;
+        var monitoring = CreateJob();
+        monitoring.Task = monitoring.Task with { IssueId = "review-task" };
+        monitoring.Phase = JobPhases.Monitoring;
+        var statuses = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [retry.Task.IssueId] = "Blocked",
+            [monitoring.Task.IssueId] = "ReadyForReview"
+        };
+
+        Assert.Equal([retry], RecoveryPlanner.JobsSupersededByLedger(new Journal { Jobs = [retry, monitoring] }, statuses));
+        Assert.False(RecoveryPlanner.IsSupersededByLedger(monitoring, statuses));
+    }
+
+    [Fact]
     public void RecoveryPlanner_ResumesSessionsAndPersistedPublicationExplicitly()
     {
         var implementing = CreateJob(JobPhases.Implementing); implementing.ThreadId = "thread-1";
