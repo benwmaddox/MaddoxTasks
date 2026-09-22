@@ -135,12 +135,18 @@ public sealed class IssueEngine
                 if (duplicate is not null)
                     throw new CommandValidationException($"Repository '{duplicate}' may belong to only one split child.");
 
-                var requested = children.Select(child => child.Repository).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                var requested = children
+                    .SelectMany(child => CheckoutReservations.GetKeys(CheckoutIdentity.Canonical, [child.Repository]))
+                    .ToHashSet();
                 foreach (var reserved in state.OrderedIssues.Where(issue => issue.Id != parent.Id && issue.Status.HoldsRepositoryReservation()))
                 {
-                    var overlap = RepositoryLabels.GetReservationKeys(reserved.Repositories).FirstOrDefault(requested.Contains);
-                    if (overlap is not null)
-                        throw new CommandValidationException($"Cannot assign repository scope '{overlap}': it is already reserved by reserving issue {reserved.Id}.");
+                    var overlap = CheckoutReservations.GetKeys(reserved.Checkout, reserved.Repositories)
+                        .Where(requested.Contains)
+                        .Select(static key => (CheckoutReservationKey?)key)
+                        .FirstOrDefault();
+                    if (overlap is { } reservation)
+                        throw new CommandValidationException(
+                            $"Cannot assign repository scope '{reservation.Repository}' in checkout '{reservation.Checkout}': it is already reserved by reserving issue {reserved.Id}.");
                 }
 
                 var timestamp = NormalizeUtc(_clock.UtcNow);
@@ -226,11 +232,11 @@ public sealed class IssueEngine
             var state = IssueState.Replay(events);
             var activeReservationKeys = state.OrderedIssues
                 .Where(issue => issue.Status == Status.Active)
-                .SelectMany(issue => RepositoryLabels.GetReservationKeys(issue.Repositories))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                .SelectMany(issue => CheckoutReservations.GetKeys(issue.Checkout, issue.Repositories))
+                .ToHashSet();
             var candidate = state.HierarchicalIssues()
                 .FirstOrDefault(issue =>
-                    !RepositoryLabels.GetReservationKeys(issue.Repositories).Any(activeReservationKeys.Contains)
+                    !CheckoutReservations.GetKeys(issue.Checkout, issue.Repositories).Any(activeReservationKeys.Contains)
                     && ResearchClaimPolicy.IsEligible(issue, events, now));
 
             if (candidate is null)
@@ -267,7 +273,7 @@ public sealed class IssueEngine
                     dryRun,
                     new IssueView(state.GetSequence(candidate.Id), candidate),
                     ResearchClaimPolicy.LatestAttemptUtc(candidate)));
-            });
+        });
     }
 
     /// <summary>
@@ -331,7 +337,8 @@ public sealed class IssueEngine
     public IssueView? ClaimNext(
         bool dryRun = false,
         IEnumerable<string>? excludedRepositories = null,
-        IssueId? expectedIssueId = null)
+        IssueId? expectedIssueId = null,
+        bool dedicatedWorktree = false)
     {
         var excludedReservationKeys = (excludedRepositories ?? [])
             .Select(RepositoryLabels.Normalize)
@@ -363,12 +370,12 @@ public sealed class IssueEngine
 
                 var activeReservationKeys = state.OrderedIssues
                     .Where(issue => issue.Status.HoldsRepositoryReservation())
-                    .SelectMany(issue => RepositoryLabels.GetReservationKeys(issue.Repositories))
-                    .ToHashSet(StringComparer.OrdinalIgnoreCase);
+                    .SelectMany(issue => CheckoutReservations.GetKeys(issue.Checkout, issue.Repositories))
+                    .ToHashSet();
 
                 var candidate = state.SelectHierarchical(
                     issue => issue.Status == Status.Next &&
-                             !RepositoryLabels.GetReservationKeys(issue.Repositories)
+                             !CheckoutReservations.GetKeys(CheckoutForClaim(issue, dedicatedWorktree), issue.Repositories)
                                  .Any(activeReservationKeys.Contains) &&
                              !RepositoryLabels.GetReservationKeys(issue.Repositories)
                                  .Any(excludedReservationKeys.Contains));
@@ -378,20 +385,40 @@ public sealed class IssueEngine
                     return new EventStoreOperation<IssueView?>(dryRun ? [] : cleanupEvents, null);
                 }
 
-                var plannedEvent = new StatusChanged(
+                var plannedEvents = new List<IssueEvent>();
+                var intendedCheckout = CheckoutForClaim(candidate, dedicatedWorktree);
+                if (!string.Equals(candidate.Checkout, intendedCheckout, StringComparison.Ordinal))
+                {
+                    var checkoutEvent = new CheckoutSet(Guid.NewGuid(), candidate.Id, now, intendedCheckout);
+                    candidate.Apply(checkoutEvent);
+                    plannedEvents.Add(checkoutEvent);
+                }
+
+                var statusEvent = new StatusChanged(
                     Guid.NewGuid(),
                     candidate.Id,
                     now,
                     Status.Active);
+                plannedEvents.Add(statusEvent);
                 if (!dryRun)
                 {
-                    candidate.Apply(plannedEvent);
+                    candidate.Apply(statusEvent);
                 }
 
                 return new EventStoreOperation<IssueView?>(
-                    dryRun ? [] : [.. cleanupEvents, plannedEvent],
+                    dryRun ? [] : [.. cleanupEvents, .. plannedEvents],
                     new IssueView(state.GetSequence(candidate.Id), candidate));
             });
+    }
+
+    private static string CheckoutForClaim(Issue issue, bool dedicatedWorktree)
+    {
+        if (!dedicatedWorktree || issue.Repositories.Count == 0)
+        {
+            return CheckoutIdentity.Canonical;
+        }
+
+        return CheckoutIdentity.ForIssue(issue.Id);
     }
 
     private static bool HasCurrentCodexReservation(Issue issue, IReadOnlyList<IssueEvent> events)

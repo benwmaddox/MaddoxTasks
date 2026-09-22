@@ -40,6 +40,8 @@ internal static class WebEndpoints
 
         app.MapMethods("/api/issues/{token}/status", ["PATCH", "PUT", "POST"],
             context => ChangeStatusAsync(context, engine));
+        app.MapMethods("/api/issues/{token}/checkout", ["PATCH", "PUT", "POST"],
+            context => SetCheckoutAsync(context, engine));
         app.MapMethods("/api/issues/{token}/priority", ["PATCH", "PUT", "POST"],
             context => ChangePriorityAsync(context, engine));
         app.MapMethods("/api/issues/{token}/description", ["PATCH", "PUT", "POST"],
@@ -137,6 +139,7 @@ internal static class WebEndpoints
             {
                 writer.WriteStartObject();
                 writer.WriteString("repository", item.Repository);
+                writer.WriteString("checkout", item.View.Issue.Checkout);
                 writer.WriteNumber("sequence", item.View.Sequence);
                 writer.WriteString("issueId", item.View.Issue.Id.ToString());
                 writer.WriteString("shortId", item.View.ShortId);
@@ -263,6 +266,23 @@ internal static class WebEndpoints
             }
 
             var result = engine.Execute(new ChangeStatus(issueId, status));
+            await WriteCommandResult(context, result, engine);
+        });
+    }
+
+    private static async Task SetCheckoutAsync(HttpContext context, IssueEngine engine)
+    {
+        var token = GetRouteValue(context, "token");
+        if (!TryResolveIssue(engine, token, out var issueId, out var error))
+        {
+            await WriteError(context, StatusCodes.Status404NotFound, error);
+            return;
+        }
+
+        await HandleJson(context, async root =>
+        {
+            var checkout = GetStringPayload(root, "checkout", "value");
+            var result = engine.Execute(new SetCheckout(issueId, checkout));
             await WriteCommandResult(context, result, engine);
         });
     }
@@ -658,6 +678,7 @@ internal static class WebEndpoints
         writer.WriteString("title", issue.Title);
         writer.WriteString("status", issue.Status.ToString());
         writer.WriteString("statusLabel", issue.Status.ToDisplayString());
+        writer.WriteString("checkout", issue.Checkout);
         writer.WriteNumber("priority", issue.Priority.Value);
         if (issue.ParentId.HasValue)
         {
@@ -746,6 +767,9 @@ internal static class WebEndpoints
                 break;
             case LabelRemoved labelRemoved:
                 writer.WriteString("label", labelRemoved.Label);
+                break;
+            case CheckoutSet checkoutSet:
+                writer.WriteString("checkout", checkoutSet.Checkout);
                 break;
             case DescriptionUpdated descriptionUpdated:
                 writer.WriteString("description", descriptionUpdated.Description);

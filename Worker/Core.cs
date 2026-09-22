@@ -105,6 +105,7 @@ public sealed class ConfigState
 public sealed record TaskCommentDto(DateTime Timestamp, string Comment, string Actor);
 public sealed record TaskDto(int Sequence, string IssueId, string Title, string Description, string[] Repositories)
 {
+    public string Checkout { get; init; } = "canonical";
     public TaskCommentDto[] Comments { get; init; } = [];
     public DateTime UpdatedAt { get; init; }
 }

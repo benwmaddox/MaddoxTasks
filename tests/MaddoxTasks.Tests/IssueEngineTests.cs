@@ -325,6 +325,148 @@ public sealed class IssueEngineTests
     }
 
     [Fact]
+    public void ClaimNext_DedicatedWorktreesAreDisjointFromCanonicalAndEachOther()
+    {
+        var now = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(now));
+        IssueId CreateSharedRepositoryIssue(string title)
+        {
+            var issueId = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+                new CreateIssue(title, null, Priority.From(2), null, null)).IssueId);
+            Assert.True(engine.Execute(new AddLabel(issueId, "repo:shared")).Success);
+            return issueId;
+        }
+
+        var canonical = CreateSharedRepositoryIssue("Canonical");
+        var firstWorktree = CreateSharedRepositoryIssue("First worktree");
+        var secondWorktree = CreateSharedRepositoryIssue("Second worktree");
+        Assert.True(engine.Execute(new ChangeStatus(canonical, Status.Active)).Success);
+
+        var firstClaim = engine.ClaimNext(dedicatedWorktree: true);
+        var secondClaim = engine.ClaimNext(dedicatedWorktree: true);
+
+        Assert.NotNull(firstClaim);
+        Assert.NotNull(secondClaim);
+        Assert.Equal(firstWorktree, firstClaim!.Issue.Id);
+        Assert.Equal(secondWorktree, secondClaim!.Issue.Id);
+        Assert.Equal(CheckoutIdentity.ForIssue(firstWorktree), firstClaim.Issue.Checkout);
+        Assert.Equal(CheckoutIdentity.ForIssue(secondWorktree), secondClaim.Issue.Checkout);
+        Assert.NotEqual(firstClaim.Issue.Checkout, secondClaim.Issue.Checkout);
+        Assert.Equal(CheckoutIdentity.Canonical, engine.GetState().Issues[canonical].Checkout);
+        Assert.Null(engine.ClaimNext(dedicatedWorktree: true));
+    }
+
+    [Fact]
+    public void ClaimNext_DedicatedWorktreeDryRunReportsCheckoutWithoutWriting()
+    {
+        var store = new InMemoryEventStore();
+        var engine = new IssueEngine(store, new FrozenClock(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc)));
+        var issueId = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Preview", null, Priority.From(1), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:preview")).Success);
+        var eventCount = store.LoadAll().Count;
+
+        var preview = engine.ClaimNext(dryRun: true, dedicatedWorktree: true);
+
+        Assert.NotNull(preview);
+        Assert.Equal(CheckoutIdentity.ForIssue(issueId), preview!.Issue.Checkout);
+        Assert.Equal(Status.Next, preview.Issue.Status);
+        Assert.Equal(eventCount, store.LoadAll().Count);
+        Assert.Equal(CheckoutIdentity.Canonical, engine.GetState().Issues[issueId].Checkout);
+    }
+
+    [Fact]
+    public void ClaimNext_RepositorylessWorktreeModeUsesCanonicalCheckout()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc)));
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First missing scope", null, Priority.From(1), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second missing scope", null, Priority.From(2), null, null)).IssueId);
+        Assert.NotNull(engine.ClaimNext());
+
+        Assert.Null(engine.ClaimNext(dedicatedWorktree: true));
+        Assert.True(engine.Execute(new ChangeStatus(first, Status.Blocked)).Success);
+
+        var secondClaim = engine.ClaimNext(dedicatedWorktree: true);
+
+        Assert.NotNull(secondClaim);
+        Assert.Equal(second, secondClaim!.Issue.Id);
+        Assert.Equal(CheckoutIdentity.Canonical, secondClaim.Issue.Checkout);
+        Assert.DoesNotContain(engine.GetEventLog().OfType<CheckoutSet>(), checkout => checkout.IssueId == second);
+    }
+
+    [Fact]
+    public void ManualStatusChange_TwoTasksWithSameWorktreeCheckoutCannotShareRepository()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc)));
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First", null, Priority.From(1), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second", null, Priority.From(2), null, null)).IssueId);
+        foreach (var issueId in new[] { first, second })
+        {
+            Assert.True(engine.Execute(new AddLabel(issueId, "repo:shared")).Success);
+            Assert.True(engine.Execute(new SetCheckout(issueId, "WORKTREE:shared")).Success);
+        }
+
+        Assert.True(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
+        var secondActivation = engine.Execute(new ChangeStatus(second, Status.Active));
+
+        Assert.False(secondActivation.Success);
+        Assert.Contains("worktree:shared", secondActivation.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(Status.Next, engine.GetState().Issues[second].Status);
+    }
+
+    [Fact]
+    public void ManualRepositoryAndCheckoutChangesEnforceCompositeReservations()
+    {
+        var engine = new IssueEngine(new InMemoryEventStore(), new FrozenClock(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc)));
+        var canonicalOwner = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Canonical owner", null, Priority.From(1), null, null)).IssueId);
+        var target = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Target", null, Priority.From(2), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(canonicalOwner, "repo:busy")).Success);
+        Assert.True(engine.Execute(new AddLabel(target, "repo:free")).Success);
+        Assert.True(engine.Execute(new ChangeStatus(canonicalOwner, Status.Active)).Success);
+        Assert.True(engine.Execute(new ChangeStatus(target, Status.Active)).Success);
+
+        var repositoryConflict = engine.Execute(new SetRepositoryLabels(target, ["busy"]));
+        Assert.False(repositoryConflict.Success);
+        Assert.Equal(["free"], engine.GetState().Issues[target].Repositories);
+
+        Assert.True(engine.Execute(new SetCheckout(target, "WORKTREE:target")).Success);
+        Assert.True(engine.Execute(new SetRepositoryLabels(target, ["busy"])).Success);
+        var checkoutConflict = engine.Execute(new SetCheckout(target, CheckoutIdentity.Canonical));
+
+        Assert.False(checkoutConflict.Success);
+        Assert.Contains("checkout 'canonical'", checkoutConflict.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("worktree:target", engine.GetState().Issues[target].Checkout);
+        Assert.Equal(["busy"], engine.GetState().Issues[target].Repositories);
+    }
+
+    [Fact]
+    public void LegacyIssueEventsDefaultToCanonicalCheckout()
+    {
+        var store = new InMemoryEventStore();
+        var issueId = IssueId.New();
+        store.Append(new IssueCreated(
+            Guid.NewGuid(),
+            issueId,
+            new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc),
+            "Legacy",
+            null,
+            Status.Active,
+            Priority.From(3),
+            null,
+            null));
+
+        var issue = IssueState.Replay(store.LoadAll()).Issues[issueId];
+
+        Assert.Equal(CheckoutIdentity.Canonical, issue.Checkout);
+    }
+
+    [Fact]
     public void RemovingLastRepositoryMovesActiveIssueToMissingReservationWhenAvailable()
     {
         var clock = new FrozenClock(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));

@@ -17,6 +17,7 @@ public static class CommandPlanner
             AddLabel addLabel => PlanLabelAdd(addLabel, state, timestamp),
             RemoveLabel removeLabel => PlanLabelRemove(removeLabel, state, timestamp),
             SetRepositoryLabels setRepositoryLabels => PlanRepositoryLabelsSet(setRepositoryLabels, state, timestamp),
+            SetCheckout setCheckout => PlanCheckoutSet(setCheckout, state, timestamp),
             UpdateDescription updateDescription => PlanDescriptionUpdate(updateDescription, state, timestamp),
             AddComment addComment => PlanCommentAdd(addComment, state, timestamp),
             _ => throw new CommandValidationException($"Unsupported command '{command.GetType().Name}'.")
@@ -37,6 +38,32 @@ public static class CommandPlanner
             throw new CommandValidationException("Repositories must be names without the 'repo:' prefix.");
         if (issue.Status.HoldsRepositoryReservation()) ValidateActiveReservation(issue, repositories, state);
         return new RepositoryLabelsSet(Guid.NewGuid(), command.IssueId, timestamp, repositories);
+    }
+
+    private static IssueEvent PlanCheckoutSet(SetCheckout command, IssueState state, DateTime timestamp)
+    {
+        var issue = RequireIssue(command.IssueId, state);
+        string checkout;
+        try
+        {
+            checkout = CheckoutIdentity.Normalize(command.Checkout);
+        }
+        catch (ArgumentException exception)
+        {
+            throw new CommandValidationException(exception.Message);
+        }
+
+        if (string.Equals(issue.Checkout, checkout, StringComparison.Ordinal))
+        {
+            throw new CommandValidationException($"Issue {command.IssueId} already uses checkout '{checkout}'.");
+        }
+
+        if (issue.Status.HoldsRepositoryReservation())
+        {
+            ValidateActiveReservation(issue, issue.Repositories, state, checkout);
+        }
+
+        return new CheckoutSet(Guid.NewGuid(), command.IssueId, timestamp, checkout);
     }
 
     private static IssueEvent PlanCreate(CreateIssue command, IssueState state, DateTime timestamp)
@@ -177,22 +204,28 @@ public static class CommandPlanner
         return issue;
     }
 
-    private static void ValidateActiveReservation(Issue issue, IEnumerable<string> repositories, IssueState state)
+    private static void ValidateActiveReservation(
+        Issue issue,
+        IEnumerable<string> repositories,
+        IssueState state,
+        string? checkout = null)
     {
-        var reservationKeys = RepositoryLabels.GetReservationKeys(repositories);
+        var reservationKeys = CheckoutReservations.GetKeys(checkout ?? issue.Checkout, repositories);
 
         foreach (var activeIssue in state.Issues.Values
                      .Where(candidate => candidate.Id != issue.Id && candidate.Status.HoldsRepositoryReservation())
                      .OrderBy(candidate => state.GetSequence(candidate.Id)))
         {
             var overlap = reservationKeys
-                .Intersect(RepositoryLabels.GetReservationKeys(activeIssue.Repositories), StringComparer.OrdinalIgnoreCase)
-                .OrderBy(static repository => repository, StringComparer.OrdinalIgnoreCase)
+                .Intersect(CheckoutReservations.GetKeys(activeIssue.Checkout, activeIssue.Repositories))
+                .OrderBy(static key => key.Checkout, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(static key => key.Repository, StringComparer.OrdinalIgnoreCase)
+                .Select(static key => (CheckoutReservationKey?)key)
                 .FirstOrDefault();
-            if (overlap is not null)
+            if (overlap is { } reservation)
             {
                 throw new CommandValidationException(
-                    $"Cannot reserve repository scope '{overlap}': it is already reserved by reserving issue {activeIssue.Id}.");
+                    $"Cannot reserve repository scope '{reservation.Repository}' in checkout '{reservation.Checkout}': it is already reserved by reserving issue {activeIssue.Id}.");
             }
         }
     }

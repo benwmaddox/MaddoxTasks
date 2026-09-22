@@ -167,7 +167,7 @@ internal static class WebAssets
     <header class="topbar">
       <div class="brand"><span class="brand-mark" aria-hidden="true"></span><h1>MaddoxTasks</h1></div>
       <div class="top-actions">
-        <button id="locks-button" type="button">Repository locks</button>
+        <button id="locks-button" type="button">Checkout reservations</button>
         <button id="refresh-button" class="icon" type="button" title="Refresh (r)" aria-label="Refresh">↻</button>
         <button id="help-button" class="icon" type="button" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
         <button id="new-button" class="primary" type="button">New issue</button>
@@ -229,8 +229,8 @@ internal static class WebAssets
   </div>
   <div id="locks-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="locks-heading">
     <section class="panel">
-      <div class="modal-header"><h2 id="locks-heading">Repository locks</h2><button class="icon subtle" type="button" data-close="locks-overlay" aria-label="Close">×</button></div>
-      <div id="locks-body" class="modal-body"><div class="muted">Loading repository locks...</div></div>
+      <div class="modal-header"><h2 id="locks-heading">Checkout reservations</h2><button class="icon subtle" type="button" data-close="locks-overlay" aria-label="Close">×</button></div>
+      <div id="locks-body" class="modal-body"><div class="muted">Loading checkout reservations...</div></div>
     </section>
   </div>
   <div id="toast" class="hidden" role="status" aria-live="polite"></div>
@@ -489,7 +489,10 @@ internal static class WebAssets
       const due = issue.dueDate ? ` · due ${escapeHtml(new Date(issue.dueDate).toLocaleString())}` : '';
       byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><button type="button" id="close-detail">Close</button></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)}${parent}${due} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div><div class="section">${comments}</div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
       byId('close-detail').onclick = () => closeOverlay('detail-overlay');
+      byId('repository-label-help').textContent = 'Use repo:<name> to identify a repository; the checkout above controls its reservation.';
+      byId('edit-status').closest('.form-grid').insertAdjacentHTML('beforeend', `<label class="full">Checkout <input id="edit-checkout" value="${escapeHtml(issue.checkout || 'canonical')}" aria-describedby="checkout-help"></label><div id="checkout-help" class="muted full">Use canonical or worktree:&lt;stable-id&gt;; tasks for the same repository cannot share a reserved checkout.</div>`);
       byId('edit-status').onchange = event => mutateStatus(event.target.value);
+      byId('edit-checkout').onchange = event => mutateCheckout(event.target.value);
       byId('edit-priority').onchange = event => mutatePriority(Number(event.target.value));
       byId('save-description').onclick = () => mutateDescription(byId('edit-description').value);
       byId('add-label').onclick = addLabel;
@@ -499,6 +502,7 @@ internal static class WebAssets
     }
     function historyText(item) {
       if (item.status) return 'Status → ' + statusLabel(item.status);
+      if (item.checkout) return 'Checkout → ' + item.checkout;
       if (item.priority) return 'Priority → ' + item.priority;
       if (item.label) return item.eventType === 'LabelAdded' ? 'Added label ' + item.label : 'Removed label ' + item.label;
       if (item.comment) return item.comment;
@@ -507,6 +511,10 @@ internal static class WebAssets
     }
     async function mutateStatus(status) {
       try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/status`, { method: 'PATCH', body: JSON.stringify({ status }) }); showToast('Status updated.'); await refresh(true); }
+      catch (error) { showToast(error.message, 'error'); }
+    }
+    async function mutateCheckout(checkout) {
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/checkout`, { method: 'PATCH', body: JSON.stringify({ checkout }) }); showToast('Checkout updated.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
     async function mutatePriority(priority) {
@@ -534,11 +542,11 @@ internal static class WebAssets
     }
     async function openRepositoryLocks() {
       openOverlay('locks-overlay');
-      byId('locks-body').innerHTML = '<div class="muted">Loading repository locks...</div>';
+      byId('locks-body').innerHTML = '<div class="muted">Loading checkout reservations...</div>';
       try {
         const payload = await api('/api/repository-locks');
         const locks = payload.locks || [];
-        byId('locks-body').innerHTML = locks.length ? locks.map(lock => `<article class="lock-item"><div>${labelTag('repo:' + lock.repository)} <span class="priority p${lock.priority}">P${lock.priority}</span></div><strong>${escapeHtml(lock.shortId)} · ${escapeHtml(lock.title)}</strong><span class="status-chip ${statusClass(lock.status)}">${escapeHtml(statusLabel(lock.status))}</span></article>`).join('') : '<div class="muted">No repositories are currently locked.</div>';
+        byId('locks-body').innerHTML = locks.length ? locks.map(lock => `<article class="lock-item"><div>${labelTag('repo:' + lock.repository)} <span class="muted">${escapeHtml(lock.checkout || 'canonical')}</span> <span class="priority p${lock.priority}">P${lock.priority}</span></div><strong>${escapeHtml(lock.shortId)} · ${escapeHtml(lock.title)}</strong><span class="status-chip ${statusClass(lock.status)}">${escapeHtml(statusLabel(lock.status))}</span></article>`).join('') : '<div class="muted">No checkouts are currently reserved.</div>';
       } catch (error) {
         byId('locks-body').innerHTML = `<div class="alert" role="alert">${escapeHtml(error.message)}</div>`;
       }

@@ -238,6 +238,7 @@ public sealed class WebServerTests
             Assert.Equal(4, json.RootElement.GetProperty("count").GetInt32());
             Assert.Equal(["alpha", "beta", "missing", "zeta"],
                 locks.Select(item => item.GetProperty("repository").GetString()!).ToArray());
+            Assert.All(locks, item => Assert.Equal("canonical", item.GetProperty("checkout").GetString()));
             Assert.Equal([activeId, reviewId, missingId, activeId],
                 locks.Select(item => item.GetProperty("issueId").GetString()!).ToArray());
             Assert.Equal(["Active", "ReadyForReview", "Active", "Active"],
@@ -252,6 +253,52 @@ public sealed class WebServerTests
                 locks.Select(item => item.GetProperty("priority").GetInt32()).ToArray());
             Assert.DoesNotContain(locks, item => item.GetProperty("issueId").GetString() == ignoredId);
             Assert.DoesNotContain(locks, item => item.GetProperty("issueId").GetString() == blockedId);
+        }
+        finally
+        {
+            await app.StopAsync();
+            TryDelete(databasePath);
+            TryDelete(databasePath + "-shm");
+            TryDelete(databasePath + "-wal");
+        }
+    }
+
+    [Fact]
+    public async Task CheckoutAssignments_AllowParallelRepoWorkButRejectTheSameCheckout()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"MaddoxTasks-checkout-{Guid.NewGuid():N}.db");
+        using var app = WebServer.CreateApplication(databasePath, "127.0.0.1", 0, new FakeDraftGenerator());
+        using var client = new HttpClient();
+        try
+        {
+            await app.StartAsync();
+            client.BaseAddress = new Uri(app.Urls.Single().TrimEnd('/') + "/");
+
+            var canonical = await CreateIssueAsync(client, "Canonical task", priority: 2);
+            await AddLabelAsync(client, canonical, "repo:alpha");
+            await ChangeStatusAsync(client, canonical, "Active");
+
+            var worktree = await CreateIssueAsync(client, "Worktree task", priority: 2);
+            await AddLabelAsync(client, worktree, "repo:alpha");
+            await SetCheckoutAsync(client, worktree, "worktree:alpha-one");
+            await ChangeStatusAsync(client, worktree, "Active");
+
+            var conflict = await CreateIssueAsync(client, "Same worktree", priority: 2);
+            await AddLabelAsync(client, conflict, "repo:alpha");
+            await SetCheckoutAsync(client, conflict, "worktree:alpha-one");
+            using (var response = await client.SendAsync(new HttpRequestMessage(HttpMethod.Patch,
+                       $"api/issues/{conflict}/status") { Content = Json("{\"status\":\"Active\"}") }))
+            {
+                Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+            }
+
+            using var locksResponse = await client.GetAsync("api/repository-locks");
+            using var locksJson = JsonDocument.Parse(await locksResponse.Content.ReadAsStringAsync());
+            var locks = locksJson.RootElement.GetProperty("locks").EnumerateArray().ToArray();
+            Assert.Equal(2, locks.Length);
+            Assert.Equal(["canonical", "worktree:alpha-one"],
+                locks.Select(item => item.GetProperty("checkout").GetString()!).ToArray());
+            Assert.All(locks, item => Assert.Equal("alpha", item.GetProperty("repository").GetString()));
         }
         finally
         {
@@ -325,6 +372,13 @@ public sealed class WebServerTests
     {
         using var response = await client.SendAsync(new HttpRequestMessage(HttpMethod.Patch,
             $"api/issues/{issueId}/status") { Content = Json($$"""{"status":"{{status}}"}""") });
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    private static async Task SetCheckoutAsync(HttpClient client, string issueId, string checkout)
+    {
+        using var response = await client.SendAsync(new HttpRequestMessage(HttpMethod.Patch,
+            $"api/issues/{issueId}/checkout") { Content = Json($$"""{"checkout":"{{checkout}}"}""") });
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
     }
 
