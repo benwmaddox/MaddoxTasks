@@ -84,6 +84,25 @@ public sealed class WorkerHostMonitoringTests
     }
 
     [Fact]
+    public async Task WorktreeMode_ClaimsADedicatedCheckout()
+    {
+        using var fixture = HostFixture.CreateWorktreeMode(Snapshot(false));
+        var task = new TaskDto(42, Guid.NewGuid().ToString(), "Claimed", "Description", ["Repo"]);
+        fixture.Processes.Responder = call => call.Arguments.Length >= 2 && call.Arguments[0] == "agent" && call.Arguments[1] == "claim"
+            ? new ExecResult(0, JsonSerializer.Serialize(task), "")
+            : call.Arguments.Contains("command", StringComparer.Ordinal)
+                ? new ExecResult(0, "{\"success\":true}", "")
+                : new ExecResult(0, "", "");
+
+        await fixture.TickAsync();
+
+        Assert.Contains(fixture.Processes.Commands, command =>
+            command.Arguments.SequenceEqual(["agent", "claim", "--dedicated-worktree"]));
+        Assert.DoesNotContain(fixture.Processes.Commands, command =>
+            command.Arguments.SequenceEqual(["agent", "claim"]));
+    }
+
+    [Fact]
     public async Task DirtyCanonicalCheckout_IsExcludedBeforeAnotherRepositoryIsClaimed()
     {
         using var fixture = HostFixture.Create(autoMergeAllowed: false, Snapshot(false));
@@ -981,7 +1000,7 @@ public sealed class WorkerHostMonitoringTests
     {
         private readonly TemporaryDirectory directory = new();
 
-        private HostFixture(bool autoMergeAllowed, DateTime? unavailableUntilUtc, params PullRequestSnapshot[] snapshots)
+        private HostFixture(bool autoMergeAllowed, DateTime? unavailableUntilUtc, bool useWorktrees, params PullRequestSnapshot[] snapshots)
         {
             var configPath = Path.Combine(directory.Path, "worker.json");
             var statePath = Path.Combine(directory.Path, "state");
@@ -1008,7 +1027,8 @@ public sealed class WorkerHostMonitoringTests
                 codexExe = "codex",
                 ghExe = "gh",
                 repoRoot = directory.Path,
-                worktreeRoot = Path.Combine(directory.Path, "worktrees")
+                worktreeRoot = Path.Combine(directory.Path, "worktrees"),
+                workspaceMode = useWorktrees ? "worktree" : "checkout"
             }));
 
             Clock = new MutableClock(new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc));
@@ -1044,10 +1064,13 @@ public sealed class WorkerHostMonitoringTests
         public TimeSpan QuietPeriod { get; }
 
         public static HostFixture Create(bool autoMergeAllowed, params PullRequestSnapshot[] snapshots)
-            => new(autoMergeAllowed, null, snapshots);
+            => new(autoMergeAllowed, null, false, snapshots);
+
+        public static HostFixture CreateWorktreeMode(params PullRequestSnapshot[] snapshots)
+            => new(false, null, true, snapshots);
 
         public static HostFixture CreateThrottled(DateTime unavailableUntilUtc)
-            => new(false, unavailableUntilUtc, Snapshot(false));
+            => new(false, unavailableUntilUtc, false, Snapshot(false));
 
         public async Task MonitorAsync()
         {

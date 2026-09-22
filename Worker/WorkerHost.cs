@@ -189,7 +189,7 @@ public sealed class WorkerHost
                 await AddCommentAsync(job, ReservationAttribution.Pending, ct);
                 job.ReservationOwnerRecorded = true;
                 Save(job);
-                log.Write("info", "job.claimed", new { task.Sequence, task.Title, task.Repositories, adoptedBlockedWorkspace = adopted });
+                log.Write("info", "job.claimed", new { task.Sequence, task.Title, task.Repositories, task.Checkout, adoptedBlockedWorkspace = adopted });
             }
             catch { capacity.Release(); throw; }
             if (mode == RecoveryMode.Monitoring)
@@ -206,7 +206,7 @@ public sealed class WorkerHost
 
     private async Task<ExecResult> ClaimLocallyAvailableAsync(WorkerConfig settings, CancellationToken ct)
     {
-        if (settings.UseWorktrees) return await RunMaddoxCommandAsync(["claim"], ct);
+        if (settings.UseWorktrees) return await RunMaddoxCommandAsync(["claim", "--dedicated-worktree"], ct);
 
         await AuditCanonicalContentionBeforeClaimAsync(settings, ct);
 

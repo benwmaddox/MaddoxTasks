@@ -113,6 +113,48 @@ public sealed class AgentRunnerTests
         Assert.Contains("keep", updatedIssue.GetProperty("labels").EnumerateArray().Select(x => x.GetString()!));
         Assert.Contains("keep", engine.GetState().Issues[target].Labels);
     }
+
+    [Fact]
+    public void SetCheckout_NormalizesValidWorktreeAndRejectsAmbiguousIdentity()
+    {
+        var now = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), new FrozenClockForAgentTests(now));
+        var issueId = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Checkout target", null, Priority.From(2), null, null)).IssueId);
+
+        using var applied = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SetCheckout","issueId":"{{issueId}}","checkout":" WORKTREE:Feature-42 "}"""));
+        Assert.True(applied.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal("worktree:feature-42", applied.RootElement.GetProperty("checkout").GetString());
+        Assert.Equal("worktree:feature-42", applied.RootElement.GetProperty("issue").GetProperty("checkout").GetString());
+
+        using var issueList = JsonDocument.Parse(AgentRunner.GetIssuesJson(engine, null, includeDone: true));
+        Assert.Equal("worktree:feature-42", issueList.RootElement[0].GetProperty("checkout").GetString());
+
+        var eventCount = engine.GetEventLog().Count;
+        using var rejected = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(engine,
+            $$"""{"type":"SetCheckout","issueId":"{{issueId}}","checkout":"worktree:../escape"}"""));
+        Assert.False(rejected.RootElement.GetProperty("success").GetBoolean());
+        Assert.Equal(eventCount, engine.GetEventLog().Count);
+        Assert.Equal("worktree:feature-42", engine.GetState().Issues[issueId].Checkout);
+    }
+
+    [Fact]
+    public void GetClaimJson_DedicatedWorktreeReportsStableCheckout()
+    {
+        var now = new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc);
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), new FrozenClockForAgentTests(now));
+        var issueId = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Claim in worktree", null, Priority.From(1), null, null)).IssueId);
+        Assert.True(engine.Execute(new AddLabel(issueId, "repo:claim")).Success);
+
+        using var response = JsonDocument.Parse(AgentRunner.GetClaimJson(engine, dedicatedWorktree: true));
+
+        Assert.Equal(issueId.ToString(), response.RootElement.GetProperty("issueId").GetString());
+        Assert.Equal($"worktree:{issueId}", response.RootElement.GetProperty("checkout").GetString());
+        Assert.Equal($"worktree:{issueId}", engine.GetState().Issues[issueId].Checkout);
+    }
+
     [Fact]
     public void ExecuteCommandJson_RequeueBlockedSerializesDedicatedStableResponse()
     {

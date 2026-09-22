@@ -10,7 +10,7 @@ Windows:
 .\MaddoxTasks.exe agent issues
 ```
 
-`agent next` remains a read-only compatibility command for selecting the next existing Active/Next task. Use `agent claim` for concurrent workers that need an atomic repository reservation.
+`agent next` remains a read-only compatibility command for selecting the next existing Active/Next task. Use `agent claim` for concurrent workers that need an atomic `(repository, checkout)` reservation.
 
 Linux/macOS:
 
@@ -27,12 +27,13 @@ Optional filters on `agent issues`:
 - `--due-before <yyyy-MM-dd or date-time>`
 - `--include-done <true|false>` (default is `true`; legacy option name that includes terminal `Done` and `Rejected` tasks)
 
-## Atomic Repository Claim
+## Atomic Checkout Reservation Claim
 
 Read-only preview:
 
 ```powershell
 .\MaddoxTasks.exe agent claim --dry-run
+.\MaddoxTasks.exe agent claim --dry-run --dedicated-worktree
 ```
 
 Worker admission may exclude locally occupied repositories and condition the real
@@ -50,9 +51,12 @@ Real claim:
 
 ```powershell
 .\MaddoxTasks.exe agent claim
+.\MaddoxTasks.exe agent claim --dedicated-worktree
 ```
 
-`agent claim` first resets stale Codex reservations and then atomically selects the first eligible `Next` issue using hierarchy order. A reset applies only to an `Active` issue with `UpdatedAt` at least 24 hours before the single normalized claim time (24 hours with no activity) and a current-period comment beginning exactly `Reservation owner: codexThreadId=` with a nonempty value, including `unavailable`. The current period begins at the latest `StatusChanged` to `Active`; older reservation comments do not qualify. Reset events and audit comments are ordered by issue sequence and persist even when no claim is available. Task families are ordered by top-level root priority and sequence. Each family is traversed child-first, with siblings ordered by priority and sequence; parents are considered after all descendants. For `agent next`, `Active` is only a tiebreaker among otherwise equal-priority siblings or roots; it never overrides descendant-before-ancestor traversal. A child uses only its own reservation keys, so a reserved parent does not block a disjoint child. A reserved child is skipped so a later claimable sibling can be selected. A family is exhausted before selection moves to the next family. The selected issue must not overlap an `Active` or `ReadyForReview` issue. A repository-less issue is eligible and uses the synthetic `missing` reservation key while its returned `repositories` array stays empty. It changes exactly that issue to `Active` and returns its issue JSON. It returns `null` when no claim is available. A scheduled runner should stop cleanly on `null`. `agent next` is read-only and selects the first `Active` or `Next` issue using the same hierarchy order. Missing and cyclic parent links are handled deterministically. `--dry-run` simulates stale cleanup and claim selection without appending events; the preview issue reports `Next`.
+In worktree mode the worker uses a stable per-task checkout ID. Within one repository, reuse a worktree ID only for the same physical checkout; it can be used independently in another repository.
+
+`agent claim` defaults to the `canonical` checkout. Pass `--dedicated-worktree` to request a distinct stable `worktree:<id>` checkout for a repository-backed issue; repository-less claims use `canonical` even with the flag. The claim output includes the selected issue's `checkout`, and dry-run reports the intended checkout without writing it. `agent claim` first resets stale Codex reservations and then atomically selects the first eligible `Next` issue using hierarchy order. A reset applies only to an `Active` issue with `UpdatedAt` at least 24 hours before the single normalized claim time (24 hours with no activity) and a current-period comment beginning exactly `Reservation owner: codexThreadId=` with a nonempty value, including `unavailable`. The current period begins at the latest `StatusChanged` to `Active`; older reservation comments do not qualify. Reset events and audit comments are ordered by issue sequence and persist even when no claim is available. Task families are ordered by top-level root priority and sequence. Each family is traversed child-first, with siblings ordered by priority and sequence; parents are considered after all descendants. For `agent next`, `Active` is only a tiebreaker among otherwise equal-priority siblings or roots; it never overrides descendant-before-ancestor traversal. A child uses only its own `(repository, checkout)` reservation keys, so a reserved parent does not block a child with disjoint keys. A reserved child is skipped so a later claimable sibling can be selected. A family is exhausted before selection moves to the next family. The selected issue must not share a `(repository, checkout)` pair with an `Active` or `ReadyForReview` issue. Repository labels continue to define repository identity; issues without a `repo:` label use the synthetic `missing` repository identity, paired with the checkout, while their returned `repositories` array stays empty. An explicit `repo:missing` label conflicts with that synthetic identity only in the same checkout. It changes exactly that issue to `Active` and returns its issue JSON. It returns `null` when no claim is available. A scheduled runner should stop cleanly on `null`. `agent next` is read-only and selects the first `Active` or `Next` issue using the same hierarchy order. Missing and cyclic parent links are handled deterministically. `--dry-run` simulates stale cleanup and claim selection without appending events; the preview issue reports `Next`.
 
 ## Blocked-task research claim
 
@@ -80,7 +84,7 @@ Agent JSON supports preview mode:
 The command selects at most one `Blocked` task in hierarchy priority/sequence order and writes its exact attempt
 marker atomically, so concurrent workers cannot claim the same task. A task's first blocked period waits 12 hours.
 Every later research attempt, and every second or later transition into `Blocked`, waits 14 days from the latest
-attempt or blocked transition. Tasks whose repository scope overlaps a current `Active` task are skipped.
+attempt or blocked transition. Tasks whose `(repository, checkout)` reservation keys overlap a current `Active` task are skipped.
 Preview writes no events. The worker's research Codex receives a
 read-only snapshot containing the selected task and current blocked-task context and may perform read-only web research, but all file, Git/GitHub, and external mutations
 are forbidden. A validated result may change only Maddox task entries (including creating tasks). After mutations and
@@ -92,7 +96,7 @@ for proven repository-owned migrations. New tasks always start in `Next`, are ca
 an enforced minimal-repair envelope covering allowed scope, exclusions, cheapest-first validation, and the stop
 condition. Larger proposed fan-outs are recorded as findings for human review instead of being applied.
 
-Repository labels are canonicalized as lowercase `repo:<name>` identities and compared case-insensitively. With no repository labels, Active and `ReadyForReview` tasks reserve the synthetic `missing` identity; an explicit `repo:missing` collides with it. Status and label changes are rejected when their resulting reservation keys conflict. The scheduled runner starts a repository-less claim from normalized `RepoRoot`, passes no `--add-dir`, and warns that no repository was specified and the impact scope is unknown.
+Repository labels are canonicalized as lowercase `repo:<name>` identities and remain the truthful repository identity; checkout is tracked separately as `canonical` or `worktree:<stable-id>`. Active and `ReadyForReview` tasks reserve each `(repository, checkout)` pair. With no repository labels, the synthetic repository identity `missing` is paired with the checkout and the public `repositories` array remains empty; an explicit `repo:missing` collides only in the same checkout. Status, label, and checkout changes are rejected when their resulting reservation pairs conflict. The scheduled runner starts a repository-less claim from normalized `RepoRoot`, passes no `--add-dir`, and warns that no repository was specified and the impact scope is unknown.
 
 The scheduled runner checks `ReadyForReview` tasks after work. Only canonical `https://github.com/<owner>/<repo>/pull/<number>` URLs in descriptions/comments are associated. It closes a task only when all associated PRs have non-null `mergedAt`; no-PR, open, closed-unmerged, and lookup-error tasks remain unchanged.
 
@@ -146,6 +150,7 @@ Supported `type` values (all available agent commands):
 - `AddLabel`
 - `RemoveLabel`
 - `SetRepositoryLabels`
+- `SetCheckout`
 - `SplitIssue`
 - `UpdateDescription`
 - `AddComment`
@@ -154,7 +159,7 @@ Supported `type` values (all available agent commands):
 
 `CompleteResearch` defaults to `Next`; the worker may pass `"completionStatus":"Done"` for a fully completed ledger-only research objective. Only `Next` and `Done` are accepted, and the source must still be `Blocked` with its durable research marker.
 
-Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels.
+Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels, and `checkout`. `agent claim` returns those fields with the claimed issue.
 
 ## Payload Schemas
 
@@ -235,7 +240,19 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
 }
 ```
 
-The nonempty repository list replaces only `repo:` labels. Values are normalized and deduplicated case-insensitively. Reservation conflicts are checked in the same event-store transaction, so failure leaves all labels unchanged. The success response includes the canonical `repositories` array.
+The nonempty repository list replaces only `repo:` labels. Values are normalized and deduplicated case-insensitively. Reservation conflicts are checked using the resulting `(repository, checkout)` pairs in the same event-store transaction, so failure leaves all labels unchanged. The success response includes the canonical `repositories` array.
+
+`SetCheckout`:
+
+```json
+{
+  "type": "SetCheckout",
+  "issueId": "1",
+  "checkout": "worktree:feature-42"
+}
+```
+
+`checkout` is required and must be `canonical` or `worktree:<stable-id>`. This command changes only the checkout identity and is rejected if the resulting `(repository, checkout)` pairs conflict with an `Active` or `ReadyForReview` issue. The success response includes the normalized `checkout` and updated issue JSON.
 
 `SplitIssue`:
 

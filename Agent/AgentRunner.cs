@@ -48,6 +48,15 @@ public static partial class AgentRunner
                 return JsonSerializer.Serialize(new SetRepositoryLabelsResponse(true, result.Message, repositoryIssueId.ToString(), updatedIssue.Repositories, updatedIssue), PrettyJsonContext.SetRepositoryLabelsResponse);
             }
         }
+        if (command is SetCheckout && result.Success && result.IssueId is { } checkoutIssueId)
+        {
+            var state = engine.GetState();
+            if (state.TryGetIssue(checkoutIssueId, out var checkoutIssue))
+            {
+                var updatedIssue = ToAgentIssueDto(new IssueView(state.GetSequence(checkoutIssueId), checkoutIssue));
+                return JsonSerializer.Serialize(new SetCheckoutResponse(true, result.Message, checkoutIssueId.ToString(), updatedIssue.Checkout, updatedIssue), PrettyJsonContext.SetCheckoutResponse);
+            }
+        }
         Status? finalStatus = null;
         if (result.Success && result.IssueId is { } issueId && engine.GetState().TryGetIssue(issueId, out var issue))
         {
@@ -329,7 +338,8 @@ public static partial class AgentRunner
         IssueEngine engine,
         bool dryRun = false,
         IEnumerable<string>? excludedRepositories = null,
-        string? expectedIssueId = null)
+        string? expectedIssueId = null,
+        bool dedicatedWorktree = false)
     {
         IssueId? expected = null;
         if (!string.IsNullOrWhiteSpace(expectedIssueId))
@@ -340,7 +350,7 @@ public static partial class AgentRunner
             }
             expected = resolved;
         }
-        var view = engine.ClaimNext(dryRun, excludedRepositories, expected);
+        var view = engine.ClaimNext(dryRun, excludedRepositories, expected, dedicatedWorktree);
         if (view is null)
         {
             return "null";
@@ -370,6 +380,7 @@ public static partial class AgentRunner
             issue.ParentId?.ToString(),
             issue.Labels.ToArray(),
             issue.Repositories.ToArray(),
+            issue.Checkout,
             issue.Comments.Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment, comment.Actor)).ToArray(),
             issue.CreatedAt,
             issue.UpdatedAt,
@@ -428,6 +439,8 @@ public static partial class AgentRunner
                     return TryBuildLabelRemove(root, engine, out command, out error);
                 case "setrepositorylabels":
                     return TryBuildRepositoryLabelsSet(root, engine, out command, out error);
+                case "setcheckout":
+                    return TryBuildCheckoutSet(root, engine, out command, out error);
                 case "updatedescription":
                     return TryBuildDescriptionUpdate(root, engine, defaultActor, out command, out error);
                 case "addcomment":
@@ -450,6 +463,15 @@ public static partial class AgentRunner
         { if (item.ValueKind != JsonValueKind.String) { error = "repositories must contain only strings."; return false; } values.Add(item.GetString() ?? ""); }
         if (values.Count == 0) { error = "repositories must be a non-empty array of strings."; return false; }
         command = new SetRepositoryLabels(issueId, values);
+        return true;
+    }
+
+    private static bool TryBuildCheckoutSet(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    {
+        command = null;
+        if (!TryResolveIssue(root, engine, out var issueId, out error)) return false;
+        if (!TryGetString(root, "checkout", required: true, out var checkout, out error)) return false;
+        command = new SetCheckout(issueId, checkout!);
         return true;
     }
 
@@ -988,6 +1010,7 @@ public static partial class AgentRunner
         string Status,
         AgentIssueDto? Task);
     private sealed record SetRepositoryLabelsResponse(bool Success, string Message, string IssueId, string[] Repositories, AgentIssueDto Issue);
+    private sealed record SetCheckoutResponse(bool Success, string Message, string IssueId, string Checkout, AgentIssueDto Issue);
     private sealed record SplitIssueResponse(bool Success, string Message, AgentIssueDto? Parent, AgentIssueDto[] Children);
 
     private sealed record AgentIssueDto(
@@ -1002,6 +1025,7 @@ public static partial class AgentRunner
         string? ParentId,
         string[] Labels,
         string[] Repositories,
+        string Checkout,
         AgentIssueCommentDto[] Comments,
         DateTime CreatedAt,
         DateTime UpdatedAt,
@@ -1019,6 +1043,7 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(ResearchClaimResponse))]
     [JsonSerializable(typeof(ResearchCompletionResponse))]
     [JsonSerializable(typeof(SetRepositoryLabelsResponse))]
+    [JsonSerializable(typeof(SetCheckoutResponse))]
     [JsonSerializable(typeof(SplitIssueResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]
     [JsonSerializable(typeof(ReviewReconciliationOutcome))]

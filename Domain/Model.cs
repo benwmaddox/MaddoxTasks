@@ -153,6 +153,59 @@ public static class RepositoryLabels
     }
 }
 
+public static class CheckoutIdentity
+{
+    public const string Canonical = "canonical";
+    private const string WorktreePrefix = "worktree:";
+    private const int MaximumWorktreeIdLength = 128;
+
+    public static string Normalize(string? checkout)
+    {
+        var normalized = checkout?.Trim() ?? string.Empty;
+        if (string.Equals(normalized, Canonical, StringComparison.OrdinalIgnoreCase))
+        {
+            return Canonical;
+        }
+
+        if (!normalized.StartsWith(WorktreePrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("Checkout must be 'canonical' or use the form 'worktree:<stable-id>'.", nameof(checkout));
+        }
+
+        var stableId = normalized[WorktreePrefix.Length..];
+        if (stableId.Length is < 1 or > MaximumWorktreeIdLength ||
+            !IsAsciiAlphaNumeric(stableId[0]) ||
+            !IsAsciiAlphaNumeric(stableId[^1]) ||
+            stableId.Any(static character => !IsAsciiAlphaNumeric(character) && character is not '.' and not '_' and not '-'))
+        {
+            throw new ArgumentException(
+                "Worktree checkout ids must be 1 to 128 ASCII letters, digits, dots, underscores, or hyphens, and start and end with a letter or digit.",
+                nameof(checkout));
+        }
+
+        return WorktreePrefix + stableId.ToLowerInvariant();
+    }
+
+    public static string ForIssue(IssueId issueId)
+        => WorktreePrefix + issueId.Value.ToString("D", CultureInfo.InvariantCulture);
+
+    private static bool IsAsciiAlphaNumeric(char character)
+        => character is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9';
+}
+
+public readonly record struct CheckoutReservationKey(string Checkout, string Repository);
+
+public static class CheckoutReservations
+{
+    public static IReadOnlyList<CheckoutReservationKey> GetKeys(string checkout, IEnumerable<string> repositories)
+    {
+        var normalizedCheckout = CheckoutIdentity.Normalize(checkout);
+        return RepositoryLabels.GetReservationKeys(repositories)
+            .Select(repository => new CheckoutReservationKey(normalizedCheckout, repository))
+            .ToArray();
+    }
+}
+
 public readonly record struct Priority(int Value)
 {
     public static Priority From(int value)
@@ -180,6 +233,7 @@ public sealed class Issue
         Description = string.Empty;
         Status = Status.Backlog;
         Priority = Priority.From(3);
+        Checkout = CheckoutIdentity.Canonical;
         CreatedAt = DateTime.MinValue;
         UpdatedAt = DateTime.MinValue;
     }
@@ -189,6 +243,7 @@ public sealed class Issue
     public string Description { get; private set; }
     public Status Status { get; private set; }
     public Priority Priority { get; private set; }
+    public string Checkout { get; private set; }
     public IssueId? ParentId { get; private set; }
     public IReadOnlyCollection<string> Labels => _labels.OrderBy(static x => x, StringComparer.OrdinalIgnoreCase).ToArray();
     public IReadOnlyList<string> Repositories => _labels
@@ -240,6 +295,10 @@ public sealed class Issue
                 _labels.RemoveWhere(static label => label.StartsWith(RepositoryLabels.Prefix, StringComparison.OrdinalIgnoreCase));
                 foreach (var repository in labelsSet.Repositories) _labels.Add(RepositoryLabels.ToLabel(repository));
                 UpdatedAt = labelsSet.Timestamp;
+                break;
+            case CheckoutSet checkoutSet:
+                Checkout = CheckoutIdentity.Normalize(checkoutSet.Checkout);
+                UpdatedAt = checkoutSet.Timestamp;
                 break;
             case DescriptionUpdated descriptionUpdated:
                 Description = NormalizeLineBreaks(descriptionUpdated.Description);

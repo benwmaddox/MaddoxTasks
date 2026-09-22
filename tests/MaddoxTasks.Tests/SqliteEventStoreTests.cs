@@ -60,17 +60,33 @@ public sealed class SqliteEventStoreTests : IDisposable
 
         store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Persist me", null, Status.Backlog, Priority.From(3), null, null));
         store.Append(new StatusChanged(Guid.NewGuid(), issueId, timestamp.AddMinutes(1), Status.Active));
+        store.Append(new CheckoutSet(Guid.NewGuid(), issueId, timestamp.AddMinutes(2), "WORKTREE:persisted"));
 
         var loaded = store.LoadAll();
 
-        Assert.Equal(2, loaded.Count);
+        Assert.Equal(3, loaded.Count);
         Assert.IsType<IssueCreated>(loaded[0]);
         Assert.IsType<StatusChanged>(loaded[1]);
+        Assert.IsType<CheckoutSet>(loaded[2]);
 
         var replayed = IssueState.Replay(loaded);
         var issue = Assert.Single(replayed.OrderedIssues);
         Assert.Equal("Persist me", issue.Title);
         Assert.Equal(Status.Active, issue.Status);
+        Assert.Equal("worktree:persisted", issue.Checkout);
+    }
+
+    [Fact]
+    public void LegacyIssueEvents_DefaultToCanonicalCheckout()
+    {
+        var issueId = new IssueId(Guid.NewGuid());
+        var timestamp = new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc);
+        var store = new SqliteEventStore(_dbPath);
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, timestamp, "Legacy", null, Status.Next, Priority.From(3), null, null));
+
+        var replayed = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll());
+
+        Assert.Equal(CheckoutIdentity.Canonical, replayed.Issues[issueId].Checkout);
     }
 
     [Fact]
@@ -132,6 +148,70 @@ public sealed class SqliteEventStoreTests : IDisposable
             .ToArray();
         Assert.Equal(2, activeRepositories.Length);
         Assert.Equal(2, activeRepositories.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+    }
+
+    [Fact]
+    public async Task ConcurrentDedicatedClaims_ReserveSameRepositoryInDistinctWorktrees()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var canonical = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+            new CreateIssue("Canonical owner", null, Priority.From(1), null, null)).IssueId);
+        Assert.True(setup.Execute(new AddLabel(canonical, "repo:shared")).Success);
+        Assert.True(setup.Execute(new ChangeStatus(canonical, Status.Active)).Success);
+        var candidates = new List<IssueId>();
+        foreach (var title in new[] { "Worktree one", "Worktree two" })
+        {
+            var issueId = Assert.IsAssignableFrom<IssueId>(setup.Execute(
+                new CreateIssue(title, null, Priority.From(2), null, null)).IssueId);
+            Assert.True(setup.Execute(new AddLabel(issueId, "repo:shared")).Success);
+            candidates.Add(issueId);
+        }
+
+        var claims = await Task.WhenAll(
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext(dedicatedWorktree: true)),
+            Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext(dedicatedWorktree: true)));
+
+        Assert.All(claims, claim => Assert.NotNull(claim));
+        Assert.Equal(candidates.OrderBy(id => id.Value).ToArray(),
+            claims.Select(claim => claim!.Issue.Id).OrderBy(id => id.Value).ToArray());
+        var active = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll()).OrderedIssues
+            .Where(issue => issue.Status == Status.Active)
+            .ToArray();
+        Assert.Equal(3, active.Length);
+        Assert.Equal(CheckoutIdentity.Canonical, active.Single(issue => issue.Id == canonical).Checkout);
+        var worktreeIssues = active.Where(issue => issue.Id != canonical).ToArray();
+        Assert.All(worktreeIssues, issue =>
+        {
+            Assert.Equal(["shared"], issue.Repositories);
+            Assert.Equal(CheckoutIdentity.ForIssue(issue.Id), issue.Checkout);
+        });
+        Assert.Equal(2, worktreeIssues.Select(issue => issue.Checkout).Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public void ManualActivation_CannotShareSamePersistedWorktreeReservation()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 9, 10, 12, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var first = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("First", null, Priority.From(1), null, null)).IssueId);
+        var second = Assert.IsAssignableFrom<IssueId>(engine.Execute(
+            new CreateIssue("Second", null, Priority.From(2), null, null)).IssueId);
+        foreach (var issueId in new[] { first, second })
+        {
+            Assert.True(engine.Execute(new AddLabel(issueId, "repo:shared")).Success);
+            Assert.True(engine.Execute(new SetCheckout(issueId, "worktree:shared")).Success);
+        }
+
+        Assert.True(engine.Execute(new ChangeStatus(first, Status.Active)).Success);
+        var secondActivation = engine.Execute(new ChangeStatus(second, Status.Active));
+
+        Assert.False(secondActivation.Success);
+        var replayed = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll());
+        Assert.Equal(Status.Active, replayed.Issues[first].Status);
+        Assert.Equal(Status.Next, replayed.Issues[second].Status);
+        Assert.Equal("worktree:shared", replayed.Issues[second].Checkout);
     }
 
     [Fact]

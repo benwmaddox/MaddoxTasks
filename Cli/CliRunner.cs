@@ -441,6 +441,7 @@ public static class CliRunner
     private static CliCommand BuildAgentClaimCommand(Option<string> dbOption)
     {
         var dryRunOption = new Option<bool>("--dry-run", "Select without changing the task status.");
+        var dedicatedWorktreeOption = new Option<bool>("--dedicated-worktree", "Reserve a dedicated worktree checkout instead of the canonical checkout.");
         var excludeRepositoryOption = new Option<string[]>("--exclude-repository", "Repository reservation key to skip for this claim.")
         {
             AllowMultipleArgumentsPerToken = true
@@ -448,13 +449,14 @@ public static class CliRunner
         var expectedIssueOption = new Option<string?>("--expected-issue-id", "Claim only when this issue remains the next eligible candidate.");
         var command = new CliCommand("claim", "Atomically claim the next available repository-backed task as Active.");
         command.AddOption(dryRunOption);
+        command.AddOption(dedicatedWorktreeOption);
         command.AddOption(excludeRepositoryOption);
         command.AddOption(expectedIssueOption);
-        command.SetHandler((string dbPath, bool dryRun, string[] excludedRepositories, string? expectedIssueId) =>
+        command.SetHandler((string dbPath, bool dryRun, bool dedicatedWorktree, string[] excludedRepositories, string? expectedIssueId) =>
         {
             var engine = CreateEngine(dbPath);
-            Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun, excludedRepositories, expectedIssueId));
-        }, dbOption, dryRunOption, excludeRepositoryOption, expectedIssueOption);
+            Console.WriteLine(AgentRunner.GetClaimJson(engine, dryRun, excludedRepositories, expectedIssueId, dedicatedWorktree));
+        }, dbOption, dryRunOption, dedicatedWorktreeOption, excludeRepositoryOption, expectedIssueOption);
         return command;
     }
 
