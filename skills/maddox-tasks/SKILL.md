@@ -7,6 +7,12 @@ description: Operate and automate Maddox Tasks via agent JSON commands. Use when
 
 Run Maddox Tasks with the published/released binary, never source internals, for agent operations.
 
+## This Workstation's Layout
+
+- The released executable is `D:\code\MaddoxTasks\MaddoxTasks.exe`.
+- The live task data is `C:\Users\Ben\OneDrive\MaddoxTasks\MaddoxTasks.db`.
+- Run the executable from its installed directory or use its absolute path. Let the binary resolve the live database; do not copy or edit the database directly.
+
 ## Execution Mode (Important)
 
 1. Use **only agent JSON commands** when operating as an agent.
@@ -58,6 +64,8 @@ Read `references/commands.md` for concrete command patterns.
 .\MaddoxTasks.exe agent claim --dedicated-worktree
 .\MaddoxTasks.exe agent claim --dry-run --dedicated-worktree
 ```
+
+Use `--dry-run` only to preview a selection. A real claim returns the selected issue as JSON, changes it from `Next` to `Active`, and reserves its `(repository, checkout)` pair atomically. Use that returned issue for work; do not select it separately or send another `ChangeStatus`. JSON `null` means no issue is currently claimable, so stop that worker invocation. When the user names a specific issue, work on it instead of claiming an unrelated one.
 
 The worker uses a stable per-task worktree identity in this mode. Within one repository, reuse a worktree ID only when it names the same physical checkout; the same ID can be used independently in another repository.
 
