@@ -10,6 +10,8 @@ Windows:
 .\MaddoxTasks.exe agent issues
 ```
 
+On this workstation, use `D:\code\MaddoxTasks\MaddoxTasks.exe`. The live data is separately stored at `C:\Users\Ben\OneDrive\MaddoxTasks\MaddoxTasks.db`; never manipulate the database directly.
+
 `agent next` remains a read-only compatibility command for selecting the next existing Active/Next task. Use `agent claim` for concurrent workers that need an atomic `(repository, checkout)` reservation.
 
 Linux/macOS:
@@ -53,6 +55,8 @@ Real claim:
 .\MaddoxTasks.exe agent claim
 .\MaddoxTasks.exe agent claim --dedicated-worktree
 ```
+
+The real command returns the claimed issue as JSON and atomically changes it from `Next` to `Active`. Use the returned issue rather than selecting one first with `agent issues` or `agent next`, and do not send a separate `ChangeStatus`. JSON `null` means nothing is currently claimable; stop that worker invocation. The dry-run command previews selection without writing it.
 
 In worktree mode the worker uses a stable per-task checkout ID. Within one repository, reuse a worktree ID only for the same physical checkout; it can be used independently in another repository.
 
