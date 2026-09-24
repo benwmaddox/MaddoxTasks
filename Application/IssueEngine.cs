@@ -56,7 +56,7 @@ public sealed class IssueEngine
         return issues
             .OrderBy(issue => statusIndex[issue.Status])
             .ThenBy(issue => state.GetSequence(issue.Id))
-            .Select(issue => new IssueView(state.GetSequence(issue.Id), issue))
+            .Select(issue => state.GetView(issue.Id))
             .ToArray();
     }
 
@@ -78,6 +78,15 @@ public sealed class IssueEngine
                 var before = IssueState.Replay(events);
                 var plannedEvent = CommandPlanner.Plan(command, before, _clock.UtcNow);
                 var plannedEvents = new List<IssueEvent> { plannedEvent };
+                if (command is CreateIssue { BlockedBy: { Count: > 0 } } createIssue)
+                {
+                    var afterCreate = IssueState.Replay(events.Concat(plannedEvents).ToArray());
+                    plannedEvents.Add(CommandPlanner.Plan(
+                        new SetBlockers(plannedEvent.IssueId, createIssue.BlockedBy!),
+                        afterCreate,
+                        _clock.UtcNow));
+                }
+
                 foreach (var label in labels.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
                     var state = IssueState.Replay(events.Concat(plannedEvents).ToArray());
@@ -160,9 +169,9 @@ public sealed class IssueEngine
                 planned.Add(new StatusChanged(Guid.NewGuid(), parent.Id, timestamp, Status.Done));
 
                 var after = IssueState.Replay(events.Concat(planned).ToArray());
-                var parentView = new IssueView(after.GetSequence(parent.Id), after.Issues[parent.Id]);
+                var parentView = after.GetView(parent.Id);
                 var childViews = planned.OfType<IssueCreated>()
-                    .Select(created => new IssueView(after.GetSequence(created.IssueId), after.Issues[created.IssueId]))
+                    .Select(created => after.GetView(created.IssueId))
                     .ToArray();
                 return new EventStoreOperation<SplitIssueResult>(planned,
                     new SplitIssueResult(true, $"Issue split into {childViews.Length} child issues.", parentView, childViews));
@@ -236,6 +245,7 @@ public sealed class IssueEngine
                 .ToHashSet();
             var candidate = state.HierarchicalIssues()
                 .FirstOrDefault(issue =>
+                    !state.HasUnresolvedBlockers(issue) &&
                     !CheckoutReservations.GetKeys(issue.Checkout, issue.Repositories).Any(activeReservationKeys.Contains)
                     && ResearchClaimPolicy.IsEligible(issue, events, now));
 
@@ -271,7 +281,7 @@ public sealed class IssueEngine
                         ? $"Blocked issue {candidate.Id} is eligible for research."
                         : $"Blocked issue {candidate.Id} claimed for research.",
                     dryRun,
-                    new IssueView(state.GetSequence(candidate.Id), candidate),
+                    state.GetView(candidate.Id),
                     ResearchClaimPolicy.LatestAttemptUtc(candidate)));
         });
     }
@@ -302,21 +312,21 @@ public sealed class IssueEngine
             {
                 return new EventStoreOperation<ResearchCompletionResult>(
                     [],
-                    new ResearchCompletionResult(false, "Issue has no research claim marker.", dryRun, ResearchCompletionStatus.NotResearchClaimed, new IssueView(state.GetSequence(issueId), issue)));
+                    new ResearchCompletionResult(false, "Issue has no research claim marker.", dryRun, ResearchCompletionStatus.NotResearchClaimed, state.GetView(issueId)));
             }
 
             if (issue.Status != Status.Blocked)
             {
                 return new EventStoreOperation<ResearchCompletionResult>(
                     [],
-                    new ResearchCompletionResult(false, $"Issue is no longer Blocked (current status: {issue.Status}).", dryRun, ResearchCompletionStatus.NotBlocked, new IssueView(state.GetSequence(issueId), issue)));
+                    new ResearchCompletionResult(false, $"Issue is no longer Blocked (current status: {issue.Status}).", dryRun, ResearchCompletionStatus.NotBlocked, state.GetView(issueId)));
             }
 
             if (dryRun)
             {
                 return new EventStoreOperation<ResearchCompletionResult>(
                     [],
-                    new ResearchCompletionResult(true, $"Research would move the Blocked issue to {completionStatus}.", true, ResearchCompletionStatus.WouldAdvance, new IssueView(state.GetSequence(issueId), issue)));
+                    new ResearchCompletionResult(true, $"Research would move the Blocked issue to {completionStatus}.", true, ResearchCompletionStatus.WouldAdvance, state.GetView(issueId)));
             }
 
             var plannedEvent = new StatusChanged(
@@ -327,7 +337,7 @@ public sealed class IssueEngine
             issue.Apply(plannedEvent);
             return new EventStoreOperation<ResearchCompletionResult>(
                 [plannedEvent],
-                new ResearchCompletionResult(true, $"Research moved the Blocked issue to {completionStatus}.", false, ResearchCompletionStatus.Advanced, new IssueView(state.GetSequence(issueId), issue)));
+                new ResearchCompletionResult(true, $"Research moved the Blocked issue to {completionStatus}.", false, ResearchCompletionStatus.Advanced, state.GetView(issueId)));
         });
     }
 
@@ -375,6 +385,7 @@ public sealed class IssueEngine
 
                 var candidate = state.SelectHierarchical(
                     issue => issue.Status == Status.Next &&
+                             !state.HasUnresolvedBlockers(issue) &&
                              !CheckoutReservations.GetKeys(CheckoutForClaim(issue, dedicatedWorktree), issue.Repositories)
                                  .Any(activeReservationKeys.Contains) &&
                              !RepositoryLabels.GetReservationKeys(issue.Repositories)
@@ -407,7 +418,7 @@ public sealed class IssueEngine
 
                 return new EventStoreOperation<IssueView?>(
                     dryRun ? [] : [.. cleanupEvents, .. plannedEvents],
-                    new IssueView(state.GetSequence(candidate.Id), candidate));
+                    state.GetView(candidate.Id));
             });
     }
 
@@ -503,4 +514,3 @@ public enum ConditionalStatusChangeResult
 }
 
 public sealed record SplitIssueResult(bool Success, string Message, IssueView? Parent, IReadOnlyList<IssueView> Children);
-

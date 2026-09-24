@@ -128,7 +128,7 @@ public sealed class TuiApp
         }
 
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]up/down navigate   Enter open   n new   / filter   ? help   q quit[/]");
+        AnsiConsole.MarkupLine("[grey]up/down navigate   Enter open   n new   b blockers   / filter   ? help   q quit[/]");
         RenderStatusBar();
     }
 
@@ -305,6 +305,13 @@ public sealed class TuiApp
                 }
 
                 return;
+            case 'b':
+                if (selectedIssue is not null)
+                {
+                    EditBlockers(selectedIssue);
+                }
+
+                return;
             case 'd':
                 if (selectedIssue is not null)
                 {
@@ -375,6 +382,9 @@ public sealed class TuiApp
                 case 't':
                     ToggleLabel(refreshedIssue);
                     break;
+                case 'b':
+                    EditBlockers(refreshedIssue);
+                    break;
                 case 'd':
                     EditDescription(refreshedIssue);
                     break;
@@ -395,6 +405,7 @@ public sealed class TuiApp
             || !TryPromptText("Description (optional, blank for none)", out var description)
             || !TryPromptText("Priority (1-5, default 3)", out var priorityText, "3")
             || !TryPromptText("Due date (optional, yyyy-MM-dd)", out var dueText)
+            || !TryPromptText("Blocked by issue tokens (optional, comma-separated)", out var blockerText)
             || !TryPromptChoice(
                 "Initial status",
                 [IssueStatus.Next, IssueStatus.Backlog],
@@ -441,7 +452,8 @@ public sealed class TuiApp
             string.IsNullOrWhiteSpace(description) ? null : description,
             priority,
             dueDate,
-            initialStatus);
+            initialStatus,
+            ParseBlockerTokens(blockerText));
 
         var result = _engine.Execute(command);
         PauseWithMessage(result.Message, result.Success);
@@ -452,8 +464,29 @@ public sealed class TuiApp
         string? description,
         Priority priority,
         DateTime? dueDate,
-        IssueStatus initialStatus = IssueStatus.Next)
-        => new(title, description, priority, ParentId: null, dueDate, initialStatus);
+        IssueStatus initialStatus = IssueStatus.Next,
+        IReadOnlyList<string>? blockedBy = null)
+        => new(title, description, priority, ParentId: null, dueDate, initialStatus, blockedBy);
+
+    private void EditBlockers(IssueView issueView)
+    {
+        Console.CursorVisible = true;
+        var current = string.Join(", ", (issueView.BlockedBy ?? []).Select(blocker => blocker.IssueId));
+        if (!TryPromptText("Complete blocker set (comma-separated issue tokens; blank clears)", out var blockerText, current))
+        {
+            Console.CursorVisible = false;
+            return;
+        }
+
+        Console.CursorVisible = false;
+        var result = _engine.Execute(new SetBlockers(issueView.Issue.Id, ParseBlockerTokens(blockerText)));
+        PauseWithMessage(result.Message, result.Success);
+    }
+
+    private static string[] ParseBlockerTokens(string? input)
+        => string.IsNullOrWhiteSpace(input)
+            ? []
+            : input.Split(',', StringSplitOptions.TrimEntries);
 
     private void ChangeStatus(IssueView issueView)
     {
@@ -682,6 +715,15 @@ public sealed class TuiApp
         grid.AddRow("Updated", issue.UpdatedAt.ToString("u"));
         grid.AddRow("Due", issue.DueDate?.ToString("u") ?? "-");
         grid.AddRow("Labels", (issue.Labels.Count == 0 ? "-" : string.Join(",", issue.Labels)).EscapeMarkup());
+        var blockers = issueView.BlockedBy is { Count: > 0 }
+            ? string.Join(Environment.NewLine, issueView.BlockedBy.Select(blocker =>
+                blocker.IsSatisfied
+                    ? $"{blocker.ShortId} {blocker.Title} (Done)"
+                    : blocker.Status is null
+                        ? $"{blocker.IssueId} (missing) - {blocker.Reason}"
+                        : $"{blocker.ShortId} {blocker.Title} ({blocker.Status.Value.ToDisplayString()}) - {blocker.Reason}"))
+            : "-";
+        grid.AddRow("Blocked by", blockers.EscapeMarkup());
         grid.AddRow("Title", issue.Title.EscapeMarkup());
         grid.AddRow("Description", (string.IsNullOrWhiteSpace(issue.Description) ? "-" : issue.Description).EscapeMarkup());
 
@@ -717,7 +759,7 @@ public sealed class TuiApp
         }
 
         AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   d description   h desc-history   q/Esc back[/]");
+        AnsiConsole.MarkupLine("[grey]Detail actions: c comment   s status   p priority   t label   b blockers   d description   h desc-history   q/Esc back[/]");
         RenderStatusBar();
     }
 

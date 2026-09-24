@@ -106,6 +106,82 @@ public sealed class SqliteEventStoreTests : IDisposable
     }
 
     [Fact]
+    public void IssueBlockersSet_RoundTripsItsSchemaVersionAndFullBlockerSet()
+    {
+        var blocker = IssueId.New();
+        var dependent = IssueId.New();
+        var timestamp = new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc);
+        var store = new SqliteEventStore(_dbPath);
+        store.Append(new IssueCreated(Guid.NewGuid(), blocker, timestamp, "Prerequisite", null, Status.Done, Priority.From(2), null, null));
+        store.Append(new IssueCreated(Guid.NewGuid(), dependent, timestamp, "Dependent", null, Status.Next, Priority.From(3), null, null));
+        store.Append(new IssueBlockersSet(Guid.NewGuid(), dependent, timestamp.AddMinutes(1), IssueBlockersSet.CurrentSchemaVersion, [blocker]));
+
+        var loaded = store.LoadAll();
+        var blockersSet = Assert.IsType<IssueBlockersSet>(loaded[^1]);
+        Assert.Equal(IssueBlockersSet.CurrentSchemaVersion, blockersSet.SchemaVersion);
+        Assert.Equal([blocker], blockersSet.BlockerIds);
+        Assert.Equal([blocker], IssueState.Replay(loaded).Issues[dependent].BlockerIds);
+        Assert.True(new IssueEngine(store, new FrozenClockForSqliteReservations(timestamp.AddMinutes(2)))
+            .GetState().GetView(dependent).BlockedBy!.Single().IsSatisfied);
+    }
+
+    [Fact]
+    public void IssueBlockersSet_RejectsUnsupportedSchemaVersionDuringReplay()
+    {
+        var issueId = IssueId.New();
+        var store = new SqliteEventStore(_dbPath);
+        store.Append(new IssueCreated(Guid.NewGuid(), issueId, DateTime.UtcNow, "Task", null, Status.Next, Priority.From(3), null, null));
+        store.Append(new IssueBlockersSet(Guid.NewGuid(), issueId, DateTime.UtcNow, 2, []));
+
+        Assert.Throws<InvalidOperationException>(() => IssueState.Replay(store.LoadAll()));
+    }
+
+    [Fact]
+    public async Task ConcurrentBlockerEdits_CannotCommitADependencyCycle()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var first = Assert.IsType<IssueId>(setup.Execute(new CreateIssue("First", null, Priority.From(2), null, null)).IssueId);
+        var second = Assert.IsType<IssueId>(setup.Execute(new CreateIssue("Second", null, Priority.From(2), null, null)).IssueId);
+
+        var firstUpdateTask = Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).Execute(new SetBlockers(first, [second.ToString()])));
+        var secondUpdateTask = Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).Execute(new SetBlockers(second, [first.ToString()])));
+        var updates = await Task.WhenAll(firstUpdateTask, secondUpdateTask);
+
+        Assert.Single(updates, result => result.Success);
+        Assert.Single(updates, result => !result.Success && result.Message.Contains("cycle", StringComparison.OrdinalIgnoreCase));
+        Assert.Single(new SqliteEventStore(_dbPath).LoadAll(), issueEvent => issueEvent is IssueBlockersSet);
+        var state = IssueState.Replay(new SqliteEventStore(_dbPath).LoadAll());
+        Assert.NotEqual(state.Issues[first].BlockerIds.Contains(second), state.Issues[second].BlockerIds.Contains(first));
+    }
+
+    [Fact]
+    public async Task ConcurrentClaimAndBlockerCompletion_UseOneAtomicDependencySnapshot()
+    {
+        var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc));
+        var setup = new IssueEngine(new SqliteEventStore(_dbPath), clock);
+        var blocker = Assert.IsType<IssueId>(setup.Execute(new CreateIssue("Prerequisite", null, Priority.From(1), null, null, Status.Backlog)).IssueId);
+        var dependent = Assert.IsType<IssueId>(setup.Execute(new CreateIssue("Dependent", null, Priority.From(2), null, null, BlockedBy: ["1"])).IssueId);
+
+        var completionTask = Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).Execute(new ChangeStatus(blocker, Status.Done)));
+        var claimTask = Task.Run(() => new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext());
+        await Task.WhenAll(completionTask, claimTask);
+        var completion = await completionTask;
+        Assert.True(completion.Success);
+        var claim = await claimTask;
+        var events = new SqliteEventStore(_dbPath).LoadAll();
+        var doneIndex = events.Select((issueEvent, index) => (issueEvent, index))
+            .Single(item => item.issueEvent is StatusChanged status && status.IssueId == blocker && status.NewStatus == Status.Done).index;
+        if (claim is null) claim = new IssueEngine(new SqliteEventStore(_dbPath), clock).ClaimNext();
+
+        Assert.NotNull(claim);
+        Assert.Equal(dependent, claim!.Issue.Id);
+        var activeIndex = new SqliteEventStore(_dbPath).LoadAll().Select((issueEvent, index) => (issueEvent, index))
+            .Single(item => item.issueEvent is StatusChanged status && status.IssueId == dependent && status.NewStatus == Status.Active).index;
+        Assert.True(doneIndex < activeIndex, "A dependent task must not be activated before its blocker is Done in the ledger.");
+    }
+
+    [Fact]
     public async Task ConcurrentClaims_ClaimSameTaskOnlyOnce()
     {
         var clock = new FrozenClockForSqliteReservations(new DateTime(2026, 2, 13, 8, 0, 0, DateTimeKind.Utc));
@@ -324,4 +400,3 @@ file sealed class FrozenClockForSqliteReservations : IClock
 
     public DateTime UtcNow { get; }
 }
-

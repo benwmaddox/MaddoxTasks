@@ -225,6 +225,7 @@ public sealed class Issue
 {
     private readonly HashSet<string> _labels = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<IssueComment> _comments = [];
+    private readonly List<IssueId> _blockerIds = [];
 
     private Issue(IssueId id)
     {
@@ -245,6 +246,7 @@ public sealed class Issue
     public Priority Priority { get; private set; }
     public string Checkout { get; private set; }
     public IssueId? ParentId { get; private set; }
+    public IReadOnlyList<IssueId> BlockerIds => _blockerIds.ToArray();
     public IReadOnlyCollection<string> Labels => _labels.OrderBy(static x => x, StringComparer.OrdinalIgnoreCase).ToArray();
     public IReadOnlyList<string> Repositories => _labels
         .Select(label => RepositoryLabels.TryGetRepository(label, out var repository) ? repository : null)
@@ -299,6 +301,32 @@ public sealed class Issue
             case CheckoutSet checkoutSet:
                 Checkout = CheckoutIdentity.Normalize(checkoutSet.Checkout);
                 UpdatedAt = checkoutSet.Timestamp;
+                break;
+            case IssueBlockersSet blockersSet:
+                if (blockersSet.SchemaVersion != IssueBlockersSet.CurrentSchemaVersion)
+                {
+                    throw new InvalidOperationException(
+                        $"Unsupported blocker dependency schema version '{blockersSet.SchemaVersion}'.");
+                }
+
+                if (blockersSet.BlockerIds is null)
+                {
+                    throw new InvalidOperationException("Blocker dependency events must include a blocker id array.");
+                }
+
+                if (blockersSet.BlockerIds.Distinct().Count() != blockersSet.BlockerIds.Length)
+                {
+                    throw new InvalidOperationException("Blocker dependency events cannot contain duplicate issue ids.");
+                }
+
+                if (blockersSet.BlockerIds.Contains(Id))
+                {
+                    throw new InvalidOperationException("An issue cannot depend on itself.");
+                }
+
+                _blockerIds.Clear();
+                _blockerIds.AddRange(blockersSet.BlockerIds);
+                UpdatedAt = blockersSet.Timestamp;
                 break;
             case DescriptionUpdated descriptionUpdated:
                 Description = NormalizeLineBreaks(descriptionUpdated.Description);
@@ -366,4 +394,3 @@ public static class IssueFiltering
 
     internal static string NormalizeLabel(string label) => label.Trim().ToLowerInvariant();
 }
-

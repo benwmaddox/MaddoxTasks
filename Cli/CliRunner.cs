@@ -26,6 +26,7 @@ public static class CliRunner
         root.AddCommand(BuildServeCommand(dbOption));
         root.AddCommand(BuildListCommand(dbOption));
         root.AddCommand(BuildCreateCommand(dbOption));
+        root.AddCommand(BuildBlockersCommand(dbOption));
         root.AddCommand(BuildStatusCommand(dbOption));
         root.AddCommand(BuildPriorityCommand(dbOption));
         root.AddCommand(BuildLabelCommand(dbOption));
@@ -115,6 +116,7 @@ public static class CliRunner
             table.AddColumn("P");
             table.AddColumn("Due");
             table.AddColumn("Labels");
+            table.AddColumn("Blocked by");
             table.AddColumn("Title");
 
             foreach (var issue in issues)
@@ -126,6 +128,7 @@ public static class CliRunner
                     issue.Issue.Priority.Value.ToString(),
                     issue.Issue.DueDate?.ToString("yyyy-MM-dd") ?? "-",
                     issue.Issue.Labels.Count == 0 ? "-" : string.Join(",", issue.Issue.Labels),
+                    FormatBlockers(issue.BlockedBy),
                     issue.Issue.Title);
             }
 
@@ -143,6 +146,7 @@ public static class CliRunner
         var parentOption = new Option<string?>("--parent", "Parent issue token (sequence, guid, or guid prefix).");
         var dueOption = new Option<string?>("--due", "Due date (yyyy-MM-dd).");
         var statusOption = new Option<string?>("--status", () => "Next", "Initial status: Next (default) or Backlog.");
+        var blockedByOption = new Option<string?>("--blocked-by", "Comma-separated issue tokens that must be Done first.");
 
         var command = new CliCommand("create", "Create a new issue.");
         command.AddArgument(titleArgument);
@@ -151,8 +155,9 @@ public static class CliRunner
         command.AddOption(parentOption);
         command.AddOption(dueOption);
         command.AddOption(statusOption);
+        command.AddOption(blockedByOption);
 
-        command.SetHandler((string dbPath, string title, string? description, int priorityRaw, string? parentToken, string? dueText, string? statusText) =>
+        command.SetHandler((string dbPath, string title, string? description, int priorityRaw, string? parentToken, string? dueText, string? statusText, string? blockedByText) =>
         {
             var engine = CreateEngine(dbPath);
             if (!TryParseCreateStatus(statusText, out var initialStatus, out var statusError))
@@ -196,11 +201,44 @@ public static class CliRunner
                 dueDate = parsedDue;
             }
 
-            var result = engine.Execute(new CreateIssue(title, description, priority, parentId, dueDate, initialStatus));
+            var result = engine.Execute(new CreateIssue(title, description, priority, parentId, dueDate, initialStatus, ParseBlockerTokens(blockedByText)));
             PrintCommandResult(result);
-        }, dbOption, titleArgument, descriptionOption, priorityOption, parentOption, dueOption, statusOption);
+        }, dbOption, titleArgument, descriptionOption, priorityOption, parentOption, dueOption, statusOption, blockedByOption);
 
         return command;
+    }
+
+    private static CliCommand BuildBlockersCommand(Option<string> dbOption)
+    {
+        var issueArgument = new Argument<string>("issue", "Issue token whose complete blocker set will be replaced.");
+        var blockedByOption = new Option<string?>("--blocked-by", "Comma-separated issue tokens; omit or pass an empty value to clear blockers.");
+        var command = new CliCommand("blockers", "Replace the blocker dependencies for an issue.");
+        command.AddArgument(issueArgument);
+        command.AddOption(blockedByOption);
+        command.SetHandler((string dbPath, string issueToken, string? blockedByText) =>
+        {
+            var engine = CreateEngine(dbPath);
+            if (!TryResolveIssue(engine, issueToken, out var issueId)) return;
+            var result = engine.Execute(new SetBlockers(issueId, ParseBlockerTokens(blockedByText)));
+            PrintCommandResult(result);
+        }, dbOption, issueArgument, blockedByOption);
+        return command;
+    }
+
+    private static string[] ParseBlockerTokens(string? input)
+        => string.IsNullOrWhiteSpace(input)
+            ? []
+            : input.Split(',', StringSplitOptions.TrimEntries);
+
+    private static string FormatBlockers(IReadOnlyList<IssueBlockerView>? blockers)
+    {
+        if (blockers is not { Count: > 0 }) return "-";
+        return string.Join(", ", blockers.Select(blocker =>
+            blocker.IsSatisfied
+                ? $"{blocker.ShortId} '{blocker.Title}' Done"
+                : blocker.Status is null
+                    ? $"{blocker.IssueId} missing - {blocker.Reason}"
+                    : $"{blocker.ShortId} '{blocker.Title}' {blocker.Status.Value.ToDisplayString()} - {blocker.Reason}"));
     }
 
     private static CliCommand BuildStatusCommand(Option<string> dbOption)
@@ -696,4 +734,3 @@ public static class CliRunner
         }
     }
 }
-

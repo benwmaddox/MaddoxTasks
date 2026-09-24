@@ -181,7 +181,7 @@ internal static class WebAssets
     </section>
     <div id="load-error" class="alert hidden" role="alert"></div>
     <section id="board" class="board" aria-live="polite"></section>
-    <p class="footer-help"><kbd>↑</kbd>/<kbd>↓</kbd> or <kbd>j</kbd>/<kbd>k</kbd> navigate · <kbd>Enter</kbd> open · <kbd>n</kbd> new · <kbd>s</kbd> status · <kbd>p</kbd> priority · <kbd>d</kbd> done/description · <kbd>c</kbd> comment · <kbd>/</kbd> search · <kbd>?</kbd> help</p>
+    <p class="footer-help"><kbd>↑</kbd>/<kbd>↓</kbd> or <kbd>j</kbd>/<kbd>k</kbd> navigate · <kbd>Enter</kbd> open · <kbd>n</kbd> new · <kbd>b</kbd> blockers · <kbd>s</kbd> status · <kbd>p</kbd> priority · <kbd>d</kbd> done/description · <kbd>c</kbd> comment · <kbd>/</kbd> search · <kbd>?</kbd> help</p>
   </main>
 
   <div id="create-overlay" class="overlay hidden" role="dialog" aria-modal="true" aria-labelledby="create-heading">
@@ -202,6 +202,7 @@ internal static class WebAssets
           <label>Priority <select id="create-priority" name="priority"><option value="1">1 - urgent</option><option value="2">2 - high</option><option value="3" selected>3 - normal</option><option value="4">4 - low</option><option value="5">5 - someday</option></select></label>
           <label>Parent issue token <input id="create-parent" name="parent" placeholder="Optional sequence or id"></label>
           <label>Due date <input id="create-due" name="due" type="date"></label>
+          <label class="full">Blocked by issue tokens (comma-separated; only Done tasks satisfy) <textarea id="create-blockers" rows="2" placeholder="Optional sequence, GUID prefix, or GUID"></textarea></label>
           <label class="full">Labels (one per line; use repo:&lt;name&gt; for repositories) <textarea id="create-labels" rows="2"></textarea></label>
         </div>
         <div class="button-row"><button class="primary" type="submit">Create issue</button><button type="button" data-close="create-overlay">Cancel</button></div>
@@ -221,7 +222,7 @@ internal static class WebAssets
       <div class="modal-header"><h2 id="help-heading">Keyboard shortcuts</h2><button class="icon subtle" type="button" data-close="help-overlay" aria-label="Close">×</button></div>
       <div class="modal-body">
         <p><kbd>↑</kbd>/<kbd>↓</kbd>, <kbd>j</kbd>/<kbd>k</kbd> move through issues. <kbd>Enter</kbd> opens the selected issue.</p>
-        <p><kbd>n</kbd> creates an issue. In an issue, <kbd>s</kbd> focuses status, <kbd>p</kbd> priority, <kbd>t</kbd> labels, <kbd>d</kbd> description, and <kbd>c</kbd> comment.</p>
+        <p><kbd>n</kbd> creates an issue. In an issue, <kbd>s</kbd> focuses status, <kbd>p</kbd> priority, <kbd>t</kbd> labels, <kbd>b</kbd> blockers, <kbd>d</kbd> description, and <kbd>c</kbd> comment.</p>
         <p><kbd>d</kbd> on the board marks the selected issue Done. <kbd>/</kbd> focuses search, <kbd>r</kbd> refreshes, <kbd>Esc</kbd> closes a panel, and <kbd>?</kbd> opens this help.</p>
         <button type="button" data-close="help-overlay">Close</button>
       </div>
@@ -379,7 +380,9 @@ internal static class WebAssets
       card.setAttribute('aria-label', `${issue.shortId} ${issue.title}, ${statusLabel(issue.status)}`);
       const tags = visibleIssueLabels(issue.labels).map(label => labelTag(label)).join('');
       const due = issue.dueDate ? `Due ${escapeHtml(new Date(issue.dueDate).toLocaleDateString())}` : '';
-      card.innerHTML = `<div class="card-top"><span class="card-id">${escapeHtml(issue.shortId)} · ${escapeHtml(issue.id.slice(0, 8))}</span><span class="priority p${issue.priority}">P${issue.priority}</span></div><div class="card-title">${escapeHtml(issue.title)}</div><div class="card-meta"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><span>${due}</span></div>${tags ? `<div class="labels">${tags}</div>` : ''}`;
+      const blockerReasons = issue.blockerReasons || [];
+      const blockerSummary = blockerReasons.length ? `<div class="muted">${escapeHtml(blockerReasons[0])}${blockerReasons.length > 1 ? ` (+${blockerReasons.length - 1} more)` : ''}</div>` : '';
+      card.innerHTML = `<div class="card-top"><span class="card-id">${escapeHtml(issue.shortId)} · ${escapeHtml(issue.id.slice(0, 8))}</span><span class="priority p${issue.priority}">P${issue.priority}</span></div><div class="card-title">${escapeHtml(issue.title)}</div><div class="card-meta"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><span>${due}</span></div>${blockerSummary}${tags ? `<div class="labels">${tags}</div>` : ''}`;
       card.addEventListener('click', () => { selectIssue(state.issues.findIndex(candidate => candidate.id === issue.id)); openDetail(issue.id); });
       card.addEventListener('focus', () => state.selectedId = issue.id);
       return card;
@@ -410,6 +413,7 @@ internal static class WebAssets
       if (parent) body.parent = parent;
       if (due) body.due = due;
       body.labels = byId('create-labels').value.split('\n').map(value => value.trim()).filter(Boolean);
+      body.blockedBy = parseBlockerTokens(byId('create-blockers').value);
       try {
         const result = await api('/api/issues', { method: 'POST', body: JSON.stringify(body) });
         closeOverlay('create-overlay');
@@ -483,11 +487,14 @@ internal static class WebAssets
       byId('detail-heading').textContent = `${issue.shortId} · ${issue.title}`;
       const statusOptions = statuses.map(status => `<option value="${status}"${status === issue.status ? ' selected' : ''}>${escapeHtml(statusLabel(status))}</option>`).join('');
       const labelTags = (issue.labels || []).map(label => labelTag(label, true)).join('');
+      const blockedBy = issue.blockedBy || [];
+      const blockerDetails = blockedBy.map(blocker => `<article class="history-item"><div class="meta">${escapeHtml(blocker.shortId || blocker.issueId)} · ${escapeHtml(blocker.status || 'missing')}</div><div>${escapeHtml(blocker.title || blocker.issueId)}</div>${blocker.reason ? `<div class="muted">${escapeHtml(blocker.reason)}</div>` : ''}</article>`).join('') || '<div class="muted">No task blockers.</div>';
+      const blockerTokens = blockedBy.map(blocker => blocker.issueId).join(', ');
       const comments = (issue.comments || []).slice().reverse().map(comment => `<article class="comment-item"><div class="meta">${escapeHtml(comment.actor)} · ${escapeHtml(new Date(comment.timestamp).toLocaleString())}</div><div>${escapeHtml(comment.comment)}</div></article>`).join('') || '<div class="muted">No comments yet.</div>';
       const history = (issue.history || []).slice().reverse().map(item => `<article class="history-item"><div class="meta">${escapeHtml(new Date(item.timestamp).toLocaleString())} · ${escapeHtml(item.eventType)}</div><div>${historyText(item)}</div></article>`).join('') || '<div class="muted">No history.</div>';
       const parent = issue.parentId ? ` · parent ${escapeHtml(issue.parentId)}` : '';
       const due = issue.dueDate ? ` · due ${escapeHtml(new Date(issue.dueDate).toLocaleString())}` : '';
-      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><button type="button" id="close-detail">Close</button></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)}${parent}${due} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div><div class="section">${comments}</div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
+      byId('detail-body').innerHTML = `<div class="detail-heading"><span class="status-chip ${statusClass(issue.status)}">${escapeHtml(statusLabel(issue.status))}</span><button type="button" id="close-detail">Close</button></div><div class="section"><h3 class="detail-title">${escapeHtml(issue.title)}</h3><div class="muted">${escapeHtml(issue.id)}${parent}${due} · created ${escapeHtml(new Date(issue.createdAt).toLocaleString())} · updated ${escapeHtml(new Date(issue.updatedAt).toLocaleString())}</div></div><div class="form-grid"><label>Status <select id="edit-status">${statusOptions}</select></label><label>Priority <select id="edit-priority"><option value="1"${issue.priority === 1 ? ' selected' : ''}>1 - urgent</option><option value="2"${issue.priority === 2 ? ' selected' : ''}>2 - high</option><option value="3"${issue.priority === 3 ? ' selected' : ''}>3 - normal</option><option value="4"${issue.priority === 4 ? ' selected' : ''}>4 - low</option><option value="5"${issue.priority === 5 ? ' selected' : ''}>5 - someday</option></select></label></div><div class="section"><div class="section-heading">Blocked by tasks</div><div class="section">${blockerDetails}</div><label>Replace blocker set (comma-separated task tokens; blank clears) <textarea id="edit-blockers" rows="2">${escapeHtml(blockerTokens)}</textarea></label><div class="button-row"><button type="button" id="save-blockers" class="primary">Save blockers</button></div></div><div class="section"><div class="section-heading">Description</div><textarea id="edit-description" rows="5">${escapeHtml(issue.description)}</textarea><div class="button-row"><button type="button" id="save-description" class="primary">Save description</button></div></div><div class="section"><div class="section-heading">Labels</div><div class="labels">${labelTags || '<span class="muted">No labels.</span>'}</div><div class="button-row"><input id="new-label" placeholder="Add label" aria-label="New label" aria-describedby="repository-label-help"><button type="button" id="add-label">Add label</button></div><div id="repository-label-help" class="muted">Use repo:&lt;name&gt; to identify and reserve a related repository.</div></div><div class="section"><div class="section-heading">Comments</div><textarea id="new-comment" rows="3" placeholder="Add a comment"></textarea><div class="button-row"><button type="button" id="add-comment" class="primary">Add comment</button></div><div class="section">${comments}</div></div><div class="section"><div class="section-heading">History</div><div class="section">${history}</div></div>`;
       byId('close-detail').onclick = () => closeOverlay('detail-overlay');
       byId('repository-label-help').textContent = 'Use repo:<name> to identify a repository; the checkout above controls its reservation.';
       byId('edit-status').closest('.form-grid').insertAdjacentHTML('beforeend', `<label class="full">Checkout <input id="edit-checkout" value="${escapeHtml(issue.checkout || 'canonical')}" aria-describedby="checkout-help"></label><div id="checkout-help" class="muted full">Use canonical or worktree:&lt;stable-id&gt;; tasks for the same repository cannot share a reserved checkout.</div>`);
@@ -495,6 +502,7 @@ internal static class WebAssets
       byId('edit-checkout').onchange = event => mutateCheckout(event.target.value);
       byId('edit-priority').onchange = event => mutatePriority(Number(event.target.value));
       byId('save-description').onclick = () => mutateDescription(byId('edit-description').value);
+      byId('save-blockers').onclick = () => mutateBlockers(byId('edit-blockers').value);
       byId('add-label').onclick = addLabel;
       byId('new-label').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); addLabel(); } });
       byId('add-comment').onclick = addComment;
@@ -507,6 +515,7 @@ internal static class WebAssets
       if (item.label) return item.eventType === 'LabelAdded' ? 'Added label ' + item.label : 'Removed label ' + item.label;
       if (item.comment) return item.comment;
       if (item.description !== undefined) return 'Updated description';
+      if (item.eventType === 'IssueBlockersSet') return 'Blocked by → ' + ((item.blockedBy || []).join(', ') || 'none');
       return item.eventType;
     }
     async function mutateStatus(status) {
@@ -526,6 +535,11 @@ internal static class WebAssets
       try { await api(`/api/issues/${encodeURIComponent(issueId)}/description`, { method: 'PATCH', body: JSON.stringify({ description }) }); if (state.detail && state.detail.id === issueId) state.detail.description = description; showToast('Description updated.'); await refresh(true); }
       catch (error) { showToast(error.message, 'error'); }
     }
+    async function mutateBlockers(value) {
+      try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/blockers`, { method: 'PATCH', body: JSON.stringify({ blockedBy: parseBlockerTokens(value) }) }); showToast('Blockers updated.'); await refresh(true); }
+      catch (error) { showToast(error.message, 'error'); }
+    }
+    function parseBlockerTokens(value) { return value.split(',').map(token => token.trim()).filter(Boolean); }
     async function addLabel() {
       const input = byId('new-label'); const label = input.value.trim(); if (!label) return;
       try { await api(`/api/issues/${encodeURIComponent(state.detail.id)}/labels`, { method: 'POST', body: JSON.stringify({ label }) }); if (input.value.trim() === label) input.value = ''; showToast('Label added.'); await refresh(true); }
@@ -560,10 +574,12 @@ internal static class WebAssets
       const key = event.key.toLowerCase();
       if (key === 'r') { await refresh(); return; }
       if (key === 'n') { openCreate(); return; }
+      if (key === 'b' && state.selected >= 0) { openDetail(state.issues[state.selected].id); return; }
       if (state.detail && !byId('detail-overlay').classList.contains('hidden')) {
         if (key === 's') { focusDetail('edit-status'); return; }
         if (key === 'p') { focusDetail('edit-priority'); return; }
         if (key === 't') { focusDetail('new-label'); return; }
+        if (key === 'b') { focusDetail('edit-blockers'); return; }
         if (key === 'd') { focusDetail('edit-description'); return; }
         if (key === 'c') { focusDetail('new-comment'); return; }
         return;

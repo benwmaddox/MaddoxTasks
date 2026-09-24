@@ -98,6 +98,8 @@ public sealed class WorkerPolicyTests
         Assert.Contains("still needs to generate evidence", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("do not use MaddoxTasks commands", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("worker-owned Git publication", prompt, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("A dependency is satisfied only when its current status is `Done`", prompt, StringComparison.Ordinal);
+        Assert.Contains("follow `blockerReasons`", prompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -653,13 +655,16 @@ public sealed class WorkerPolicyTests
         var started = new DateTime(2026, 9, 4, 12, 0, 0, DateTimeKind.Utc);
         var old = new TaskCommentDto(started.AddMinutes(-1), "old", "user");
         var worker = new TaskCommentDto(started.AddMinutes(1), "worker status", "maddox-worker");
-        var claimed = new TaskDto(1, "issue", "Task", "original", ["Repo"]) { Comments = [old], UpdatedAt = started };
+        var pendingBlocker = new TaskBlockerDto(2, "#2", "abcd1234", "blocker-id", "Prerequisite", "Active", false, "Complete prerequisite #2.");
+        var completedBlocker = pendingBlocker with { Status = "Done", IsSatisfied = true, Reason = string.Empty };
+        var claimed = new TaskDto(1, "issue", "Task", "original", ["Repo"]) { Comments = [old], BlockedBy = [pendingBlocker], UpdatedAt = started };
         var job = CreateJob(JobPhases.Implementing, started);
         TaskUpdatePolicy.Seed(job, claimed);
 
-        var live = claimed with { Description = "replacement", Comments = [old, worker, new TaskCommentDto(started.AddMinutes(2), "please adjust", "USER")], UpdatedAt = started.AddMinutes(2) };
+        var live = claimed with { Description = "replacement", Comments = [old, worker, new TaskCommentDto(started.AddMinutes(2), "please adjust", "USER")], BlockedBy = [completedBlocker], UpdatedAt = started.AddMinutes(2) };
         Assert.True(TaskUpdatePolicy.Ingest(job, live));
         Assert.Equal("replacement", job.PendingDescription);
+        Assert.Equal([completedBlocker], job.PendingBlockers!);
         Assert.Equal("please adjust", Assert.Single(job.PendingHumanComments).Comment);
         Assert.False(TaskUpdatePolicy.Ingest(job, live));
         Assert.Equal("Task update queued", TaskUpdatePolicy.DashboardPhase(job, job.Phase));
@@ -669,8 +674,10 @@ public sealed class WorkerPolicyTests
         TaskUpdatePolicy.EndApplying(job);
 
         var batch = TaskUpdatePolicy.Capture(job);
+        Assert.Equal([completedBlocker], batch.BlockedBy!);
         TaskUpdatePolicy.MarkDelivered(job, batch);
         Assert.False(TaskUpdatePolicy.HasPending(job));
+        Assert.True(Assert.Single(job.Task.BlockedBy).IsSatisfied);
     }
 
     [Fact]
@@ -781,10 +788,13 @@ public sealed class WorkerPolicyTests
     {
         var batch = new PendingTaskUpdateBatch("ToddlerMatch only", [
             new TaskCommentDto(DateTime.UnixEpoch, "first", "user"),
-            new TaskCommentDto(DateTime.UnixEpoch.AddSeconds(1), "second", "user")]);
+            new TaskCommentDto(DateTime.UnixEpoch.AddSeconds(1), "second", "user")],
+            [new TaskBlockerDto(2, "#2", "abcd1234", "blocker-id", "Prerequisite", "Done", true, string.Empty)]);
         var prompt = WorkerHost.BuildTaskUpdatePrompt(batch);
         Assert.Contains("ToddlerMatch only", prompt);
         Assert.True(prompt.IndexOf("first", StringComparison.Ordinal) < prompt.IndexOf("second", StringComparison.Ordinal));
+        Assert.Contains("blockerDependenciesReplacement", prompt, StringComparison.Ordinal);
+        Assert.Contains("Done", prompt, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -804,8 +814,9 @@ public sealed class WorkerPolicyTests
             {"type":"AddLabel","issueId":"{{targetId}}","label":"researched"},
             {"type":"RemoveLabel","issueId":"{{targetId}}","label":"old"},
             {"type":"SetRepositoryLabels","issueId":"{{targetId}}","repositories":["alpha"]},
+            {"type":"SetBlockers","issueId":"{{targetId}}","blockedBy":["1"]},
             {"type":"ChangeStatus","issueId":"{{targetId}}","newStatus":"Next"},
-            {"type":"CreateIssue","title":"Track contract","description":"Follow-up","status":"Next","priority":3,"repositories":["beta"]}
+            {"type":"CreateIssue","title":"Track contract","description":"Follow-up","status":"Next","priority":3,"repositories":["beta"],"blockedBy":["{{targetId}}"]}
           ]
         }
         """;
@@ -813,8 +824,10 @@ public sealed class WorkerPolicyTests
         var plan = ResearchPlanPolicy.Parse(json, new TaskDto(42, sourceId, "Source", "Blocked", ["alpha"]));
 
         Assert.Equal(ResearchPlanPolicy.Unblocked, plan.Outcome);
-        Assert.Equal(8, plan.Mutations.Length);
-        Assert.Equal(["AddComment", "UpdateDescription", "ChangePriority", "AddLabel", "RemoveLabel", "SetRepositoryLabels", "ChangeStatus", "CreateIssue"], plan.Mutations.Select(mutation => mutation.Type).ToArray());
+        Assert.Equal(9, plan.Mutations.Length);
+        Assert.Equal(["AddComment", "UpdateDescription", "ChangePriority", "AddLabel", "RemoveLabel", "SetRepositoryLabels", "SetBlockers", "ChangeStatus", "CreateIssue"], plan.Mutations.Select(mutation => mutation.Type).ToArray());
+        Assert.Equal(["1"], plan.Mutations[6].BlockedBy!);
+        Assert.Equal([targetId], plan.Mutations[^1].BlockedBy!);
         Assert.Equal("Next", plan.Mutations[^1].Status);
         Assert.NotNull(plan.Mutations[^1].Description);
         Assert.Contains("Research-created task scope:", plan.Mutations[^1].Description!, StringComparison.Ordinal);
@@ -942,6 +955,8 @@ public sealed class WorkerPolicyTests
         Assert.Contains("cluster the evidence", prompt, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Prefer one upstream owner task", prompt, StringComparison.Ordinal);
         Assert.Contains("must start in Next", prompt, StringComparison.Ordinal);
+        Assert.Contains("only when its current status is Done", prompt, StringComparison.Ordinal);
+        Assert.Contains("SetBlockers replaces the complete dependency set", prompt, StringComparison.Ordinal);
         Assert.Contains("at most 3", prompt, StringComparison.Ordinal);
         Assert.Contains("smallest required change", prompt, StringComparison.Ordinal);
         Assert.Contains("Validation requirements are evidence", prompt, StringComparison.Ordinal);

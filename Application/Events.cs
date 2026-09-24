@@ -56,6 +56,21 @@ public sealed record CheckoutSet(
     Guid EventId, IssueId IssueId, DateTime Timestamp, string Checkout
 ) : IssueEvent(EventId, IssueId, Timestamp);
 
+/// <summary>
+/// Replaces the complete set of task dependencies. SchemaVersion is persisted
+/// with the event so future dependency representations can replay old ledgers.
+/// </summary>
+public sealed record IssueBlockersSet(
+    Guid EventId,
+    IssueId IssueId,
+    DateTime Timestamp,
+    int SchemaVersion,
+    IssueId[] BlockerIds
+) : IssueEvent(EventId, IssueId, Timestamp)
+{
+    public const int CurrentSchemaVersion = 1;
+}
+
 public sealed record DescriptionUpdated(
     Guid EventId,
     IssueId IssueId,
@@ -71,4 +86,3 @@ public sealed record CommentAdded(
     string Comment,
     string Actor = "user"
 ) : IssueEvent(EventId, IssueId, Timestamp);
-

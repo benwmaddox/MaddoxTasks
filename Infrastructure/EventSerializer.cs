@@ -17,6 +17,7 @@ public static class EventSerializer
             LabelRemoved value => JsonSerializer.Serialize(value, JsonDefaults.Context.LabelRemoved),
             RepositoryLabelsSet value => JsonSerializer.Serialize(value, JsonDefaults.Context.RepositoryLabelsSet),
             CheckoutSet value => JsonSerializer.Serialize(value, JsonDefaults.Context.CheckoutSet),
+            IssueBlockersSet value => JsonSerializer.Serialize(value, JsonDefaults.Context.IssueBlockersSet),
             DescriptionUpdated value => JsonSerializer.Serialize(value, JsonDefaults.Context.DescriptionUpdated),
             CommentAdded value => JsonSerializer.Serialize(value, JsonDefaults.Context.CommentAdded),
             _ => throw new InvalidOperationException($"Unknown event type '{issueEvent.GetType().Name}'.")
@@ -34,6 +35,7 @@ public static class EventSerializer
             nameof(LabelRemoved) => DeserializeTyped(payload, JsonDefaults.Context.LabelRemoved),
             nameof(RepositoryLabelsSet) => DeserializeTyped(payload, JsonDefaults.Context.RepositoryLabelsSet),
             nameof(CheckoutSet) => DeserializeTyped(payload, JsonDefaults.Context.CheckoutSet),
+            nameof(IssueBlockersSet) => DeserializeTyped(payload, JsonDefaults.Context.IssueBlockersSet),
             nameof(DescriptionUpdated) => DeserializeTyped(payload, JsonDefaults.Context.DescriptionUpdated),
             nameof(CommentAdded) => DeserializeTyped(payload, JsonDefaults.Context.CommentAdded),
             _ => throw new InvalidOperationException($"Unknown event type '{eventType}'.")
@@ -46,4 +48,3 @@ public static class EventSerializer
         return value ?? throw new InvalidOperationException($"Failed to deserialize event payload for '{typeof(T).Name}'.");
     }
 }
-

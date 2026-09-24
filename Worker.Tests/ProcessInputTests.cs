@@ -25,12 +25,23 @@ public sealed class ProcessInputTests
     [Fact]
     public void ResearchSnapshot_IncludesSelectedTaskAndRelatedBlockedTasks()
     {
-        var task = new TaskDto(499, "source-id", "Unblock", "Triage three tasks", []);
+        var blocker = new TaskBlockerDto(389, "#389", "a1b2c3d4", "blocker-id", "Prerequisite", "Rejected", false, "Resolve or remove the rejected prerequisite.");
+        var task = new TaskDto(499, "source-id", "Unblock", "Triage three tasks", [])
+        {
+            BlockedBy = [blocker],
+            BlockerReasons = [blocker.Reason]
+        };
         var snapshot = WorkerHost.BuildResearchSnapshot(task, "[{\"sequence\":389,\"status\":\"Blocked\"}]");
         using var document = System.Text.Json.JsonDocument.Parse(snapshot);
 
         Assert.Equal(499, document.RootElement.GetProperty("selectedTask").GetProperty("Sequence").GetInt32());
+        Assert.Equal("Rejected", document.RootElement.GetProperty("selectedTask").GetProperty("BlockedBy")[0].GetProperty("Status").GetString());
+        Assert.Equal(blocker.Reason, document.RootElement.GetProperty("selectedTask").GetProperty("BlockerReasons")[0].GetString());
         Assert.Equal(389, document.RootElement.GetProperty("tasks")[0].GetProperty("sequence").GetInt32());
+
+        var prompt = WorkerHost.BuildResearchPrompt(task, "snapshot.json");
+        Assert.Contains("only when its current status is Done", prompt, StringComparison.Ordinal);
+        Assert.Contains("Rejected, missing", prompt, StringComparison.Ordinal);
     }
 
     [Theory]

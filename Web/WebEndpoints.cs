@@ -44,6 +44,8 @@ internal static class WebEndpoints
             context => SetCheckoutAsync(context, engine));
         app.MapMethods("/api/issues/{token}/priority", ["PATCH", "PUT", "POST"],
             context => ChangePriorityAsync(context, engine));
+        app.MapMethods("/api/issues/{token}/blockers", ["PATCH", "PUT", "POST"],
+            context => SetBlockersAsync(context, engine));
         app.MapMethods("/api/issues/{token}/description", ["PATCH", "PUT", "POST"],
             context => UpdateDescriptionAsync(context, engine));
         app.MapPost("/api/issues/{token}/labels", context => AddLabelAsync(context, engine));
@@ -196,6 +198,7 @@ internal static class WebEndpoints
             var title = GetOptionalString(root, "title");
             var description = GetOptionalString(root, "description");
             var parentToken = GetOptionalString(root, "parentId") ?? GetOptionalString(root, "parent");
+            var blockedBy = GetOptionalStringArray(root, "blockedBy");
             var dueText = GetOptionalString(root, "dueDate") ?? GetOptionalString(root, "due");
             var statusText = GetOptionalString(root, "status") ?? nameof(Status.Next);
             var priorityRaw = GetOptionalInt(root, "priority") ?? 3;
@@ -241,8 +244,25 @@ internal static class WebEndpoints
                     labels.Add(label.GetString()!);
                 }
             }
-            var result = engine.Execute(new CreateIssue(title ?? string.Empty, description, priority, parentId, dueDate, status), labels);
+            var result = engine.Execute(new CreateIssue(title ?? string.Empty, description, priority, parentId, dueDate, status, blockedBy), labels);
             await WriteCommandResult(context, result, engine, StatusCodes.Status201Created);
+        });
+    }
+
+    private static async Task SetBlockersAsync(HttpContext context, IssueEngine engine)
+    {
+        var token = GetRouteValue(context, "token");
+        if (!TryResolveIssue(engine, token, out var issueId, out var error))
+        {
+            await WriteError(context, StatusCodes.Status404NotFound, error);
+            return;
+        }
+
+        await HandleJson(context, async root =>
+        {
+            var blockedBy = GetRequiredStringArray(root, "blockedBy");
+            var result = engine.Execute(new SetBlockers(issueId, blockedBy));
+            await WriteCommandResult(context, result, engine);
         });
     }
 
@@ -714,6 +734,26 @@ internal static class WebEndpoints
         }
 
         writer.WriteEndArray();
+        var blockers = view.BlockedBy ?? [];
+        writer.WriteStartArray("blockedBy");
+        foreach (var blocker in blockers)
+        {
+            writer.WriteStartObject();
+            writer.WriteNumber("sequence", blocker.Sequence);
+            writer.WriteString("shortId", blocker.ShortId);
+            writer.WriteString("guidPrefix", blocker.GuidPrefix);
+            writer.WriteString("issueId", blocker.IssueId);
+            if (blocker.Title is null) writer.WriteNull("title"); else writer.WriteString("title", blocker.Title);
+            if (blocker.Status.HasValue) writer.WriteString("status", blocker.Status.Value.ToString()); else writer.WriteNull("status");
+            writer.WriteBoolean("isSatisfied", blocker.IsSatisfied);
+            writer.WriteString("reason", blocker.Reason);
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        writer.WriteStartArray("blockerReasons");
+        foreach (var blocker in blockers.Where(blocker => !blocker.IsSatisfied)) writer.WriteStringValue(blocker.Reason);
+        writer.WriteEndArray();
         if (includeDetails)
         {
             writer.WriteString("description", issue.Description);
@@ -771,6 +811,12 @@ internal static class WebEndpoints
             case CheckoutSet checkoutSet:
                 writer.WriteString("checkout", checkoutSet.Checkout);
                 break;
+            case IssueBlockersSet blockersSet:
+                writer.WriteNumber("schemaVersion", blockersSet.SchemaVersion);
+                writer.WriteStartArray("blockedBy");
+                foreach (var blockerId in blockersSet.BlockerIds) writer.WriteStringValue(blockerId.ToString());
+                writer.WriteEndArray();
+                break;
             case DescriptionUpdated descriptionUpdated:
                 writer.WriteString("description", descriptionUpdated.Description);
                 writer.WriteString("actor", descriptionUpdated.Actor);
@@ -811,6 +857,35 @@ internal static class WebEndpoints
         }
 
         return property.GetString();
+    }
+
+    private static string[]? GetOptionalStringArray(JsonElement root, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty(propertyName, out var property)) return null;
+        return ReadStringArray(property, propertyName);
+    }
+
+    private static string[] GetRequiredStringArray(JsonElement root, string propertyName)
+    {
+        if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty(propertyName, out var property))
+            throw new JsonException($"Property '{propertyName}' is required and must be an array of issue tokens.");
+        return ReadStringArray(property, propertyName);
+    }
+
+    private static string[] ReadStringArray(JsonElement property, string propertyName)
+    {
+        if (property.ValueKind != JsonValueKind.Array)
+            throw new JsonException($"Property '{propertyName}' must be an array of issue tokens.");
+
+        var values = new List<string>();
+        foreach (var item in property.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+                throw new JsonException($"Property '{propertyName}' must contain only strings.");
+            values.Add(item.GetString() ?? string.Empty);
+        }
+
+        return values.ToArray();
     }
 
     private static string GetStringPayload(JsonElement root, string propertyName, params string[] aliases)
