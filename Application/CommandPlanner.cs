@@ -18,6 +18,7 @@ public static class CommandPlanner
             RemoveLabel removeLabel => PlanLabelRemove(removeLabel, state, timestamp),
             SetRepositoryLabels setRepositoryLabels => PlanRepositoryLabelsSet(setRepositoryLabels, state, timestamp),
             SetCheckout setCheckout => PlanCheckoutSet(setCheckout, state, timestamp),
+            SetBlockers setBlockers => PlanBlockersSet(setBlockers, state, timestamp),
             UpdateDescription updateDescription => PlanDescriptionUpdate(updateDescription, state, timestamp),
             AddComment addComment => PlanCommentAdd(addComment, state, timestamp),
             _ => throw new CommandValidationException($"Unsupported command '{command.GetType().Name}'.")
@@ -64,6 +65,58 @@ public static class CommandPlanner
         }
 
         return new CheckoutSet(Guid.NewGuid(), command.IssueId, timestamp, checkout);
+    }
+
+    private static IssueEvent PlanBlockersSet(SetBlockers command, IssueState state, DateTime timestamp)
+    {
+        var issue = RequireIssue(command.IssueId, state);
+        var tokens = command.BlockedBy ?? throw new CommandValidationException("blockedBy must be an array of issue tokens.");
+        var blockerIds = new List<IssueId>(tokens.Count);
+        var seen = new HashSet<IssueId>();
+
+        foreach (var tokenValue in tokens)
+        {
+            var token = tokenValue?.Trim() ?? string.Empty;
+            if (token.Length == 0)
+            {
+                throw new CommandValidationException("Blocker issue tokens cannot be empty.");
+            }
+
+            if (!state.TryResolveIssueToken(token, out var blockerId, out var resolveError))
+            {
+                throw new CommandValidationException($"Blocker '{token}' could not be resolved: {resolveError}");
+            }
+
+            if (blockerId == issue.Id)
+            {
+                throw new CommandValidationException("An issue cannot depend on itself.");
+            }
+
+            if (!seen.Add(blockerId))
+            {
+                throw new CommandValidationException($"Blocker '{token}' duplicates issue {blockerId}.");
+            }
+
+            blockerIds.Add(blockerId);
+        }
+
+        blockerIds.Sort((left, right) => state.GetSequence(left).CompareTo(state.GetSequence(right)));
+        if (issue.BlockerIds.SequenceEqual(blockerIds))
+        {
+            throw new CommandValidationException($"Issue {issue.Id} already has that blocker set.");
+        }
+
+        if (state.TryFindDependencyCycle(issue.Id, blockerIds, out var cycle))
+        {
+            throw new CommandValidationException($"Blocker dependencies would create a cycle: {cycle}.");
+        }
+
+        return new IssueBlockersSet(
+            Guid.NewGuid(),
+            issue.Id,
+            timestamp,
+            IssueBlockersSet.CurrentSchemaVersion,
+            blockerIds.ToArray());
     }
 
     private static IssueEvent PlanCreate(CreateIssue command, IssueState state, DateTime timestamp)
@@ -293,4 +346,3 @@ public static class CommandPlanner
         return value.ToUniversalTime();
     }
 }
-

@@ -167,6 +167,16 @@ Statuses are `Backlog`, `Next`, `Active`, `Blocked`, `ReadyForReview`, `Done`, a
 
 New issues default to `Next` across the CLI, TUI, and agent command surfaces. Use the explicit `--status Backlog` CLI/TUI choice or `"status": "Backlog"` agent field when a new issue should remain in Backlog. Existing issues are not migrated or reordered.
 
+Issues can declare any number of task blockers. Every blocker must be `Done` before the dependent task is eligible for `agent next`, claim (including dry-run), or blocked-task research; `Rejected`, missing, and all other statuses remain unresolved. Dependency eligibility is checked on the same atomic snapshot as selection and does not change hierarchy ordering. The CLI accepts comma-separated sequence numbers, GUIDs, or GUID prefixes, and the TUI and browser detail panel support the same complete-set edit:
+
+```powershell
+.\MaddoxTasks.exe create "Dependent task" --blocked-by "12,8f31c9"
+.\MaddoxTasks.exe blockers 15 --blocked-by "12,8f31c9"
+.\MaddoxTasks.exe blockers 15  # omit --blocked-by to clear the complete set
+```
+
+The agent command uses an optional `blockedBy` token array on `CreateIssue` and the `SetBlockers` command to replace the full set. References are resolved inside the ledger transaction; missing, duplicate, self, and direct or indirect cyclic dependencies are rejected without writing events. Issue reads return resolved blocker ticket, title, and current status plus actionable `blockerReasons`; event history stores blocker-set replacements as schema-versioned events. For a migration/import, create all issues first, collect their returned IDs, then issue `SetBlockers` commands so references resolve against the complete ledger. API clients can edit the full set at `/api/issues/{token}/blockers` and receive the same resolved read model.
+
 Active and `ReadyForReview` issues reserve each repository identity paired with a checkout identity. Repository labels with the canonical `repo:<name>` prefix (for example, `repo:StasisLang`) remain the truthful repository scope; repository names are compared case-insensitively. The checkout is stored separately as `canonical` or `worktree:<stable-id>`. A worktree ID is scoped to its repository and must continue to identify the same physical checkout there; IDs may be reused in other repositories. Two reserving issues conflict only when both the repository and checkout match. An issue with no repository labels uses the synthetic repository identity `missing` paired with its checkout; this does not add a `repo:missing` label, so its public `repositories` array remains empty. An explicit `repo:missing` label conflicts with that synthetic identity only in the same checkout. Worker claims for repository-less issues use `canonical`. Moving to another status releases the reservation. Repository labels and checkout may be changed while work is reserving only when the resulting pairs are free.
 
 ## Agent JSON Commands

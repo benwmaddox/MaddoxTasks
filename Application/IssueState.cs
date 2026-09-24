@@ -21,6 +21,78 @@ public sealed class IssueState
 
     public IReadOnlyList<Issue> OrderedIssues => _creationOrder.Select(id => _issues[id]).ToArray();
 
+    public IssueView GetView(IssueId issueId)
+    {
+        var issue = _issues[issueId];
+        var blockers = issue.BlockerIds
+            .Select(blockerId => _issues.TryGetValue(blockerId, out var blocker)
+                ? new IssueBlockerView(
+                    GetSequence(blockerId),
+                    $"#{GetSequence(blockerId)}",
+                    blocker.Id.ToShortCode(),
+                    blocker.Id.ToString(),
+                    blocker.Title,
+                    blocker.Status)
+                : new IssueBlockerView(0, "missing", blockerId.ToShortCode(), blockerId.ToString(), null, null))
+            .ToArray();
+        return new IssueView(GetSequence(issueId), issue, blockers);
+    }
+
+    public bool HasUnresolvedBlockers(Issue issue)
+        => issue.BlockerIds.Any(blockerId =>
+            !_issues.TryGetValue(blockerId, out var blocker) || blocker.Status != Status.Done);
+
+    public bool TryFindDependencyCycle(IssueId issueId, IReadOnlyList<IssueId> proposedBlockerIds, out string cycle)
+    {
+        foreach (var blockerId in proposedBlockerIds)
+        {
+            if (!TryFindDependencyPath(blockerId, issueId, out var path)) continue;
+            cycle = string.Join(" -> ", new[] { issueId }.Concat(path).Select(id =>
+            {
+                var sequence = GetSequence(id);
+                return sequence > 0 ? $"#{sequence}" : id.ToString();
+            }));
+            return true;
+        }
+
+        cycle = string.Empty;
+        return false;
+    }
+
+    private bool TryFindDependencyPath(IssueId start, IssueId target, out IReadOnlyList<IssueId> path)
+    {
+        var parentById = new Dictionary<IssueId, IssueId?> { [start] = null };
+        var pending = new Stack<IssueId>();
+        pending.Push(start);
+
+        while (pending.TryPop(out var current))
+        {
+            if (current == target)
+            {
+                var reversed = new List<IssueId>();
+                IssueId? cursor = current;
+                while (cursor.HasValue)
+                {
+                    reversed.Add(cursor.Value);
+                    cursor = parentById[cursor.Value];
+                }
+
+                reversed.Reverse();
+                path = reversed;
+                return true;
+            }
+
+            if (!_issues.TryGetValue(current, out var issue)) continue;
+            foreach (var dependency in issue.BlockerIds.OrderByDescending(GetSequence))
+            {
+                if (parentById.TryAdd(dependency, current)) pending.Push(dependency);
+            }
+        }
+
+        path = [];
+        return false;
+    }
+
     /// <summary>
     /// Returns issues in deterministic program order. A program is a root issue
     /// and all of its descendants. Programs are ordered by root priority and
@@ -246,9 +318,30 @@ public sealed class IssueState
     }
 }
 
-public sealed record IssueView(int Sequence, Issue Issue)
+public sealed record IssueView(
+    int Sequence,
+    Issue Issue,
+    IReadOnlyList<IssueBlockerView>? BlockedBy = null)
 {
     public string ShortId => $"#{Sequence}";
     public string GuidPrefix => Issue.Id.ToShortCode();
 }
 
+public sealed record IssueBlockerView(
+    int Sequence,
+    string ShortId,
+    string GuidPrefix,
+    string IssueId,
+    string? Title,
+    Status? Status)
+{
+    public bool IsSatisfied => Status == Domain.Status.Done;
+
+    public string Reason => Status switch
+    {
+        null => $"Blocker {IssueId} is missing from the task ledger; remove it or restore the missing task.",
+        Domain.Status.Done => string.Empty,
+        Domain.Status.Rejected => $"Blocker {ShortId} '{Title}' is Rejected; resolve or remove this dependency.",
+        _ => $"Blocker {ShortId} '{Title}' is {Status.Value.ToDisplayString()}; complete it or remove this dependency."
+    };
+}

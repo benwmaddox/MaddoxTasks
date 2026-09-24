@@ -1,6 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using MaddoxTasks.Application;
 using MaddoxTasks.Web;
 
 namespace MaddoxTasks.Tests;
@@ -73,6 +74,59 @@ public sealed class WebServerTests
                 {"title":"Fix form","description":"Acceptance criteria","status":"Backlog","priority":2,"parentId":null,"dueDate":"2026-12-31","labels":["ui","repo:MaddoxTasks"]}
                 """);
             return Task.FromResult(document.RootElement.Clone());
+        }
+    }
+
+    [Fact]
+    public async Task WebApi_CreatesAndReplacesBlockersWithActionableReadModels()
+    {
+        var databasePath = Path.Combine(Path.GetTempPath(), $"MaddoxTasks-dependencies-{Guid.NewGuid():N}.db");
+        using var app = WebServer.CreateApplication(databasePath, "127.0.0.1", 0);
+        using var client = new HttpClient();
+        try
+        {
+            await app.StartAsync();
+            client.BaseAddress = new Uri(app.Urls.Single());
+            using var blockerCreated = await client.PostAsync("api/issues", Json("""{"title":"Prerequisite","status":"Backlog"}"""));
+            Assert.Equal(HttpStatusCode.Created, blockerCreated.StatusCode);
+            using var blockerResult = JsonDocument.Parse(await blockerCreated.Content.ReadAsStringAsync());
+
+            using var dependentCreated = await client.PostAsync("api/issues", Json("""{"title":"Dependent","blockedBy":["1"]}"""));
+            Assert.Equal(HttpStatusCode.Created, dependentCreated.StatusCode);
+            using var dependentResult = JsonDocument.Parse(await dependentCreated.Content.ReadAsStringAsync());
+            var dependentId = dependentResult.RootElement.GetProperty("issueId").GetString()!;
+
+            using var detailResponse = await client.GetAsync($"api/issues/{dependentId}");
+            using var detail = JsonDocument.Parse(await detailResponse.Content.ReadAsStringAsync());
+            var blocker = Assert.Single(detail.RootElement.GetProperty("issue").GetProperty("blockedBy").EnumerateArray());
+            Assert.Equal("Prerequisite", blocker.GetProperty("title").GetString());
+            Assert.Equal("Backlog", blocker.GetProperty("status").GetString());
+            Assert.False(blocker.GetProperty("isSatisfied").GetBoolean());
+            Assert.Contains("complete it", blocker.GetProperty("reason").GetString(), StringComparison.OrdinalIgnoreCase);
+
+            using var invalidCreate = await client.PostAsync("api/issues", Json("""{"title":"Invalid","blockedBy":["missing"]}"""));
+            Assert.Equal(HttpStatusCode.BadRequest, invalidCreate.StatusCode);
+            using var list = JsonDocument.Parse(await client.GetStringAsync("api/issues"));
+            Assert.Equal(2, list.RootElement.GetProperty("count").GetInt32());
+
+            using var changed = await client.SendAsync(new HttpRequestMessage(HttpMethod.Patch, $"api/issues/{dependentId}/blockers")
+            {
+                Content = Json("""{"blockedBy":[]}""")
+            });
+            Assert.Equal(HttpStatusCode.OK, changed.StatusCode);
+            using var changedJson = JsonDocument.Parse(await changed.Content.ReadAsStringAsync());
+            Assert.Empty(changedJson.RootElement.GetProperty("issue").GetProperty("blockedBy").EnumerateArray());
+
+            using var updatedDetail = JsonDocument.Parse(await client.GetStringAsync($"api/issues/{dependentId}"));
+            Assert.Empty(updatedDetail.RootElement.GetProperty("issue").GetProperty("blockedBy").EnumerateArray());
+            Assert.Contains(updatedDetail.RootElement.GetProperty("issue").GetProperty("history").EnumerateArray(),
+                item => item.GetProperty("eventType").GetString() == nameof(IssueBlockersSet));
+        }
+        finally
+        {
+            await app.StopAsync();
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDelete(databasePath); TryDelete(databasePath + "-wal"); TryDelete(databasePath + "-shm");
         }
     }
 

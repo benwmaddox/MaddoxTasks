@@ -318,6 +318,41 @@ public sealed class AgentRunnerTests
     }
 
     [Fact]
+    public void AgentCreateAndSetBlockers_ExposeReasonsAndGateNextAndClaim()
+    {
+        var clock = new FrozenClockForAgentTests(new DateTime(2026, 9, 24, 12, 0, 0, DateTimeKind.Utc));
+        var engine = new IssueEngine(new InMemoryEventStoreForAgentTests(), clock);
+        using var blockerCreate = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"CreateIssue","title":"Prerequisite","status":"Backlog"}"""));
+        Assert.True(blockerCreate.RootElement.GetProperty("success").GetBoolean());
+
+        using var dependentCreate = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            """{"type":"CreateIssue","title":"Dependent","blockedBy":["1"]}"""));
+        Assert.True(dependentCreate.RootElement.GetProperty("success").GetBoolean());
+        var dependentId = dependentCreate.RootElement.GetProperty("issueId").GetString()!;
+
+        using var issues = JsonDocument.Parse(AgentRunner.GetIssuesJson(engine, null, includeDone: true));
+        var dependent = issues.RootElement.EnumerateArray().Single(issue => issue.GetProperty("issueId").GetString() == dependentId);
+        var blocker = Assert.Single(dependent.GetProperty("blockedBy").EnumerateArray());
+        Assert.Equal("Prerequisite", blocker.GetProperty("title").GetString());
+        Assert.Equal("Backlog", blocker.GetProperty("status").GetString());
+        Assert.False(blocker.GetProperty("isSatisfied").GetBoolean());
+        Assert.Contains("complete it", blocker.GetProperty("reason").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("null", AgentRunner.GetNextTaskJson(engine));
+        Assert.Equal("null", AgentRunner.GetClaimJson(engine));
+
+        using var cleared = JsonDocument.Parse(AgentRunner.ExecuteCommandJson(
+            engine,
+            $$"""{"type":"SetBlockers","issueId":"{{dependentId}}","blockedBy":[]}"""));
+        Assert.True(cleared.RootElement.GetProperty("success").GetBoolean());
+        Assert.Empty(cleared.RootElement.GetProperty("blockedBy").EnumerateArray());
+        using var next = JsonDocument.Parse(AgentRunner.GetNextTaskJson(engine));
+        Assert.Equal(dependentId, next.RootElement.GetProperty("issueId").GetString());
+    }
+
+    [Fact]
     public void ExecuteCommandJson_CreateRejectsUnsupportedInitialStatusDeterministically()
     {
         var clock = new FrozenClockForAgentTests(new DateTime(2026, 2, 17, 15, 0, 0, DateTimeKind.Utc));

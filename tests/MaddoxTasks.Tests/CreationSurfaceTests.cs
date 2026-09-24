@@ -37,9 +37,11 @@ public sealed class CreationSurfaceTests
     {
         var defaultCommand = TuiApp.BuildCreateIssueCommand("Task", null, Priority.From(3), null);
         var backlogCommand = TuiApp.BuildCreateIssueCommand("Task", null, Priority.From(3), null, Status.Backlog);
+        var dependentCommand = TuiApp.BuildCreateIssueCommand("Task", null, Priority.From(3), null, blockedBy: ["1"]);
 
         Assert.Equal(Status.Next, defaultCommand.Status);
         Assert.Equal(Status.Backlog, backlogCommand.Status);
+        Assert.Equal(["1"], dependentCommand.BlockedBy);
     }
 
     [Fact]
@@ -66,6 +68,33 @@ public sealed class CreationSurfaceTests
             {
                 Directory.Delete(tempRoot, recursive: true);
             }
+        }
+    }
+
+    [Fact]
+    public async Task CliCreateAndBlockersCommand_SupportDependencyTokensAndClearing()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"maddox-cli-dependencies-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempRoot);
+        var dbPath = Path.Combine(tempRoot, "tasks.db");
+
+        try
+        {
+            Assert.Equal(0, await CliRunner.InvokeAsync(["--db", dbPath, "create", "Prerequisite", "--status", "Backlog"]));
+            Assert.Equal(0, await CliRunner.InvokeAsync(["--db", dbPath, "create", "Dependent", "--blocked-by", "1"]));
+
+            var engine = new IssueEngine(new SqliteEventStore(dbPath), new SystemClock());
+            var dependent = engine.QueryIssues(includeDone: true).Single(view => view.Issue.Title == "Dependent");
+            Assert.Equal("Prerequisite", Assert.Single(dependent.BlockedBy!).Title);
+            Assert.False(Assert.Single(dependent.BlockedBy!).IsSatisfied);
+
+            Assert.Equal(0, await CliRunner.InvokeAsync(["--db", dbPath, "blockers", dependent.ShortId[1..]]));
+            Assert.Empty(engine.GetState().Issues[dependent.Issue.Id].BlockerIds);
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
         }
     }
 }

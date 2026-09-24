@@ -149,6 +149,7 @@ PowerShell stdin pattern (avoids quote escaping):
 Supported `type` values (all available agent commands):
 
 - `CreateIssue`
+- `SetBlockers`
 - `ChangeStatus`
 - `ChangePriority`
 - `AddLabel`
@@ -163,7 +164,7 @@ Supported `type` values (all available agent commands):
 
 `CompleteResearch` defaults to `Next`; the worker may pass `"completionStatus":"Done"` for a fully completed ledger-only research objective. Only `Next` and `Done` are accepted, and the source must still be `Blocked` with its durable research marker.
 
-Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels, and `checkout`. `agent claim` returns those fields with the claimed issue.
+Every issue returned by `agent issues` includes `repositories`, derived from its `repo:` labels, `checkout`, resolved `blockedBy` details, and `blockerReasons`. `agent claim` returns those fields with the claimed issue.
 
 ## Payload Schemas
 
@@ -176,12 +177,27 @@ Every issue returned by `agent issues` includes `repositories`, derived from its
   "description": "Investigate cache invalidation",
   "priority": 2,
   "status": "Next",
+  "blockedBy": ["12", "8f31c9"],
   "parentId": "551e912f-eee0-4042-ab87-3a89826fd88e",
   "dueDate": "2026-02-20"
 }
 ```
 
 `status` is optional and defaults to `Next`. The only supported initial statuses are `Next` and explicit `Backlog`; other statuses must be applied with `ChangeStatus` after creation. Successful command responses include the final stored `status`.
+
+`blockedBy` is an optional array of existing issue tokens (sequence number, GUID prefix, or full GUID). Every token is resolved against the same ledger transaction. Missing, duplicate, self, or direct/indirect cyclic references reject the complete create without writing events.
+
+`SetBlockers` replaces the complete dependency set; pass an empty `blockedBy` array to clear it:
+
+```json
+{
+  "type": "SetBlockers",
+  "issueId": "15",
+  "blockedBy": ["12", "8f31c9"]
+}
+```
+
+Each issue read contains a `blockedBy` array with resolved blocker ticket identifiers, titles, current statuses, and whether each is satisfied, plus `blockerReasons` for any unresolved dependency. Only `Done` satisfies a blocker; `Rejected`, missing, and every other status remain unresolved. Claim, claim dry-run, `agent next`, and research-claim selection gate on the same atomic snapshot and retain existing hierarchy order. Event history serializes blocker replacement as a versioned `schemaVersion` plus a complete GUID array. For imports, create the issues first, then apply `SetBlockers` with the IDs returned by creation; do not edit the event database directly.
 
 `ChangeStatus`:
 

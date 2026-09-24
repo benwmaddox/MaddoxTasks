@@ -103,10 +103,22 @@ public sealed class ConfigState
 }
 
 public sealed record TaskCommentDto(DateTime Timestamp, string Comment, string Actor);
+public sealed record TaskBlockerDto(
+    int Sequence,
+    string ShortId,
+    string GuidPrefix,
+    string IssueId,
+    string? Title,
+    string? Status,
+    bool IsSatisfied,
+    string Reason);
+
 public sealed record TaskDto(int Sequence, string IssueId, string Title, string Description, string[] Repositories)
 {
     public string Checkout { get; init; } = "canonical";
     public TaskCommentDto[] Comments { get; init; } = [];
+    public TaskBlockerDto[] BlockedBy { get; init; } = [];
+    public string[] BlockerReasons { get; init; } = [];
     public DateTime UpdatedAt { get; init; }
 }
 
@@ -127,7 +139,8 @@ public sealed record ResearchMutation(
     string? ParentId = null,
     int? Priority = null,
     string? Status = null,
-    string? Comment = null);
+    string? Comment = null,
+    string[]? BlockedBy = null);
 
 public sealed record ResearchPlan(
     string Outcome,
@@ -161,6 +174,7 @@ Research-created task scope:
         "AddLabel",
         "RemoveLabel",
         "SetRepositoryLabels",
+        "SetBlockers",
         "ChangeStatus"
     };
 
@@ -229,7 +243,9 @@ Research-created task scope:
             if (parentId is not null && !Guid.TryParse(parentId, out _)) throw new InvalidDataException("CreateIssue parentId must be a valid issue id GUID.");
             var repositories = OptionalStringArray(element, "repositories", allowEmpty: true);
             ValidateRepositories(repositories);
-            return new ResearchMutation(canonicalType, Title: title, Description: ScopeCreatedIssueDescription(description), Priority: priority, Status: "Next", ParentId: parentId, Repositories: repositories);
+            var blockedBy = OptionalStringArray(element, "blockedBy", allowEmpty: true);
+            ValidateIssueTokens(blockedBy);
+            return new ResearchMutation(canonicalType, Title: title, Description: ScopeCreatedIssueDescription(description), Priority: priority, Status: "Next", ParentId: parentId, Repositories: repositories, BlockedBy: blockedBy);
         }
 
         var issueId = RequiredString(element, "issueId");
@@ -250,6 +266,14 @@ Research-created task scope:
             var repositories = RequiredStringArray(element, "repositories", allowEmpty: false);
             ValidateRepositories(repositories);
             return new ResearchMutation(canonicalType, IssueId: issueId, Repositories: repositories);
+        }
+        if (canonicalType == "SetBlockers")
+        {
+            if (IsSourceIssueToken(issueId, sourceIssueId, sourceSequence))
+                throw new InvalidDataException("Research mutations may not change the source task's blocker dependencies.");
+            var blockedBy = RequiredStringArray(element, "blockedBy", allowEmpty: true);
+            ValidateIssueTokens(blockedBy);
+            return new ResearchMutation(canonicalType, IssueId: issueId, BlockedBy: blockedBy);
         }
 
         var newStatus = RequiredString(element, "newStatus");
@@ -274,6 +298,15 @@ Research-created task scope:
             throw new InvalidDataException("Repositories must be non-empty names without the 'repo:' prefix.");
         if (repositories.Distinct(StringComparer.OrdinalIgnoreCase).Count() != repositories.Length)
             throw new InvalidDataException("Repositories must not contain duplicates.");
+    }
+
+    private static void ValidateIssueTokens(string[]? issueTokens)
+    {
+        if (issueTokens is null) return;
+        if (issueTokens.Any(string.IsNullOrWhiteSpace))
+            throw new InvalidDataException("Blocker issue tokens must not be empty.");
+        if (issueTokens.Distinct(StringComparer.OrdinalIgnoreCase).Count() != issueTokens.Length)
+            throw new InvalidDataException("Blocker issue tokens must not contain duplicates.");
     }
 
     private static string RequiredString(JsonElement root, string name, bool allowEmpty = false)
@@ -372,7 +405,7 @@ Research-created task scope:
     }
 }
 
-public sealed record PendingTaskUpdateBatch(string? Description, TaskCommentDto[] Comments);
+public sealed record PendingTaskUpdateBatch(string? Description, TaskCommentDto[] Comments, TaskBlockerDto[]? BlockedBy = null);
 public sealed record ClarificationChild(string Title, string Description, string Repository, string Rationale);
 public sealed record ClarificationDecision(string Action, string[] Repositories, ClarificationChild[] Children, string Rationale, double Confidence, bool Ambiguous);
 
@@ -1242,8 +1275,10 @@ public sealed class Job
     public HashSet<string> ReleasedCanonicalRepositories { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public DateTime? ObservedTaskUpdatedAt { get; set; }
     public string? ObservedDescription { get; set; }
+    public TaskBlockerDto[]? ObservedBlockers { get; set; }
     public HashSet<string> ProcessedHumanCommentKeys { get; set; } = new(StringComparer.Ordinal);
     public string? PendingDescription { get; set; }
+    public TaskBlockerDto[]? PendingBlockers { get; set; }
     public List<TaskCommentDto> PendingHumanComments { get; set; } = [];
     public bool TaskUpdateWindowClosed { get; set; }
     [System.Text.Json.Serialization.JsonIgnore]
@@ -1284,6 +1319,7 @@ public static class TaskUpdatePolicy
     {
         job.ObservedTaskUpdatedAt = task.UpdatedAt;
         job.ObservedDescription = task.Description;
+        job.ObservedBlockers = task.BlockedBy.ToArray();
         foreach (var comment in task.Comments) job.ProcessedHumanCommentKeys.Add(CommentKey(comment));
     }
 
@@ -1296,6 +1332,13 @@ public static class TaskUpdatePolicy
         {
             job.ObservedDescription = task.Description;
             job.PendingDescription = task.Description;
+            changed = true;
+        }
+        job.ObservedBlockers ??= job.Task.BlockedBy.ToArray();
+        if (!BlockersEqual(job.ObservedBlockers, task.BlockedBy))
+        {
+            job.ObservedBlockers = task.BlockedBy.ToArray();
+            job.PendingBlockers = task.BlockedBy.ToArray();
             changed = true;
         }
         foreach (var comment in task.Comments.OrderBy(comment => comment.Timestamp))
@@ -1312,17 +1355,25 @@ public static class TaskUpdatePolicy
         return changed;
     }
 
-    public static bool HasPending(Job job) => job.PendingDescription is not null || job.PendingHumanComments.Count > 0;
-    public static PendingTaskUpdateBatch Capture(Job job) => new(job.PendingDescription, [.. job.PendingHumanComments]);
+    public static bool HasPending(Job job) => job.PendingDescription is not null || job.PendingBlockers is not null || job.PendingHumanComments.Count > 0;
+    public static PendingTaskUpdateBatch Capture(Job job) => new(job.PendingDescription, [.. job.PendingHumanComments], job.PendingBlockers?.ToArray());
     public static void BeginApplying(Job job) => job.TaskUpdateInFlight = true;
     public static void EndApplying(Job job) => job.TaskUpdateInFlight = false;
     public static void MarkDelivered(Job job, PendingTaskUpdateBatch batch)
     {
         if (batch.Description is not null && string.Equals(job.PendingDescription, batch.Description, StringComparison.Ordinal)) job.PendingDescription = null;
+        if (batch.BlockedBy is not null)
+        {
+            job.Task = job.Task with { BlockedBy = batch.BlockedBy.ToArray() };
+            if (job.PendingBlockers is not null && BlockersEqual(job.PendingBlockers, batch.BlockedBy)) job.PendingBlockers = null;
+        }
         var delivered = batch.Comments.Select(CommentKey).ToHashSet(StringComparer.Ordinal);
         job.PendingHumanComments.RemoveAll(comment => delivered.Contains(CommentKey(comment)));
     }
     public static string CommentKey(TaskCommentDto comment) => $"{comment.Timestamp.ToUniversalTime():O}\n{comment.Actor}\n{comment.Comment}";
+
+    private static bool BlockersEqual(TaskBlockerDto[]? left, TaskBlockerDto[]? right)
+        => (left ?? []).SequenceEqual(right ?? []);
     public static string DashboardPhase(Job job, string phase) => job.TaskUpdateInFlight
         ? "Applying task update"
         : HasPending(job) ? "Task update queued" : phase;

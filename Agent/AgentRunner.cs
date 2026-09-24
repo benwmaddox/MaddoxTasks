@@ -44,7 +44,7 @@ public static partial class AgentRunner
             var state = engine.GetState();
             if (state.TryGetIssue(repositoryIssueId, out var repositoryIssue))
             {
-                var updatedIssue = ToAgentIssueDto(new IssueView(state.GetSequence(repositoryIssueId), repositoryIssue));
+                var updatedIssue = ToAgentIssueDto(state.GetView(repositoryIssueId));
                 return JsonSerializer.Serialize(new SetRepositoryLabelsResponse(true, result.Message, repositoryIssueId.ToString(), updatedIssue.Repositories, updatedIssue), PrettyJsonContext.SetRepositoryLabelsResponse);
             }
         }
@@ -53,8 +53,19 @@ public static partial class AgentRunner
             var state = engine.GetState();
             if (state.TryGetIssue(checkoutIssueId, out var checkoutIssue))
             {
-                var updatedIssue = ToAgentIssueDto(new IssueView(state.GetSequence(checkoutIssueId), checkoutIssue));
+                var updatedIssue = ToAgentIssueDto(state.GetView(checkoutIssueId));
                 return JsonSerializer.Serialize(new SetCheckoutResponse(true, result.Message, checkoutIssueId.ToString(), updatedIssue.Checkout, updatedIssue), PrettyJsonContext.SetCheckoutResponse);
+            }
+        }
+        if (command is SetBlockers && result.Success && result.IssueId is { } blockersIssueId)
+        {
+            var state = engine.GetState();
+            if (state.TryGetIssue(blockersIssueId, out _))
+            {
+                var updatedIssue = ToAgentIssueDto(state.GetView(blockersIssueId));
+                return JsonSerializer.Serialize(
+                    new SetBlockersResponse(true, result.Message, blockersIssueId.ToString(), updatedIssue.BlockedBy, updatedIssue),
+                    PrettyJsonContext.SetBlockersResponse);
             }
         }
         Status? finalStatus = null;
@@ -324,11 +335,11 @@ public static partial class AgentRunner
     {
         var state = engine.GetState();
         var nextIssue = state.SelectHierarchical(
-            issue => issue.Status is Status.Active or Status.Next,
+            issue => (issue.Status is Status.Active or Status.Next) && !state.HasUnresolvedBlockers(issue),
             preferActive: true);
         var nextTask = nextIssue is null
             ? null
-            : new IssueView(state.GetSequence(nextIssue.Id), nextIssue);
+            : state.GetView(nextIssue.Id);
 
         var dto = nextTask is null ? null : ToAgentIssueDto(nextTask);
         return JsonSerializer.Serialize(dto, PrettyJsonContext.AgentIssueDto);
@@ -384,7 +395,17 @@ public static partial class AgentRunner
             issue.Comments.Select(comment => new AgentIssueCommentDto(comment.Timestamp, comment.Comment, comment.Actor)).ToArray(),
             issue.CreatedAt,
             issue.UpdatedAt,
-            issue.DueDate);
+            issue.DueDate,
+            (view.BlockedBy ?? []).Select(blocker => new AgentBlockerDto(
+                blocker.Sequence,
+                blocker.ShortId,
+                blocker.GuidPrefix,
+                blocker.IssueId,
+                blocker.Title,
+                blocker.Status?.ToString(),
+                blocker.IsSatisfied,
+                blocker.Reason)).ToArray(),
+            (view.BlockedBy ?? []).Where(blocker => !blocker.IsSatisfied).Select(blocker => blocker.Reason).ToArray());
     }
 
     private static bool TryParseCommand(string json, IssueEngine engine, string defaultActor, out Command? command, out string error)
@@ -441,6 +462,8 @@ public static partial class AgentRunner
                     return TryBuildRepositoryLabelsSet(root, engine, out command, out error);
                 case "setcheckout":
                     return TryBuildCheckoutSet(root, engine, out command, out error);
+                case "setblockers":
+                    return TryBuildBlockersSet(root, engine, out command, out error);
                 case "updatedescription":
                     return TryBuildDescriptionUpdate(root, engine, defaultActor, out command, out error);
                 case "addcomment":
@@ -488,6 +511,7 @@ public static partial class AgentRunner
         TryGetString(root, "description", required: false, out var description, out _);
         TryGetString(root, "parentId", required: false, out var parentText, out _);
         TryGetString(root, "dueDate", required: false, out var dueDateText, out _);
+        if (!TryGetStringArray(root, "blockedBy", required: false, out var blockedBy, out error)) return false;
 
         var status = Status.Next;
         if (!TryGetString(root, "status", required: false, out var statusText, out error))
@@ -558,7 +582,53 @@ public static partial class AgentRunner
             dueDate = parsedDueDate;
         }
 
-        command = new CreateIssue(title!, description, priorityValue, parentId, dueDate, status);
+        command = new CreateIssue(title!, description, priorityValue, parentId, dueDate, status, blockedBy);
+        return true;
+    }
+
+    private static bool TryBuildBlockersSet(JsonElement root, IssueEngine engine, out Command? command, out string error)
+    {
+        command = null;
+        if (!TryResolveIssue(root, engine, out var issueId, out error)) return false;
+        if (!TryGetStringArray(root, "blockedBy", required: true, out var blockedBy, out error)) return false;
+        command = new SetBlockers(issueId, blockedBy);
+        return true;
+    }
+
+    private static bool TryGetStringArray(
+        JsonElement root,
+        string propertyName,
+        bool required,
+        out string[] values,
+        out string error)
+    {
+        values = [];
+        error = string.Empty;
+        if (!TryGetProperty(root, propertyName, out var element))
+        {
+            if (required) error = $"'{propertyName}' must be an array of issue tokens.";
+            return !required;
+        }
+
+        if (element.ValueKind != JsonValueKind.Array)
+        {
+            error = $"'{propertyName}' must be an array of issue tokens.";
+            return false;
+        }
+
+        var result = new List<string>();
+        foreach (var item in element.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String)
+            {
+                error = $"'{propertyName}' must contain only strings.";
+                return false;
+            }
+
+            result.Add(item.GetString() ?? string.Empty);
+        }
+
+        values = result.ToArray();
         return true;
     }
 
@@ -1011,6 +1081,7 @@ public static partial class AgentRunner
         AgentIssueDto? Task);
     private sealed record SetRepositoryLabelsResponse(bool Success, string Message, string IssueId, string[] Repositories, AgentIssueDto Issue);
     private sealed record SetCheckoutResponse(bool Success, string Message, string IssueId, string Checkout, AgentIssueDto Issue);
+    private sealed record SetBlockersResponse(bool Success, string Message, string IssueId, AgentBlockerDto[] BlockedBy, AgentIssueDto Issue);
     private sealed record SplitIssueResponse(bool Success, string Message, AgentIssueDto? Parent, AgentIssueDto[] Children);
 
     private sealed record AgentIssueDto(
@@ -1029,7 +1100,19 @@ public static partial class AgentRunner
         AgentIssueCommentDto[] Comments,
         DateTime CreatedAt,
         DateTime UpdatedAt,
-        DateTime? DueDate);
+        DateTime? DueDate,
+        AgentBlockerDto[] BlockedBy,
+        string[] BlockerReasons);
+
+    private sealed record AgentBlockerDto(
+        int Sequence,
+        string ShortId,
+        string GuidPrefix,
+        string IssueId,
+        string? Title,
+        string? Status,
+        bool IsSatisfied,
+        string Reason);
 
     private sealed record AgentIssueCommentDto(DateTime Timestamp, string Comment, string Actor);
 
@@ -1044,9 +1127,9 @@ public static partial class AgentRunner
     [JsonSerializable(typeof(ResearchCompletionResponse))]
     [JsonSerializable(typeof(SetRepositoryLabelsResponse))]
     [JsonSerializable(typeof(SetCheckoutResponse))]
+    [JsonSerializable(typeof(SetBlockersResponse))]
     [JsonSerializable(typeof(SplitIssueResponse))]
     [JsonSerializable(typeof(ReviewReconciliationResult))]
     [JsonSerializable(typeof(ReviewReconciliationOutcome))]
     private sealed partial class AgentJsonContext : JsonSerializerContext;
 }
-

@@ -10,7 +10,8 @@ public sealed record CreateIssue(
     Priority Priority,
     IssueId? ParentId,
     DateTime? DueDate,
-    Status Status = Status.Next
+    Status Status = Status.Next,
+    IReadOnlyList<string>? BlockedBy = null
 ) : Command;
 
 public sealed record ChangeStatus(
@@ -37,6 +38,9 @@ public sealed record SetRepositoryLabels(IssueId IssueId, IReadOnlyList<string> 
 
 public sealed record SetCheckout(IssueId IssueId, string Checkout) : Command;
 
+/// <summary>Replaces every blocker dependency using task tokens resolved in the command snapshot.</summary>
+public sealed record SetBlockers(IssueId IssueId, IReadOnlyList<string> BlockedBy) : Command;
+
 public sealed record SplitIssueChild(string Title, string Description, string Repository);
 
 public sealed record SplitIssue(IssueId IssueId, IReadOnlyList<SplitIssueChild> Children);
@@ -52,4 +56,3 @@ public sealed record AddComment(
     string Comment,
     string Actor = "user"
 ) : Command;
-
